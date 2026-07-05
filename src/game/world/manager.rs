@@ -9,7 +9,6 @@ use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generator::TerrainGenerator;
 
 pub const POOL_SIZE: usize = 1000;
-pub const RENDER_DISTANCE_CHUNKS: i32 = 4;
 
 type ChunkCoord = (i32, i32);
 
@@ -35,10 +34,11 @@ pub struct ChunkManager {
     generator: Arc<TerrainGenerator>,
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
+    render_distance_chunks: i32,
 }
 
 impl ChunkManager {
-    pub fn new() -> Self {
+    pub fn new(render_distance_chunks: i32) -> Self {
         let pool = (0..POOL_SIZE).map(|_| Some(Chunk::empty())).collect();
         let pool_free_list = (0..POOL_SIZE).collect();
         let gpu_free_list = (0..GPU_RENDER_SLOTS).collect();
@@ -53,6 +53,7 @@ impl ChunkManager {
             generator: Arc::new(TerrainGenerator::new()),
             result_tx,
             result_rx,
+            render_distance_chunks,
         }
     }
 
@@ -72,8 +73,8 @@ impl ChunkManager {
         let center_z = (camera_position.z / CHUNK_SIZE as f32).floor() as i32;
 
         let mut desired = HashSet::new();
-        for dz in -RENDER_DISTANCE_CHUNKS..=RENDER_DISTANCE_CHUNKS {
-            for dx in -RENDER_DISTANCE_CHUNKS..=RENDER_DISTANCE_CHUNKS {
+        for dz in -self.render_distance_chunks..=self.render_distance_chunks {
+            for dx in -self.render_distance_chunks..=self.render_distance_chunks {
                 desired.insert((center_x + dx, center_z + dz));
             }
         }
@@ -153,11 +154,5 @@ impl ChunkManager {
 
         renderer.clear_slot(queue, loaded.gpu_slot);
         self.gpu_free_list.push(loaded.gpu_slot);
-    }
-}
-
-impl Default for ChunkManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

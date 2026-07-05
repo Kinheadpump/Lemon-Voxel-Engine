@@ -102,9 +102,14 @@ Um hochwertige visuelle Effekte performant umzusetzen, nutzt die WGPU-Pipeline e
 Um die Engine deterministisch und wartbar zu halten, wird strikt zwischen Spielzustand (State) und Rendering unterschieden.
 
 - **Fixed Timestep Physik:** Berechnungen wie Gravitation, Kollisionen und Geschwindigkeits-Vektoren laufen in einem isolierten `update(dt: f32)`-Loop mit fester Zeitschrittweite, um physikalische Instabilitäten bei schwankenden Framerates zu verhindern.
-- **Kamera & Matrizen:** Die Kamera-Logik (View- und Projection-Matrizen) wird als reines Daten-Struct in `src/game/math/camera.rs` verwaltet. Berechnungen erfolgen ausschließlich über das `glam` Crate.
+- **Kamera & Matrizen:** Die Kamera-Logik (View- und Projection-Matrizen) wird als reines Daten-Struct in `src/game/math/camera.rs` verwaltet. Berechnungen erfolgen über das `glam` Crate. Es handelt sich um eine First-Person-Kamera: Bewegungen (Vor/Zurück/Links/Rechts) erfolgen strikt auf der XZ-Ebene (affin zum Boden), unabhängig vom vertikalen Blickwinkel (Pitch).
 - **Input Handling:** Rohe Winit-Events (Tastatur, Maus) werden frühzeitig abgefangen und in abstrakte Engine-Commands (z.B. `MoveForward`, `Jump`) übersetzt, bevor sie an den Player-State weitergereicht werden. Das Rendering-System greift niemals direkt auf Tastatureingaben zu.
 
 ## 8. Speichermanagement (Zero-Allocation Runtime)
 Um Heap-Fragmentierung und Frame-Stuttering zu verhindern, ist dynamische Speicherallokation während des Game-Loops strikt verboten.
 - **Chunk Object Pool:** Chunk-Datenstrukturen (`[u16; 32768]`) und deren zugehörige GPU-Buffer werden beim Engine-Start voralloziert. Wenn Chunks entladen werden, wandern sie zurück in einen Recyling-Pool (Arena) und werden für neu generierte Chunks wiederverwendet (überschrieben).
+
+## 9. Konfiguration & Globale Parameter
+"Magic Numbers" im Code sind strengstens verboten. 
+- Alle globalen Parameter (Movement Speed, Mouse Sensitivity, FOV, Render Distance, Clear Color) werden zentral im `EngineConfig` Struct in `src/engine/config.rs` verwaltet.
+- Neue Systeme müssen ihre Parameter aus dieser Konfiguration beziehen und dürfen keine eigenen hartgecodeten Konstanten verwenden.

@@ -11,8 +11,8 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn new(position: Vec3, yaw: f32, pitch: f32) -> Self {
-        Self { position, yaw, pitch, fov_y_radians: 60f32.to_radians(), near: 0.1 }
+    pub fn new(position: Vec3, yaw: f32, pitch: f32, fov_y_radians: f32) -> Self {
+        Self { position, yaw, pitch, fov_y_radians, near: 0.1 }
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -22,6 +22,17 @@ impl Camera {
             self.yaw.sin() * self.pitch.cos(),
         )
         .normalize()
+    }
+
+    /// Vorwaerts-Vektor projiziert auf die XZ-Ebene, fuer Spectator-Bewegung unabhaengig vom Pitch.
+    pub fn forward_flat(&self) -> Vec3 {
+        let forward = self.forward();
+        let flattened = Vec3::new(forward.x, 0.0, forward.z);
+        if flattened.length_squared() > 1e-6 {
+            flattened.normalize()
+        } else {
+            Vec3::ZERO
+        }
     }
 
     pub fn right(&self) -> Vec3 {
