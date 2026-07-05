@@ -64,7 +64,7 @@ fn build_chunk_draw_data(
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera_uniform_buffer"),
         contents: bytemuck::bytes_of(&camera_data),
-        usage: wgpu::BufferUsages::UNIFORM,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     let mut directions: [Option<DirectionDrawData>; 6] = std::array::from_fn(|_| None);
