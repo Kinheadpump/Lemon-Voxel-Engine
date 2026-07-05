@@ -122,6 +122,16 @@ impl ChunkManager {
             );
             renderer.upload_chunk(queue, result.gpu_slot, &result.mesh, origin);
 
+            let total_faces: usize = result.mesh.faces.iter().map(|f| f.len()).sum();
+            log::debug!(
+                "Chunk {:?} hochgeladen: slot={} origin={:?} faces={:?} total={}",
+                result.coord,
+                result.gpu_slot,
+                origin,
+                result.mesh.faces.iter().map(|f| f.len()).collect::<Vec<_>>(),
+                total_faces
+            );
+
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
                 result.coord,
