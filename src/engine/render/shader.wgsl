@@ -14,7 +14,7 @@ struct DirectionUniform {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_id: u32,
+    @location(0) @interpolate(flat) tex_id: u32,
 };
 
 const CORNER_OFFSETS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
