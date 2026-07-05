@@ -114,7 +114,7 @@ impl GpuContext {
         self.depth_view = pipeline::create_depth_view(&self.device, width, height);
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, visible_mask: &[bool]) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -171,7 +171,7 @@ impl GpuContext {
             });
 
             render_pass.set_pipeline(&self.chunk_pipeline.pipeline);
-            self.renderer.render(&mut render_pass);
+            self.renderer.render(&mut render_pass, visible_mask);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

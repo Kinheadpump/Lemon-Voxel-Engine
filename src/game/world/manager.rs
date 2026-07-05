@@ -2,8 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use rayon::prelude::*;
+
 use crate::engine::core::mesher::{DirectionalMesh, mesh_chunk};
 use crate::engine::render::renderer::{ChunkRenderer, GPU_RENDER_SLOTS};
+use crate::game::math::frustum::Frustum;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generator::TerrainGenerator;
@@ -35,6 +38,7 @@ pub struct ChunkManager {
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
+    visible_mask: Vec<bool>,
 }
 
 impl ChunkManager {
@@ -54,6 +58,7 @@ impl ChunkManager {
             result_tx,
             result_rx,
             render_distance_chunks,
+            visible_mask: vec![false; GPU_RENDER_SLOTS],
         }
     }
 
@@ -61,9 +66,18 @@ impl ChunkManager {
         self.loaded.len()
     }
 
+    pub fn visible_chunk_count(&self) -> usize {
+        self.visible_mask.iter().filter(|visible| **visible).count()
+    }
+
+    pub fn visible_mask(&self) -> &[bool] {
+        &self.visible_mask
+    }
+
     pub fn update(
         &mut self,
         camera_position: glam::Vec3,
+        frustum: &Frustum,
         queue: &wgpu::Queue,
         renderer: &ChunkRenderer,
     ) {
@@ -109,6 +123,26 @@ impl ChunkManager {
                 let mesh = mesh_chunk(&chunk);
                 let _ = tx.send(GenerationResult { coord, pool_slot, gpu_slot, chunk, mesh });
             });
+        }
+
+        self.update_visibility(frustum);
+    }
+
+    fn update_visibility(&mut self, frustum: &Frustum) {
+        let results: Vec<(usize, bool)> = self
+            .loaded
+            .par_iter()
+            .map(|(coord, loaded)| {
+                let min =
+                    glam::Vec3::new((coord.0 * CHUNK_SIZE) as f32, 0.0, (coord.1 * CHUNK_SIZE) as f32);
+                let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+                (loaded.gpu_slot, frustum.intersects_aabb(min, max))
+            })
+            .collect();
+
+        self.visible_mask.iter_mut().for_each(|visible| *visible = false);
+        for (slot, visible) in results {
+            self.visible_mask[slot] = visible;
         }
     }
 

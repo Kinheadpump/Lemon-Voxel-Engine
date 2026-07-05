@@ -160,9 +160,12 @@ impl ChunkRenderer {
         }
     }
 
-    pub fn render<'pass>(&'pass self, render_pass: &mut wgpu::RenderPass<'pass>) {
+    pub fn render<'pass>(&'pass self, render_pass: &mut wgpu::RenderPass<'pass>, visible_mask: &[bool]) {
         for arena in &self.directions {
             for slot in 0..GPU_RENDER_SLOTS {
+                if !visible_mask[slot] {
+                    continue;
+                }
                 render_pass.set_bind_group(0, &arena.slot_bind_groups[slot], &[]);
                 render_pass.draw_indirect(&arena.indirect_buffer, slot as u64 * INDIRECT_ARGS_STRIDE);
             }

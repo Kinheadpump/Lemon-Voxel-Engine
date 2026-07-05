@@ -11,6 +11,7 @@ use crate::engine::config::EngineConfig;
 use crate::engine::render::context::GpuContext;
 use crate::game::input::{InputState, MoveCommand};
 use crate::game::math::camera::Camera;
+use crate::game::math::frustum::Frustum;
 use crate::game::world::manager::ChunkManager;
 
 pub struct App {
@@ -136,19 +137,22 @@ impl ApplicationHandler for App {
 
                 self.apply_movement(dt);
 
-                let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
-                self.chunk_manager.update(self.camera.position, gpu.queue(), &gpu.renderer);
-
                 let view_proj = self.camera.view_projection(aspect);
+                let frustum = Frustum::from_view_projection(view_proj);
+
+                let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
+                self.chunk_manager.update(self.camera.position, &frustum, gpu.queue(), &gpu.renderer);
+
                 gpu.update_camera(view_proj);
 
-                gpu.render();
+                gpu.render(self.chunk_manager.visible_mask());
 
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;
                     log::info!(
-                        "Aktive Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        "Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
                         self.chunk_manager.loaded_chunk_count(),
+                        self.chunk_manager.visible_chunk_count(),
                         self.camera.position.x,
                         self.camera.position.y,
                         self.camera.position.z
