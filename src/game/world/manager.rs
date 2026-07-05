@@ -5,7 +5,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use rayon::prelude::*;
 
 use crate::engine::core::mesher::{DirectionalMesh, mesh_chunk};
-use crate::engine::render::renderer::{ChunkRenderer, GPU_RENDER_SLOTS};
 use crate::game::math::frustum::Frustum;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
@@ -17,13 +16,13 @@ type ChunkCoord = (i32, i32);
 
 struct LoadedChunk {
     pool_slot: usize,
-    gpu_slot: usize,
+    mesh: DirectionalMesh,
+    origin: glam::Vec3,
 }
 
 struct GenerationResult {
     coord: ChunkCoord,
     pool_slot: usize,
-    gpu_slot: usize,
     chunk: Chunk,
     mesh: DirectionalMesh,
 }
@@ -31,34 +30,31 @@ struct GenerationResult {
 pub struct ChunkManager {
     pool: Vec<Option<Chunk>>,
     pool_free_list: Vec<usize>,
-    gpu_free_list: Vec<usize>,
     loaded: HashMap<ChunkCoord, LoadedChunk>,
     in_flight: HashSet<ChunkCoord>,
     generator: Arc<TerrainGenerator>,
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
-    visible_mask: Vec<bool>,
+    visible_coords: Vec<ChunkCoord>,
 }
 
 impl ChunkManager {
     pub fn new(render_distance_chunks: i32) -> Self {
         let pool = (0..POOL_SIZE).map(|_| Some(Chunk::empty())).collect();
         let pool_free_list = (0..POOL_SIZE).collect();
-        let gpu_free_list = (0..GPU_RENDER_SLOTS).collect();
         let (result_tx, result_rx) = channel();
 
         Self {
             pool,
             pool_free_list,
-            gpu_free_list,
             loaded: HashMap::new(),
             in_flight: HashSet::new(),
             generator: Arc::new(TerrainGenerator::new()),
             result_tx,
             result_rx,
             render_distance_chunks,
-            visible_mask: vec![false; GPU_RENDER_SLOTS],
+            visible_coords: Vec::new(),
         }
     }
 
@@ -67,21 +63,19 @@ impl ChunkManager {
     }
 
     pub fn visible_chunk_count(&self) -> usize {
-        self.visible_mask.iter().filter(|visible| **visible).count()
+        self.visible_coords.len()
     }
 
-    pub fn visible_mask(&self) -> &[bool] {
-        &self.visible_mask
+    /// Meshes aller aktuell sichtbaren (frustum-getesteten) Chunks, fuer die Kompaktierung
+    /// in den Renderer-Frame-Buffer.
+    pub fn visible_chunks(&self) -> impl Iterator<Item = (&DirectionalMesh, glam::Vec3)> {
+        self.visible_coords
+            .iter()
+            .filter_map(move |coord| self.loaded.get(coord).map(|loaded| (&loaded.mesh, loaded.origin)))
     }
 
-    pub fn update(
-        &mut self,
-        camera_position: glam::Vec3,
-        frustum: &Frustum,
-        queue: &wgpu::Queue,
-        renderer: &ChunkRenderer,
-    ) {
-        self.apply_completed_generations(queue, renderer);
+    pub fn update(&mut self, camera_position: glam::Vec3, frustum: &Frustum) {
+        self.apply_completed_generations();
 
         let center_x = (camera_position.x / CHUNK_SIZE as f32).floor() as i32;
         let center_z = (camera_position.z / CHUNK_SIZE as f32).floor() as i32;
@@ -96,7 +90,7 @@ impl ChunkManager {
         let to_unload: Vec<ChunkCoord> =
             self.loaded.keys().copied().filter(|coord| !desired.contains(coord)).collect();
         for coord in to_unload {
-            self.unload_chunk(coord, queue, renderer);
+            self.unload_chunk(coord);
         }
 
         for coord in desired {
@@ -105,10 +99,6 @@ impl ChunkManager {
             }
 
             let Some(pool_slot) = self.pool_free_list.pop() else {
-                continue;
-            };
-            let Some(gpu_slot) = self.gpu_free_list.pop() else {
-                self.pool_free_list.push(pool_slot);
                 continue;
             };
 
@@ -120,8 +110,13 @@ impl ChunkManager {
 
             rayon::spawn(move || {
                 generator.generate_chunk(coord.0, coord.1, &mut chunk);
-                let mesh = mesh_chunk(&chunk);
-                let _ = tx.send(GenerationResult { coord, pool_slot, gpu_slot, chunk, mesh });
+
+                let mesh = mesh_chunk(&chunk, coord.0, coord.1, |world_x, world_y, world_z| {
+                    world_y >= 0
+                        && world_y <= generator.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1)
+                });
+
+                let _ = tx.send(GenerationResult { coord, pool_slot, chunk, mesh });
             });
         }
 
@@ -129,24 +124,19 @@ impl ChunkManager {
     }
 
     fn update_visibility(&mut self, frustum: &Frustum) {
-        let results: Vec<(usize, bool)> = self
+        self.visible_coords = self
             .loaded
             .par_iter()
-            .map(|(coord, loaded)| {
+            .filter_map(|(coord, _)| {
                 let min =
                     glam::Vec3::new((coord.0 * CHUNK_SIZE) as f32, 0.0, (coord.1 * CHUNK_SIZE) as f32);
                 let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
-                (loaded.gpu_slot, frustum.intersects_aabb(min, max))
+                frustum.intersects_aabb(min, max).then_some(*coord)
             })
             .collect();
-
-        self.visible_mask.iter_mut().for_each(|visible| *visible = false);
-        for (slot, visible) in results {
-            self.visible_mask[slot] = visible;
-        }
     }
 
-    fn apply_completed_generations(&mut self, queue: &wgpu::Queue, renderer: &ChunkRenderer) {
+    fn apply_completed_generations(&mut self) {
         while let Ok(result) = self.result_rx.try_recv() {
             self.in_flight.remove(&result.coord);
 
@@ -155,14 +145,11 @@ impl ChunkManager {
                 0.0,
                 (result.coord.1 * CHUNK_SIZE) as f32,
             );
-            renderer.upload_chunk(queue, result.gpu_slot, &result.mesh, origin);
 
             let total_faces: usize = result.mesh.faces.iter().map(|f| f.len()).sum();
             log::debug!(
-                "Chunk {:?} hochgeladen: slot={} origin={:?} faces={:?} total={}",
+                "Chunk {:?} gemesht: faces={:?} total={}",
                 result.coord,
-                result.gpu_slot,
-                origin,
                 result.mesh.faces.iter().map(|f| f.len()).collect::<Vec<_>>(),
                 total_faces
             );
@@ -170,12 +157,12 @@ impl ChunkManager {
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
                 result.coord,
-                LoadedChunk { pool_slot: result.pool_slot, gpu_slot: result.gpu_slot },
+                LoadedChunk { pool_slot: result.pool_slot, mesh: result.mesh, origin },
             );
         }
     }
 
-    fn unload_chunk(&mut self, coord: ChunkCoord, queue: &wgpu::Queue, renderer: &ChunkRenderer) {
+    fn unload_chunk(&mut self, coord: ChunkCoord) {
         let Some(loaded) = self.loaded.remove(&coord) else {
             return;
         };
@@ -185,8 +172,5 @@ impl ChunkManager {
             self.pool[loaded.pool_slot] = Some(chunk);
         }
         self.pool_free_list.push(loaded.pool_slot);
-
-        renderer.clear_slot(queue, loaded.gpu_slot);
-        self.gpu_free_list.push(loaded.gpu_slot);
     }
 }

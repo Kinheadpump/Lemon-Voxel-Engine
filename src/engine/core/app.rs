@@ -140,12 +140,13 @@ impl ApplicationHandler for App {
                 let view_proj = self.camera.view_projection(aspect);
                 let frustum = Frustum::from_view_projection(view_proj);
 
+                self.chunk_manager.update(self.camera.position, &frustum);
+
                 let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
-                self.chunk_manager.update(self.camera.position, &frustum, gpu.queue(), &gpu.renderer);
-
                 gpu.update_camera(view_proj);
+                gpu.upload_frame(self.chunk_manager.visible_chunks());
 
-                gpu.render(self.chunk_manager.visible_mask());
+                gpu.render();
 
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;

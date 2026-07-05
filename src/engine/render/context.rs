@@ -3,6 +3,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::engine::config::EngineConfig;
+use crate::engine::core::mesher::DirectionalMesh;
 
 use super::pipeline;
 use super::renderer::ChunkRenderer;
@@ -104,6 +105,10 @@ impl GpuContext {
         self.renderer.update_camera(&self.queue, view_proj);
     }
 
+    pub fn upload_frame<'a>(&mut self, visible_chunks: impl Iterator<Item = (&'a DirectionalMesh, glam::Vec3)>) {
+        self.renderer.upload_frame(&self.queue, visible_chunks);
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -114,7 +119,7 @@ impl GpuContext {
         self.depth_view = pipeline::create_depth_view(&self.device, width, height);
     }
 
-    pub fn render(&mut self, visible_mask: &[bool]) {
+    pub fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -171,7 +176,7 @@ impl GpuContext {
             });
 
             render_pass.set_pipeline(&self.chunk_pipeline.pipeline);
-            self.renderer.render(&mut render_pass, visible_mask);
+            self.renderer.render(&mut render_pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

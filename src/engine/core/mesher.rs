@@ -46,7 +46,39 @@ fn pos_from_layer_uv(dir: usize, layer: i32, u: i32, v: i32) -> (i32, i32, i32) 
     }
 }
 
-fn build_face_mask(chunk: &Chunk, dir: usize, layer: i32) -> [[u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE] {
+/// Liest einen Nachbarblock. Liegt die Position innerhalb des lokalen Chunks, wird das lokale
+/// Array genutzt. Liegt sie ausserhalb (X/Z-Chunkgrenze), wird `neighbor_solid_at_world` befragt,
+/// damit an Chunk-Nahtstellen keine Phantom-Waende entstehen, obwohl der Nachbar-Chunk dort
+/// tatsaechlich Terrain hat.
+#[inline(always)]
+fn is_solid<F: Fn(i32, i32, i32) -> bool>(
+    chunk: &Chunk,
+    chunk_x: i32,
+    chunk_z: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    neighbor_solid_at_world: &F,
+) -> bool {
+    if (0..CHUNK_SIZE).contains(&x) && (0..CHUNK_SIZE).contains(&y) && (0..CHUNK_SIZE).contains(&z) {
+        return chunk.get_block(x, y, z) != 0;
+    }
+
+    if !(0..CHUNK_SIZE).contains(&y) {
+        return false;
+    }
+
+    neighbor_solid_at_world(chunk_x * CHUNK_SIZE + x, y, chunk_z * CHUNK_SIZE + z)
+}
+
+fn build_face_mask<F: Fn(i32, i32, i32) -> bool>(
+    chunk: &Chunk,
+    chunk_x: i32,
+    chunk_z: i32,
+    dir: usize,
+    layer: i32,
+    neighbor_solid_at_world: &F,
+) -> [[u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE] {
     let mut mask = [[0u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE];
     let (ox, oy, oz) = NEIGHBOR_OFFSETS[dir];
 
@@ -58,8 +90,9 @@ fn build_face_mask(chunk: &Chunk, dir: usize, layer: i32) -> [[u16; CHUNK_SIZE_U
                 continue;
             }
 
-            let neighbor = chunk.get_block(x + ox, y + oy, z + oz);
-            if neighbor == 0 {
+            let neighbor_solid =
+                is_solid(chunk, chunk_x, chunk_z, x + ox, y + oy, z + oz, neighbor_solid_at_world);
+            if !neighbor_solid {
                 mask[u as usize][v as usize] = block_id;
             }
         }
@@ -108,12 +141,17 @@ fn greedy_merge_mask(
     rects
 }
 
-pub fn mesh_chunk(chunk: &Chunk) -> DirectionalMesh {
+pub fn mesh_chunk<F: Fn(i32, i32, i32) -> bool>(
+    chunk: &Chunk,
+    chunk_x: i32,
+    chunk_z: i32,
+    neighbor_solid_at_world: F,
+) -> DirectionalMesh {
     let mut mesh = DirectionalMesh::default();
 
     for dir in 0..6 {
         for layer in 0..CHUNK_SIZE {
-            let mut mask = build_face_mask(chunk, dir, layer);
+            let mut mask = build_face_mask(chunk, chunk_x, chunk_z, dir, layer, &neighbor_solid_at_world);
 
             for (u, v, width, height, texture_id) in greedy_merge_mask(&mut mask) {
                 let (x, y, z) = pos_from_layer_uv(dir, layer, u as i32, v as i32);
