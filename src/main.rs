@@ -10,97 +10,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use engine::core::mesher::mesh_chunk;
 use engine::render::pipeline;
+use engine::render::renderer::ChunkRenderer;
 use game::input::{InputState, MoveCommand};
 use game::math::camera::Camera;
-use game::world::chunk::Chunk;
+use game::world::manager::ChunkManager;
 
 const MOVE_SPEED_UNITS_PER_SEC: f32 = 12.0;
 const MOUSE_SENSITIVITY_RADIANS_PER_PIXEL: f32 = 0.0025;
-
-fn build_test_chunk() -> Chunk {
-    let mut chunk = Chunk::empty();
-
-    for z in 0..32 {
-        for x in 0..32 {
-            chunk.set_block(x, 0, z, 1);
-        }
-    }
-    chunk.set_block(16, 1, 16, 2);
-
-    chunk
-}
-
-fn run_mesher_smoke_test() {
-    let mesh = mesh_chunk(&build_test_chunk());
-
-    const DIR_NAMES: [&str; 6] = ["-X", "+X", "-Y", "+Y", "-Z", "+Z"];
-    for (dir, faces) in mesh.faces.iter().enumerate() {
-        log::info!("Mesher-Test Richtung {}: {} Faces", DIR_NAMES[dir], faces.len());
-    }
-}
-
-struct DirectionDrawData {
-    bind_group: wgpu::BindGroup,
-    face_count: u32,
-}
-
-struct ChunkDrawData {
-    directions: [Option<DirectionDrawData>; 6],
-    camera_buffer: wgpu::Buffer,
-}
-
-fn build_chunk_draw_data(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    view_proj: glam::Mat4,
-) -> ChunkDrawData {
-    use wgpu::util::DeviceExt;
-
-    let mesh = mesh_chunk(&build_test_chunk());
-
-    let camera_data = pipeline::CameraUniformData { view_proj: view_proj.to_cols_array_2d() };
-    let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("camera_uniform_buffer"),
-        contents: bytemuck::bytes_of(&camera_data),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let mut directions: [Option<DirectionDrawData>; 6] = std::array::from_fn(|_| None);
-
-    for (dir, faces) in mesh.faces.iter().enumerate() {
-        if faces.is_empty() {
-            continue;
-        }
-
-        let direction_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("direction_uniform_buffer"),
-            contents: bytemuck::bytes_of(&pipeline::DIRECTION_VECTORS[dir]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("face_storage_buffer"),
-            contents: bytemuck::cast_slice(faces),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("chunk_face_bind_group"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: direction_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: storage_buffer.as_entire_binding() },
-            ],
-        });
-
-        directions[dir] = Some(DirectionDrawData { bind_group, face_count: faces.len() as u32 });
-    }
-
-    ChunkDrawData { directions, camera_buffer }
-}
 
 struct GpuContext {
     surface: wgpu::Surface<'static>,
@@ -109,7 +26,7 @@ struct GpuContext {
     config: wgpu::SurfaceConfiguration,
     window: Arc<Window>,
     chunk_pipeline: pipeline::ChunkPipeline,
-    chunk_draw_data: ChunkDrawData,
+    renderer: ChunkRenderer,
     depth_view: wgpu::TextureView,
 }
 
@@ -139,7 +56,7 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("primary_device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -170,13 +87,10 @@ impl GpuContext {
         surface.configure(&device, &config);
 
         let chunk_pipeline = pipeline::create(&device, config.format);
-
-        let chunk_draw_data =
-            build_chunk_draw_data(&device, &chunk_pipeline.bind_group_layout, initial_view_proj);
-
+        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height);
 
-        Self { surface, device, queue, config, window, chunk_pipeline, chunk_draw_data, depth_view }
+        Self { surface, device, queue, config, window, chunk_pipeline, renderer, depth_view }
     }
 
     fn aspect(&self) -> f32 {
@@ -184,12 +98,7 @@ impl GpuContext {
     }
 
     fn update_camera(&self, view_proj: glam::Mat4) {
-        let camera_data = pipeline::CameraUniformData { view_proj: view_proj.to_cols_array_2d() };
-        self.queue.write_buffer(
-            &self.chunk_draw_data.camera_buffer,
-            0,
-            bytemuck::bytes_of(&camera_data),
-        );
+        self.renderer.update_camera(&self.queue, view_proj);
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -264,10 +173,7 @@ impl GpuContext {
             });
 
             render_pass.set_pipeline(&self.chunk_pipeline.pipeline);
-            for direction in self.chunk_draw_data.directions.iter().flatten() {
-                render_pass.set_bind_group(0, &direction.bind_group, &[]);
-                render_pass.draw(0..6, 0..direction.face_count);
-            }
+            self.renderer.render(&mut render_pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -279,20 +185,20 @@ struct App {
     gpu: Option<GpuContext>,
     camera: Camera,
     input: InputState,
+    chunk_manager: ChunkManager,
     last_frame: Instant,
+    last_stats_log: Instant,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
             gpu: None,
-            camera: Camera::new(
-                glam::Vec3::new(48.0, 40.0, 48.0),
-                -3.0 * std::f32::consts::FRAC_PI_4,
-                -0.6155,
-            ),
+            camera: Camera::new(glam::Vec3::new(16.0, 40.0, 16.0), 0.0, -0.6),
             input: InputState::default(),
+            chunk_manager: ChunkManager::new(),
             last_frame: Instant::now(),
+            last_stats_log: Instant::now(),
         }
     }
 }
@@ -386,10 +292,24 @@ impl ApplicationHandler for App {
                 self.apply_movement(dt);
 
                 let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
+                self.chunk_manager.update(self.camera.position, &gpu.queue, &gpu.renderer);
+
                 let view_proj = self.camera.view_projection(aspect);
                 gpu.update_camera(view_proj);
 
                 gpu.render();
+
+                if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
+                    self.last_stats_log = now;
+                    log::info!(
+                        "Aktive Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        self.chunk_manager.loaded_chunk_count(),
+                        self.camera.position.x,
+                        self.camera.position.y,
+                        self.camera.position.z
+                    );
+                }
+
                 gpu.window.request_redraw();
             }
             _ => {}
@@ -402,8 +322,6 @@ fn main() {
         .filter_module("wgpu_hal::vulkan::instance", log::LevelFilter::Off)
         .filter_module("wgpu_core", log::LevelFilter::Error)
         .init();
-
-    run_mesher_smoke_test();
 
     let event_loop = EventLoop::new().expect("Event-Loop-Erstellung fehlgeschlagen");
     event_loop.set_control_flow(ControlFlow::Poll);

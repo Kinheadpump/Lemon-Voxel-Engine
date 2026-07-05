@@ -10,6 +10,10 @@ impl Chunk {
         Self { blocks: [0u16; CHUNK_VOLUME] }
     }
 
+    pub fn clear(&mut self) {
+        self.blocks.fill(0);
+    }
+
     #[inline(always)]
     pub const fn index_from_pos(x: u32, y: u32, z: u32) -> usize {
         (x + y * 32 + z * 1024) as usize
