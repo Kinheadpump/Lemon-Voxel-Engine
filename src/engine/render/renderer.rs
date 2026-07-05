@@ -160,4 +160,12 @@ impl ChunkRenderer {
             render_pass.draw_indirect(&arena.indirect_buffer, 0);
         }
     }
+
+    pub fn total_face_count(&self) -> usize {
+        self.face_scratch.iter().map(Vec::len).sum()
+    }
+
+    pub fn draw_call_count(&self) -> usize {
+        self.directions.len()
+    }
 }

@@ -19,6 +19,7 @@ pub struct InputState {
     move_up: bool,
     move_down: bool,
     mouse_delta: (f32, f32),
+    hud_toggle_requested: bool,
 }
 
 impl InputState {
@@ -30,8 +31,13 @@ impl InputState {
             KeyCode::KeyD => self.move_right = pressed,
             KeyCode::Space => self.move_up = pressed,
             KeyCode::ShiftLeft => self.move_down = pressed,
+            KeyCode::F3 if pressed => self.hud_toggle_requested = true,
             _ => {}
         }
+    }
+
+    pub fn take_hud_toggle_requested(&mut self) -> bool {
+        std::mem::take(&mut self.hud_toggle_requested)
     }
 
     pub fn handle_mouse_delta(&mut self, dx: f32, dy: f32) {

@@ -5,6 +5,8 @@ use winit::window::Window;
 use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::DirectionalMesh;
 
+use super::gpu_timer::GpuTimer;
+use super::hud::HudRenderer;
 use super::pipeline;
 use super::renderer::ChunkRenderer;
 
@@ -18,6 +20,8 @@ pub struct GpuContext {
     pub renderer: ChunkRenderer,
     depth_view: wgpu::TextureView,
     clear_color: wgpu::Color,
+    hud: HudRenderer,
+    gpu_timer: Option<GpuTimer>,
 }
 
 impl GpuContext {
@@ -43,10 +47,17 @@ impl GpuContext {
             .await
             .expect("Kein kompatibler GPU-Adapter gefunden");
 
+        let timer_features_supported = adapter.features().contains(super::gpu_timer::REQUIRED_FEATURES);
+        let required_features = if timer_features_supported {
+            super::gpu_timer::REQUIRED_FEATURES
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("primary_device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -79,6 +90,12 @@ impl GpuContext {
         let chunk_pipeline = pipeline::create(&device, &queue, config.format);
         let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height);
+        let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
+        let gpu_timer = GpuTimer::try_new(&device, &queue);
+
+        if gpu_timer.is_none() {
+            log::warn!("GPU-Timestamp-Queries auf dieser Hardware nicht unterstuetzt - GPU-Render-Time im HUD bleibt leer");
+        }
 
         Self {
             surface,
@@ -90,6 +107,8 @@ impl GpuContext {
             renderer,
             depth_view,
             clear_color: engine_config.clear_color,
+            hud,
+            gpu_timer,
         }
     }
 
@@ -107,6 +126,20 @@ impl GpuContext {
 
     pub fn upload_frame<'a>(&mut self, visible_chunks: impl Iterator<Item = (&'a DirectionalMesh, glam::Vec3)>) {
         self.renderer.upload_frame(&self.queue, visible_chunks);
+    }
+
+    pub fn toggle_hud(&mut self) {
+        self.hud.toggle();
+    }
+
+    pub fn update_hud_text(&mut self, lines: &[String]) {
+        let width = self.config.width as f32;
+        let height = self.config.height as f32;
+        self.hud.update_text(&self.queue, width, height, lines);
+    }
+
+    pub fn last_gpu_time_ms(&self) -> Option<f32> {
+        self.gpu_timer.as_ref().and_then(GpuTimer::last_gpu_time_ms)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -151,8 +184,10 @@ impl GpuContext {
             });
 
         {
+            let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear_pass"),
+                label: Some("chunk_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -170,7 +205,7 @@ impl GpuContext {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -179,7 +214,34 @@ impl GpuContext {
             self.renderer.render(&mut render_pass);
         }
 
+        if let Some(gpu_timer) = self.gpu_timer.as_mut() {
+            gpu_timer.resolve(&mut encoder);
+        }
+
+        {
+            let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hud_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.hud.render(&mut hud_pass);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        if let Some(gpu_timer) = self.gpu_timer.as_mut() {
+            gpu_timer.after_submit(&self.device);
+        }
+
         self.queue.present(frame);
     }
 }

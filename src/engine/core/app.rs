@@ -22,6 +22,7 @@ pub struct App {
     chunk_manager: ChunkManager,
     last_frame: Instant,
     last_stats_log: Instant,
+    fps_ema: f32,
 }
 
 impl App {
@@ -39,6 +40,7 @@ impl App {
             chunk_manager: ChunkManager::new(config.render_distance_chunks),
             last_frame: Instant::now(),
             last_stats_log: Instant::now(),
+            fps_ema: 0.0,
         }
     }
 
@@ -137,6 +139,14 @@ impl ApplicationHandler for App {
 
                 self.apply_movement(dt);
 
+                let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                self.fps_ema =
+                    if self.fps_ema <= 0.0 { instant_fps } else { self.fps_ema * 0.9 + instant_fps * 0.1 };
+
+                if self.input.take_hud_toggle_requested() {
+                    self.gpu.as_mut().expect("GPU-Kontext verschwunden").toggle_hud();
+                }
+
                 let view_proj = self.camera.view_projection(aspect);
                 let frustum = Frustum::from_view_projection(view_proj);
 
@@ -146,12 +156,38 @@ impl ApplicationHandler for App {
                 gpu.update_camera(view_proj);
                 gpu.upload_frame(self.chunk_manager.visible_chunks());
 
+                let gpu_ms_text = match gpu.last_gpu_time_ms() {
+                    Some(ms) => format!("{ms:.2}MS"),
+                    None => "N/A".to_string(),
+                };
+                let hud_lines = vec![
+                    format!("FPS: {:.0}", self.fps_ema),
+                    format!("FRAME: {:.2}MS / GPU: {}", dt * 1000.0, gpu_ms_text),
+                    format!(
+                        "CHUNKS: {} / {} VISIBLE",
+                        self.chunk_manager.loaded_chunk_count(),
+                        self.chunk_manager.visible_chunk_count()
+                    ),
+                    format!(
+                        "DRAW CALLS: {} / FACES: {}",
+                        gpu.renderer.draw_call_count(),
+                        gpu.renderer.total_face_count()
+                    ),
+                    format!(
+                        "POS: {:.1} / {:.1} / {:.1}",
+                        self.camera.position.x, self.camera.position.y, self.camera.position.z
+                    ),
+                ];
+                gpu.update_hud_text(&hud_lines);
+
                 gpu.render();
 
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;
                     log::info!(
-                        "Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        "FPS: {:.0} | Frame: {:.2}ms | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        self.fps_ema,
+                        dt * 1000.0,
                         self.chunk_manager.loaded_chunk_count(),
                         self.chunk_manager.visible_chunk_count(),
                         self.camera.position.x,

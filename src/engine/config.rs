@@ -5,6 +5,7 @@ pub struct EngineConfig {
     pub fov_y_radians: f32,
     pub render_distance_chunks: i32,
     pub clear_color: wgpu::Color,
+    pub hud_visible_default: bool,
 }
 
 impl Default for EngineConfig {
@@ -15,6 +16,7 @@ impl Default for EngineConfig {
             fov_y_radians: 60f32.to_radians(),
             render_distance_chunks: 4,
             clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
+            hud_visible_default: true,
         }
     }
 }
