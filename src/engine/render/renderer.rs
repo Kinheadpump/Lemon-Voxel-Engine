@@ -111,6 +111,14 @@ impl ChunkRenderer {
                                 ),
                             }),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&pipeline.block_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&pipeline.block_texture_sampler),
+                        },
                     ],
                 })
             })

@@ -12,10 +12,13 @@ struct DirectionUniform {
 @group(0) @binding(1) var<uniform> direction: DirectionUniform;
 @group(0) @binding(2) var<storage, read> faces: array<u32>;
 @group(0) @binding(3) var<storage, read> chunk_origins: array<vec4<f32>>;
+@group(0) @binding(4) var block_textures: texture_2d_array<f32>;
+@group(0) @binding(5) var block_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) @interpolate(flat) tex_id: u32,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) tex_layer: u32,
 };
 
 const CORNER_OFFSETS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
@@ -37,7 +40,7 @@ fn vs_main(
     let local_x = f32(packed & 0x1Fu);
     let local_y = f32((packed >> 5u) & 0x1Fu);
     let local_z = f32((packed >> 10u) & 0x1Fu);
-    let tex_id = (packed >> 15u) & 0x7Fu;
+    let tex_layer = (packed >> 15u) & 0x7Fu;
     let width = f32(((packed >> 22u) & 0x1Fu) + 1u);
     let height = f32(((packed >> 27u) & 0x1Fu) + 1u);
 
@@ -53,18 +56,12 @@ fn vs_main(
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
-    out.tex_id = tex_id;
+    out.uv = vec2<f32>(corner.x * width, corner.y * height);
+    out.tex_layer = tex_layer;
     return out;
-}
-
-fn tex_id_debug_color(id: u32) -> vec3<f32> {
-    let r = f32((id * 47u) % 251u) / 251.0;
-    let g = f32((id * 97u) % 251u) / 251.0;
-    let b = f32((id * 173u) % 251u) / 251.0;
-    return vec3<f32>(r, g, b);
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(tex_id_debug_color(in.tex_id), 1.0);
+    return textureSample(block_textures, block_sampler, in.uv, i32(in.tex_layer));
 }

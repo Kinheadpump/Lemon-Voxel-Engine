@@ -2,12 +2,15 @@ use bevy_math::Vec2;
 use noiz::Noise;
 use noiz::prelude::*;
 
+use crate::engine::render::textures::{TEXTURE_LAYER_DIRT, TEXTURE_LAYER_GRASS, TEXTURE_LAYER_STONE};
+
 use super::chunk::{CHUNK_SIZE, Chunk};
 
 const WORLD_SEED: u32 = 1337;
 const NOISE_FREQUENCY: f32 = 0.02;
 const BASE_HEIGHT: f32 = 12.0;
 const HEIGHT_AMPLITUDE: f32 = 10.0;
+const DIRT_LAYER_DEPTH: i32 = 3;
 
 pub struct TerrainGenerator {
     noise: Noise<common_noise::Perlin>,
@@ -37,7 +40,16 @@ impl TerrainGenerator {
                 let height = self.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1);
 
                 for local_y in 0..=height {
-                    chunk.set_block(local_x, local_y, local_z, 1);
+                    let depth_from_surface = height - local_y;
+                    let block_id = if depth_from_surface == 0 {
+                        TEXTURE_LAYER_GRASS
+                    } else if depth_from_surface <= DIRT_LAYER_DEPTH {
+                        TEXTURE_LAYER_DIRT
+                    } else {
+                        TEXTURE_LAYER_STONE
+                    } as u16;
+
+                    chunk.set_block(local_x, local_y, local_z, block_id);
                 }
             }
         }

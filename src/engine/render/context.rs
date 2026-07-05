@@ -75,7 +75,7 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
-        let chunk_pipeline = pipeline::create(&device, config.format);
+        let chunk_pipeline = pipeline::create(&device, &queue, config.format);
         let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height);
 
