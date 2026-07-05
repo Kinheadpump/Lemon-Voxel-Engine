@@ -2,15 +2,22 @@ pub mod game;
 pub mod engine;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::keyboard::PhysicalKey;
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use engine::core::mesher::mesh_chunk;
 use engine::render::pipeline;
+use game::input::{InputState, MoveCommand};
+use game::math::camera::Camera;
 use game::world::chunk::Chunk;
+
+const MOVE_SPEED_UNITS_PER_SEC: f32 = 12.0;
+const MOUSE_SENSITIVITY_RADIANS_PER_PIXEL: f32 = 0.0025;
 
 fn build_test_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
@@ -41,6 +48,7 @@ struct DirectionDrawData {
 
 struct ChunkDrawData {
     directions: [Option<DirectionDrawData>; 6],
+    camera_buffer: wgpu::Buffer,
 }
 
 fn build_chunk_draw_data(
@@ -91,7 +99,7 @@ fn build_chunk_draw_data(
         directions[dir] = Some(DirectionDrawData { bind_group, face_count: faces.len() as u32 });
     }
 
-    ChunkDrawData { directions }
+    ChunkDrawData { directions, camera_buffer }
 }
 
 struct GpuContext {
@@ -102,10 +110,11 @@ struct GpuContext {
     window: Arc<Window>,
     chunk_pipeline: pipeline::ChunkPipeline,
     chunk_draw_data: ChunkDrawData,
+    depth_view: wgpu::TextureView,
 }
 
 impl GpuContext {
-    async fn new(window: Arc<Window>) -> Self {
+    async fn new(window: Arc<Window>, initial_view_proj: glam::Mat4) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -162,18 +171,25 @@ impl GpuContext {
 
         let chunk_pipeline = pipeline::create(&device, config.format);
 
-        let aspect = config.width as f32 / config.height as f32;
-        let projection =
-            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 0.1, 200.0);
-        let view = glam::camera::rh::view::look_at_mat4(
-            glam::Vec3::new(48.0, 40.0, 48.0),
-            glam::Vec3::new(16.0, 8.0, 16.0),
-            glam::Vec3::Y,
-        );
         let chunk_draw_data =
-            build_chunk_draw_data(&device, &chunk_pipeline.bind_group_layout, projection * view);
+            build_chunk_draw_data(&device, &chunk_pipeline.bind_group_layout, initial_view_proj);
 
-        Self { surface, device, queue, config, window, chunk_pipeline, chunk_draw_data }
+        let depth_view = pipeline::create_depth_view(&device, config.width, config.height);
+
+        Self { surface, device, queue, config, window, chunk_pipeline, chunk_draw_data, depth_view }
+    }
+
+    fn aspect(&self) -> f32 {
+        self.config.width as f32 / self.config.height as f32
+    }
+
+    fn update_camera(&self, view_proj: glam::Mat4) {
+        let camera_data = pipeline::CameraUniformData { view_proj: view_proj.to_cols_array_2d() };
+        self.queue.write_buffer(
+            &self.chunk_draw_data.camera_buffer,
+            0,
+            bytemuck::bytes_of(&camera_data),
+        );
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -183,6 +199,7 @@ impl GpuContext {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.depth_view = pipeline::create_depth_view(&self.device, width, height);
     }
 
     fn render(&mut self) {
@@ -233,7 +250,14 @@ impl GpuContext {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -251,9 +275,55 @@ impl GpuContext {
     }
 }
 
-#[derive(Default)]
 struct App {
     gpu: Option<GpuContext>,
+    camera: Camera,
+    input: InputState,
+    last_frame: Instant,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            gpu: None,
+            camera: Camera::new(
+                glam::Vec3::new(48.0, 40.0, 48.0),
+                -3.0 * std::f32::consts::FRAC_PI_4,
+                -0.6155,
+            ),
+            input: InputState::default(),
+            last_frame: Instant::now(),
+        }
+    }
+}
+
+impl App {
+    fn apply_movement(&mut self, dt: f32) {
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let mut motion = glam::Vec3::ZERO;
+
+        for command in self.input.active_commands() {
+            match command {
+                MoveCommand::Forward => motion += forward,
+                MoveCommand::Backward => motion -= forward,
+                MoveCommand::StrafeLeft => motion -= right,
+                MoveCommand::StrafeRight => motion += right,
+                MoveCommand::Ascend => motion += glam::Vec3::Y,
+                MoveCommand::Descend => motion -= glam::Vec3::Y,
+            }
+        }
+
+        if motion != glam::Vec3::ZERO {
+            self.camera.position += motion.normalize() * MOVE_SPEED_UNITS_PER_SEC * dt;
+        }
+
+        let (dx, dy) = self.input.take_mouse_delta();
+        self.camera.rotate(
+            dx * MOUSE_SENSITIVITY_RADIANS_PER_PIXEL,
+            -dy * MOUSE_SENSITIVITY_RADIANS_PER_PIXEL,
+        );
+    }
 }
 
 impl ApplicationHandler for App {
@@ -269,7 +339,23 @@ impl ApplicationHandler for App {
                 .expect("Fenster-Erstellung fehlgeschlagen"),
         );
 
-        self.gpu = Some(pollster::block_on(GpuContext::new(window)));
+        window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+            .ok();
+        window.set_cursor_visible(false);
+
+        let aspect = window.inner_size().width.max(1) as f32 / window.inner_size().height.max(1) as f32;
+        let initial_view_proj = self.camera.view_projection(aspect);
+
+        self.gpu = Some(pollster::block_on(GpuContext::new(window, initial_view_proj)));
+        self.last_frame = Instant::now();
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.input.handle_mouse_delta(delta.0 as f32, delta.1 as f32);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -280,7 +366,29 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == winit::keyboard::KeyCode::Escape
+                        && event.state == ElementState::Pressed
+                    {
+                        event_loop.exit();
+                    }
+                    self.input.handle_key(code, event.state == ElementState::Pressed);
+                }
+            }
             WindowEvent::RedrawRequested => {
+                let aspect = gpu.aspect();
+
+                let now = Instant::now();
+                let dt = (now - self.last_frame).as_secs_f32();
+                self.last_frame = now;
+
+                self.apply_movement(dt);
+
+                let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
+                let view_proj = self.camera.view_projection(aspect);
+                gpu.update_camera(view_proj);
+
                 gpu.render();
                 gpu.window.request_redraw();
             }
