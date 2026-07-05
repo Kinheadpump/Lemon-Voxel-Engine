@@ -9,6 +9,7 @@ use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
 use super::pipeline;
 use super::renderer::ChunkRenderer;
+use super::ssao::SsaoPass;
 
 pub struct GpuContext {
     surface: wgpu::Surface<'static>,
@@ -18,10 +19,17 @@ pub struct GpuContext {
     pub window: Arc<Window>,
     chunk_pipeline: pipeline::ChunkPipeline,
     pub renderer: ChunkRenderer,
+    msaa_color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    resolve_color_view: wgpu::TextureView,
     clear_color: wgpu::Color,
     hud: HudRenderer,
     gpu_timer: Option<GpuTimer>,
+    ssao: SsaoPass,
+    msaa_samples: u32,
+    ssao_enabled: bool,
+    ssao_radius: f32,
+    ssao_strength: f32,
 }
 
 impl GpuContext {
@@ -87,9 +95,18 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
-        let chunk_pipeline = pipeline::create(&device, &queue, config.format);
+        let msaa_samples = engine_config.msaa_samples.max(1);
+
+        let chunk_pipeline = pipeline::create(&device, &queue, config.format, msaa_samples);
         let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj);
-        let depth_view = pipeline::create_depth_view(&device, config.width, config.height);
+        let msaa_color_view =
+            pipeline::create_msaa_color_view(&device, config.width, config.height, msaa_samples, config.format);
+        let depth_view = pipeline::create_depth_view(&device, config.width, config.height, msaa_samples);
+        let resolve_color_view = pipeline::create_resolve_color_view(&device, config.width, config.height, config.format);
+
+        let mut ssao = SsaoPass::new(&device, config.format);
+        ssao.rebuild_bind_group(&device, &depth_view, &resolve_color_view);
+
         let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
         let gpu_timer = GpuTimer::try_new(&device, &queue);
 
@@ -105,10 +122,17 @@ impl GpuContext {
             window,
             chunk_pipeline,
             renderer,
+            msaa_color_view,
             depth_view,
+            resolve_color_view,
             clear_color: engine_config.clear_color,
             hud,
             gpu_timer,
+            ssao,
+            msaa_samples,
+            ssao_enabled: engine_config.ssao_enabled,
+            ssao_radius: engine_config.ssao_radius,
+            ssao_strength: engine_config.ssao_strength,
         }
     }
 
@@ -122,6 +146,18 @@ impl GpuContext {
 
     pub fn update_camera(&self, view_proj: glam::Mat4) {
         self.renderer.update_camera(&self.queue, view_proj);
+    }
+
+    pub fn update_ssao(&self, projection: glam::Mat4) {
+        self.ssao.update_uniforms(
+            &self.queue,
+            projection,
+            self.config.width as f32,
+            self.config.height as f32,
+            self.ssao_radius,
+            self.ssao_strength,
+            self.ssao_enabled,
+        );
     }
 
     pub fn upload_frame<'a>(&mut self, visible_chunks: impl Iterator<Item = (&'a DirectionalMesh, glam::Vec3)>) {
@@ -142,6 +178,12 @@ impl GpuContext {
         self.gpu_timer.as_ref().and_then(GpuTimer::last_gpu_time_ms)
     }
 
+    pub fn vram_usage_mb(&self) -> Option<f32> {
+        self.device
+            .generate_allocator_report()
+            .map(|report| report.total_allocated_bytes as f32 / (1024.0 * 1024.0))
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -149,7 +191,11 @@ impl GpuContext {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = pipeline::create_depth_view(&self.device, width, height);
+        self.msaa_color_view =
+            pipeline::create_msaa_color_view(&self.device, width, height, self.msaa_samples, self.config.format);
+        self.depth_view = pipeline::create_depth_view(&self.device, width, height, self.msaa_samples);
+        self.resolve_color_view = pipeline::create_resolve_color_view(&self.device, width, height, self.config.format);
+        self.ssao.rebuild_bind_group(&self.device, &self.depth_view, &self.resolve_color_view);
     }
 
     pub fn render(&mut self) {
@@ -173,7 +219,7 @@ impl GpuContext {
             }
         };
 
-        let view = frame
+        let swapchain_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -187,10 +233,10 @@ impl GpuContext {
             let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
 
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("chunk_pass"),
+                label: Some("chunk_opaque_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &self.msaa_color_view,
+                    resolve_target: Some(&self.resolve_color_view),
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear_color),
@@ -219,10 +265,28 @@ impl GpuContext {
         }
 
         {
+            let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao_post_process_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &swapchain_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(self.clear_color), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.ssao.render(&mut ssao_pass);
+        }
+
+        {
             let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hud_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &swapchain_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },

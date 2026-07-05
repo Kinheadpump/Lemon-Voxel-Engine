@@ -6,6 +6,10 @@ pub struct EngineConfig {
     pub render_distance_chunks: i32,
     pub clear_color: wgpu::Color,
     pub hud_visible_default: bool,
+    pub msaa_samples: u32,
+    pub ssao_enabled: bool,
+    pub ssao_radius: f32,
+    pub ssao_strength: f32,
 }
 
 impl Default for EngineConfig {
@@ -17,6 +21,10 @@ impl Default for EngineConfig {
             render_distance_chunks: 4,
             clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
             hud_visible_default: true,
+            msaa_samples: 4,
+            ssao_enabled: true,
+            ssao_radius: 2.0,
+            ssao_strength: 1.4,
         }
     }
 }

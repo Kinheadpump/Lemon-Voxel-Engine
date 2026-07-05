@@ -86,7 +86,12 @@ fn create_block_texture_array(device: &wgpu::Device, queue: &wgpu::Queue) -> (wg
     (view, sampler)
 }
 
-pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat) -> ChunkPipeline {
+pub fn create(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    surface_format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> ChunkPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("chunk_face_shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -187,7 +192,7 @@ pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState { count: sample_count, mask: !0, alpha_to_coverage_enabled: false },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
@@ -205,15 +210,59 @@ pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::
     ChunkPipeline { pipeline, bind_group_layout, block_texture_view, block_texture_sampler }
 }
 
-pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth_texture"),
         size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Multisampled Color-Ziel fuer den Opaque-Pass (Hardware-MSAA). Wird per `resolve_target` in ein
+/// normales, sampelbares Ziel aufgeloest, bevor der Post-Processing-Pass (SSAO) darauf zugreift.
+pub fn create_msaa_color_view(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("msaa_color_texture"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Aufgeloestes (nicht multisampled) Opaque-Farbziel, sampelbar fuer den Post-Processing-Pass.
+pub fn create_resolve_color_view(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("resolved_color_texture"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
 

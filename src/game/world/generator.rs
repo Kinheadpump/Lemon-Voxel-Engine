@@ -12,6 +12,11 @@ const BASE_HEIGHT: f32 = 12.0;
 const HEIGHT_AMPLITUDE: f32 = 10.0;
 const DIRT_LAYER_DEPTH: i32 = 3;
 
+/// Die Ursprungszelle des `noiz`-Gradientenrauschens (Welt-Koordinaten nahe (0,0)) ist
+/// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
+/// verschiebt jede Sample-Koordinate weit weg vom Ursprung und umgeht das vollstaendig.
+const NOISE_ORIGIN_OFFSET: f32 = 10_000.0;
+
 pub struct TerrainGenerator {
     noise: Noise<common_noise::Perlin>,
 }
@@ -24,8 +29,10 @@ impl TerrainGenerator {
     }
 
     pub fn height_at(&self, world_x: i32, world_z: i32) -> i32 {
-        let sample_point =
-            Vec2::new(world_x as f32 * NOISE_FREQUENCY, world_z as f32 * NOISE_FREQUENCY);
+        let sample_point = Vec2::new(
+            world_x as f32 * NOISE_FREQUENCY + NOISE_ORIGIN_OFFSET,
+            world_z as f32 * NOISE_FREQUENCY + NOISE_ORIGIN_OFFSET,
+        );
         let raw: f32 = self.noise.sample(sample_point);
         (BASE_HEIGHT + raw * HEIGHT_AMPLITUDE) as i32
     }

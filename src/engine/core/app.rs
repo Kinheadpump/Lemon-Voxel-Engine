@@ -154,15 +154,21 @@ impl ApplicationHandler for App {
 
                 let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
                 gpu.update_camera(view_proj);
+                gpu.update_ssao(self.camera.projection_matrix(aspect));
                 gpu.upload_frame(self.chunk_manager.visible_chunks());
 
                 let gpu_ms_text = match gpu.last_gpu_time_ms() {
                     Some(ms) => format!("{ms:.2}MS"),
                     None => "N/A".to_string(),
                 };
+                let vram_text = match gpu.vram_usage_mb() {
+                    Some(mb) => format!("{mb:.1}MB"),
+                    None => "N/A".to_string(),
+                };
                 let hud_lines = vec![
                     format!("FPS: {:.0}", self.fps_ema),
                     format!("FRAME: {:.2}MS / GPU: {}", dt * 1000.0, gpu_ms_text),
+                    format!("VRAM: {}", vram_text),
                     format!(
                         "CHUNKS: {} / {} VISIBLE",
                         self.chunk_manager.loaded_chunk_count(),
@@ -185,9 +191,10 @@ impl ApplicationHandler for App {
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;
                     log::info!(
-                        "FPS: {:.0} | Frame: {:.2}ms | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
                         self.fps_ema,
                         dt * 1000.0,
+                        vram_text,
                         self.chunk_manager.loaded_chunk_count(),
                         self.chunk_manager.visible_chunk_count(),
                         self.camera.position.x,

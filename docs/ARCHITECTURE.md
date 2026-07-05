@@ -31,6 +31,10 @@ Das Rendering verzichtet komplett auf das Senden einzelner Würfel. Die Pipeline
 
 ---
 
+### 2.1 Speicher-Architektur & Restriktionen
+- **Keine Sparse Voxel Octrees (SVOs):** Die Engine verzichtet explizit auf Octrees. SVOs sparen zwar RAM, zerstören aber die Cache-Lokalität der CPU.
+- **Flache Arrays:** Jeder Chunk nutzt zwingend ein lineares Array `[u16; 32768]` (32x32x32). Dies garantiert $O(1)$ Zugriffszeiten und maximale Speicherbandbreite beim Evaluieren des Greedy-Meshing-Algorithmus.
+
 ## 3. Die 32-Bit Vertex-Kompression (Zero-Waste)
 
 Die gesamte Information einer Rechteck-Ecke (Face-Instanz) wird lückenlos in einem einzigen vorzeichenlosen 32-Bit-Integer (`u32`) komprimiert. Da die Chunks in 6 Richtungs-Meshes aufgeteilt sind, entfällt die Speicherung der Normalen komplett.
@@ -73,6 +77,11 @@ Im WGSL-Shader wird über die eingebaute Variable `@builtin(draw_index)` (entspr
 
 ### Texture Batching (Texture2DArray)
 Um den State-Change-Overhead zu eliminieren und das `draw_indirect` nicht zu brechen, werden alle Block-Texturen in einem einzigen **Texture2DArray** auf die GPU geladen. Der `texture_id` Wert aus dem komprimierten 32-Bit-Vertex dient im Fragment-Shader direkt als Layer-Index für den Array-Zugriff.
+
+### 4.1 Rendering-Roadmap & Restriktionen
+- **Verbotene Techniken:** Geometry Shaders und Hardware-Tessellation werden aufgrund schlechter Performance auf modernen GPUs strikt untersagt. Wir nutzen ausschließlich Vertex Pulling via SSBOs.
+- **Zukünftige Optimierungen:** Implementierung von Frustum & Occlusion Culling. Weit entfernte Chunks erhalten ein algorithmisch gedownsampletes Mesh (Level of Detail).
+- **Beleuchtung (Roadmap):** Die Lichtausbreitung erfolgt später über einen Floodfill-Algorithmus (Breadth-First Search) über die Chunk-Grenzen hinweg.
 
 ## 5. Skalierung & Tiefenpufferung
 
