@@ -10,11 +10,15 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::engine::config::EngineConfig;
 use crate::engine::render::context::GpuContext;
+use crate::engine::render::textures::TEXTURE_LAYER_STONE;
 use crate::game::input::{InputState, MoveCommand};
 use crate::game::math::camera::Camera;
 use crate::game::math::frustum::Frustum;
 use crate::game::physics::PlayerPhysics;
-use crate::game::world::manager::ChunkManager;
+use crate::game::world::manager::{ChunkManager, INTERACTION_REACH};
+
+/// Block-Typ, der beim Platzieren verwendet wird - "einfache" Interaktion ohne Inventar/Auswahl.
+const PLACE_BLOCK_ID: u16 = TEXTURE_LAYER_STONE as u16;
 
 pub struct App {
     config: EngineConfig,
@@ -105,10 +109,13 @@ impl App {
             horizontal = horizontal.normalize() * speed;
         }
 
-        let generator = Arc::clone(self.chunk_manager.generator());
+        // Kollisionsabfrage respektiert geladene/editierte Chunk-Daten (nicht nur das prozedurale
+        // Terrain), damit abgebaute/platzierte Bloecke sofort physikalisch wirksam sind.
+        let chunk_manager = &self.chunk_manager;
+        let is_solid = |x: i32, y: i32, z: i32| chunk_manager.is_solid_at(x, y, z);
         self.physics.advance(
             dt,
-            &generator,
+            &is_solid,
             &mut self.camera.position,
             horizontal,
             self.input.is_jump_or_ascend_held(),
@@ -168,6 +175,9 @@ impl ApplicationHandler for App {
                     self.input.handle_key(code, event.state == ElementState::Pressed);
                 }
             }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.input.handle_mouse_button(button, state == ElementState::Pressed);
+            }
             WindowEvent::RedrawRequested => {
                 let aspect = gpu.aspect();
 
@@ -202,6 +212,39 @@ impl ApplicationHandler for App {
                 gpu.update_ssao(self.camera.projection_matrix(aspect));
 
                 let queue = gpu.queue().clone();
+
+                if self.input.take_mine_requested() {
+                    if let Some(hit) =
+                        self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                    {
+                        self.chunk_manager.set_block(
+                            hit.block.x,
+                            hit.block.y,
+                            hit.block.z,
+                            0,
+                            &queue,
+                            &mut gpu.renderer,
+                        );
+                    }
+                }
+                if self.input.take_place_requested() {
+                    if let Some(hit) =
+                        self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                    {
+                        let target = hit.block + hit.normal;
+                        if !self.physics.occupies_block(self.camera.position, target) {
+                            self.chunk_manager.set_block(
+                                target.x,
+                                target.y,
+                                target.z,
+                                PLACE_BLOCK_ID,
+                                &queue,
+                                &mut gpu.renderer,
+                            );
+                        }
+                    }
+                }
+
                 self.chunk_manager.update(self.camera.position, &frustum, &queue, &mut gpu.renderer);
 
                 let mode_text = if self.physics.flying {

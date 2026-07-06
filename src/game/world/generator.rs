@@ -42,25 +42,31 @@ impl TerrainGenerator {
         (self.base_height + raw * self.height_amplitude) as i32
     }
 
-    /// Einzige Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener Chunk-Daten -
-    /// genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen) UND von der Physik (Kollision).
-    /// Da das Terrain rein prozedural ist (noch keine Block-Edits), ist eine Hoehenabfrage
-    /// ausreichend und immer verfuegbar, auch fuer noch nicht gemeshte Chunks.
+    /// Fallback-Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener/editierter
+    /// Chunk-Daten - genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten
+    /// Chunks) UND von `ChunkManager::is_solid_at` fuer Regionen, die (noch) nicht geladen sind.
+    /// Kein Clamp mehr auf eine einzelne Chunk-Hoehe - das Terrain ist jetzt vertikal ungebunden,
+    /// die Chunk-Aufteilung in Y ist reine Streaming-Granularitaet.
     pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
-        world_y >= 0 && world_y <= self.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1)
+        world_y >= 0 && world_y <= self.height_at(world_x, world_z)
     }
 
-    pub fn generate_chunk(&self, chunk_x: i32, chunk_z: i32, chunk: &mut Chunk) {
+    pub fn generate_chunk(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
         chunk.clear();
 
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
                 let world_x = chunk_x * CHUNK_SIZE + local_x;
                 let world_z = chunk_z * CHUNK_SIZE + local_z;
-                let height = self.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1);
+                let height = self.height_at(world_x, world_z);
 
-                for local_y in 0..=height {
-                    let depth_from_surface = height - local_y;
+                for local_y in 0..CHUNK_SIZE {
+                    let world_y = chunk_y * CHUNK_SIZE + local_y;
+                    if world_y < 0 || world_y > height {
+                        continue;
+                    }
+
+                    let depth_from_surface = height - world_y;
                     let block_id = if depth_from_surface == 0 {
                         TEXTURE_LAYER_GRASS
                     } else if depth_from_surface <= self.dirt_layer_depth {

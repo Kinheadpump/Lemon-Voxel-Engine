@@ -14,6 +14,13 @@ impl Chunk {
         self.blocks.fill(0);
     }
 
+    /// Guenstige Vorabpruefung, um das teure Greedy-Meshing (6 Richtungen * 32 Ebenen) fuer
+    /// Chunks zu ueberspringen, die ohnehin keine Faces erzeugen wuerden - bei vertikal gestapelten
+    /// Chunks ist der weit ueberwiegende Teil (alles oberhalb der Terrainhoehe) reine Luft.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.iter().all(|&block| block == 0)
+    }
+
     #[inline(always)]
     pub const fn index_from_pos(x: u32, y: u32, z: u32) -> usize {
         (x + y * 32 + z * 1024) as usize
@@ -42,5 +49,32 @@ impl Chunk {
             return 0;
         }
         self.blocks[Self::index_from_pos(x as u32, y as u32, z as u32)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_chunk_is_empty() {
+        assert!(Chunk::empty().is_empty());
+    }
+
+    #[test]
+    fn placing_a_block_makes_it_non_empty() {
+        let mut chunk = Chunk::empty();
+        chunk.set_block(1, 2, 3, 7);
+        assert!(!chunk.is_empty());
+        assert_eq!(chunk.get_block(1, 2, 3), 7);
+    }
+
+    #[test]
+    fn out_of_bounds_access_is_a_noop() {
+        let mut chunk = Chunk::empty();
+        chunk.set_block(-1, 0, 0, 9);
+        chunk.set_block(CHUNK_SIZE, 0, 0, 9);
+        assert!(chunk.is_empty());
+        assert_eq!(chunk.get_block(-1, 0, 0), 0);
     }
 }

@@ -14,7 +14,7 @@ const CHUNK_DATA_STRIDE_BYTES: u64 = 16;
 #[derive(Clone, Copy, Default)]
 pub struct ChunkGpuHandle {
     slots: [Slot; 6],
-    origin_xz: [f32; 2],
+    origin: [f32; 3],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -207,7 +207,7 @@ impl ChunkRenderer {
         mesh: &DirectionalMesh,
         origin: glam::Vec3,
     ) -> ChunkGpuHandle {
-        let mut handle = ChunkGpuHandle { slots: Default::default(), origin_xz: [origin.x, origin.z] };
+        let mut handle = ChunkGpuHandle { slots: Default::default(), origin: [origin.x, origin.y, origin.z] };
 
         for (dir, arena) in self.directions.iter_mut().enumerate() {
             let faces = &mesh.faces[dir];
@@ -260,7 +260,7 @@ impl ChunkRenderer {
                     first_vertex: 0,
                     first_instance: slot.offset,
                 });
-                arena.chunk_data_scratch.push([handle.origin_xz[0], 0.0, handle.origin_xz[1], 0.0]);
+                arena.chunk_data_scratch.push([handle.origin[0], handle.origin[1], handle.origin[2], 0.0]);
                 self.visible_face_count += slot.count as usize;
             }
 

@@ -1,3 +1,4 @@
+use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct InputState {
     hud_toggle_requested: bool,
     fly_toggle_requested: bool,
     wireframe_toggle_requested: bool,
+    mine_requested: bool,
+    place_requested: bool,
     active_commands_scratch: Vec<MoveCommand>,
 }
 
@@ -41,6 +44,25 @@ impl InputState {
             KeyCode::KeyF if pressed => self.fly_toggle_requested = true,
             _ => {}
         }
+    }
+
+    pub fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        if !pressed {
+            return;
+        }
+        match button {
+            MouseButton::Left => self.mine_requested = true,
+            MouseButton::Right => self.place_requested = true,
+            _ => {}
+        }
+    }
+
+    pub fn take_mine_requested(&mut self) -> bool {
+        std::mem::take(&mut self.mine_requested)
+    }
+
+    pub fn take_place_requested(&mut self) -> bool {
+        std::mem::take(&mut self.place_requested)
     }
 
     pub fn is_sprinting(&self) -> bool {

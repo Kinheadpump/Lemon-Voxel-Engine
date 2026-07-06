@@ -11,6 +11,9 @@ pub struct EngineConfig {
     pub mouse_sensitivity: f32,
     pub fov_y_radians: f32,
     pub render_distance_chunks: i32,
+    /// Anzahl vertikal gestapelter Chunks (Weltboden bei Chunk-Y=0, Bauhoehe = `world_height_chunks
+    /// * CHUNK_SIZE`). Ersetzt die alte Ein-Schicht-Annahme, die Terrainhoehe hart auf 31 gedeckelt hat.
+    pub world_height_chunks: i32,
     pub clear_color: wgpu::Color,
     pub hud_visible_default: bool,
     pub msaa_samples: u32,
@@ -48,6 +51,7 @@ impl Default for EngineConfig {
             mouse_sensitivity: 0.0025,
             fov_y_radians: 60f32.to_radians(),
             render_distance_chunks: 4,
+            world_height_chunks: 4,
             clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
             hud_visible_default: true,
             msaa_samples: 4,
@@ -72,7 +76,9 @@ impl Default for EngineConfig {
             fixed_timestep: 1.0 / 60.0,
             max_physics_steps_per_frame: 8,
 
-            chunk_pool_size: 4300,
+            // Muss mind. (2*render_distance_chunks+1)^2 * world_height_chunks abdecken, sonst werden
+            // Chunks am Rand der Render-Distanz stillschweigend nicht geladen (Pool erschoepft).
+            chunk_pool_size: 512,
             max_faces_per_direction: 3_000_000,
             max_draws_per_direction: 4300,
         }
@@ -126,6 +132,7 @@ struct ConfigFile {
     mouse_sensitivity: f32,
     fov_degrees: f32,
     render_distance_chunks: i32,
+    world_height_chunks: i32,
     clear_color_rgb: [f64; 3],
     hud_visible_default: bool,
     msaa_samples: u32,
@@ -169,6 +176,7 @@ impl From<EngineConfig> for ConfigFile {
             mouse_sensitivity: c.mouse_sensitivity,
             fov_degrees: c.fov_y_radians.to_degrees(),
             render_distance_chunks: c.render_distance_chunks,
+            world_height_chunks: c.world_height_chunks,
             clear_color_rgb: [c.clear_color.r, c.clear_color.g, c.clear_color.b],
             hud_visible_default: c.hud_visible_default,
             msaa_samples: c.msaa_samples,
@@ -208,6 +216,7 @@ impl From<ConfigFile> for EngineConfig {
             mouse_sensitivity: f.mouse_sensitivity,
             fov_y_radians: f.fov_degrees.to_radians(),
             render_distance_chunks: f.render_distance_chunks.clamp(1, 32),
+            world_height_chunks: f.world_height_chunks.clamp(1, 16),
             clear_color: wgpu::Color {
                 r: f.clear_color_rgb[0],
                 g: f.clear_color_rgb[1],
