@@ -11,7 +11,7 @@ struct DirectionUniform {
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> direction: DirectionUniform;
 @group(0) @binding(2) var<storage, read> faces: array<u32>;
-@group(0) @binding(3) var<storage, read> chunk_origins: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> chunk_origins: array<vec2<f32>>;
 @group(0) @binding(4) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(5) var block_sampler: sampler;
 
@@ -46,7 +46,8 @@ fn vs_main(
 
     let local_pos = vec3<f32>(local_x, local_y, local_z);
     let plane_offset = max(direction.normal.xyz, vec3<f32>(0.0));
-    let chunk_origin = chunk_origins[instance_index].xyz;
+    let chunk_xz = chunk_origins[instance_index];
+    let chunk_origin = vec3<f32>(chunk_xz.x, 0.0, chunk_xz.y);
     let origin = chunk_origin + local_pos + plane_offset;
 
     let corner = CORNER_OFFSETS[vertex_index % 6u];

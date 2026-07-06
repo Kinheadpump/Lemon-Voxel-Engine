@@ -10,7 +10,8 @@ sprint_multiplier = 4.0
 mouse_sensitivity = 0.0025
 # Vertikales Sichtfeld in Grad.
 fov_degrees = 60.0
-# Chunk-Radius um den Spieler (1..15). 4 => 9x9 Chunks, 6 => 13x13, usw.
+# Chunk-Radius um den Spieler (1..32). 4 => 9x9 Chunks, 16 => 33x33 (1089), 32 => 65x65 (4225).
+# Geometrie wird persistent auf der GPU gehalten; hohe Werte kosten v.a. RAM (64 KiB pro Chunk).
 render_distance_chunks = 4
 # Hintergrund-/Himmelfarbe als linearer RGB-Wert (0.0..1.0).
 clear_color_rgb = [0.02, 0.02, 0.02]

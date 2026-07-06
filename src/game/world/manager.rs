@@ -5,19 +5,21 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use rayon::prelude::*;
 
 use crate::engine::core::mesher::{DirectionalMesh, mesh_chunk};
+use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::frustum::Frustum;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generator::TerrainGenerator;
 
-pub const POOL_SIZE: usize = 1000;
+/// Vorallozierter Chunk-Pool. Deckt Render-Distanz bis 32 ab ((2*32+1)^2 = 4225 Chunks) mit
+/// Reserve. Jeder Chunk belegt 64 KiB RAM.
+pub const POOL_SIZE: usize = 4300;
 
 type ChunkCoord = (i32, i32);
 
 struct LoadedChunk {
     pool_slot: usize,
-    mesh: DirectionalMesh,
-    origin: glam::Vec3,
+    gpu_handle: ChunkGpuHandle,
 }
 
 struct GenerationResult {
@@ -36,7 +38,8 @@ pub struct ChunkManager {
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
-    visible_coords: Vec<ChunkCoord>,
+    visible_handles: Vec<ChunkGpuHandle>,
+    visible_count: usize,
 }
 
 impl ChunkManager {
@@ -54,7 +57,8 @@ impl ChunkManager {
             result_tx,
             result_rx,
             render_distance_chunks,
-            visible_coords: Vec::new(),
+            visible_handles: Vec::new(),
+            visible_count: 0,
         }
     }
 
@@ -63,19 +67,17 @@ impl ChunkManager {
     }
 
     pub fn visible_chunk_count(&self) -> usize {
-        self.visible_coords.len()
+        self.visible_count
     }
 
-    /// Meshes aller aktuell sichtbaren (frustum-getesteten) Chunks, fuer die Kompaktierung
-    /// in den Renderer-Frame-Buffer.
-    pub fn visible_chunks(&self) -> impl Iterator<Item = (&DirectionalMesh, glam::Vec3)> {
-        self.visible_coords
-            .iter()
-            .filter_map(move |coord| self.loaded.get(coord).map(|loaded| (&loaded.mesh, loaded.origin)))
-    }
-
-    pub fn update(&mut self, camera_position: glam::Vec3, frustum: &Frustum) {
-        self.apply_completed_generations();
+    pub fn update(
+        &mut self,
+        camera_position: glam::Vec3,
+        frustum: &Frustum,
+        queue: &wgpu::Queue,
+        renderer: &mut ChunkRenderer,
+    ) {
+        self.apply_completed_generations(queue, renderer);
 
         let center_x = (camera_position.x / CHUNK_SIZE as f32).floor() as i32;
         let center_z = (camera_position.z / CHUNK_SIZE as f32).floor() as i32;
@@ -90,7 +92,7 @@ impl ChunkManager {
         let to_unload: Vec<ChunkCoord> =
             self.loaded.keys().copied().filter(|coord| !desired.contains(coord)).collect();
         for coord in to_unload {
-            self.unload_chunk(coord);
+            self.unload_chunk(coord, renderer);
         }
 
         for coord in desired {
@@ -120,11 +122,11 @@ impl ChunkManager {
             });
         }
 
-        self.update_visibility(frustum);
+        self.update_visibility(frustum, queue, renderer);
     }
 
-    fn update_visibility(&mut self, frustum: &Frustum) {
-        self.visible_coords = self
+    fn update_visibility(&mut self, frustum: &Frustum, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
+        let visible_coords: Vec<ChunkCoord> = self
             .loaded
             .par_iter()
             .filter_map(|(coord, _)| {
@@ -134,9 +136,19 @@ impl ChunkManager {
                 frustum.intersects_aabb(min, max).then_some(*coord)
             })
             .collect();
+
+        self.visible_handles.clear();
+        for coord in &visible_coords {
+            if let Some(loaded) = self.loaded.get(coord) {
+                self.visible_handles.push(loaded.gpu_handle);
+            }
+        }
+        self.visible_count = self.visible_handles.len();
+
+        renderer.set_visible(queue, &self.visible_handles);
     }
 
-    fn apply_completed_generations(&mut self) {
+    fn apply_completed_generations(&mut self, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         while let Ok(result) = self.result_rx.try_recv() {
             self.in_flight.remove(&result.coord);
 
@@ -146,26 +158,22 @@ impl ChunkManager {
                 (result.coord.1 * CHUNK_SIZE) as f32,
             );
 
-            let total_faces: usize = result.mesh.faces.iter().map(|f| f.len()).sum();
-            log::debug!(
-                "Chunk {:?} gemesht: faces={:?} total={}",
-                result.coord,
-                result.mesh.faces.iter().map(|f| f.len()).collect::<Vec<_>>(),
-                total_faces
-            );
+            let gpu_handle = renderer.alloc_chunk(queue, &result.mesh, origin);
 
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
                 result.coord,
-                LoadedChunk { pool_slot: result.pool_slot, mesh: result.mesh, origin },
+                LoadedChunk { pool_slot: result.pool_slot, gpu_handle },
             );
         }
     }
 
-    fn unload_chunk(&mut self, coord: ChunkCoord) {
+    fn unload_chunk(&mut self, coord: ChunkCoord, renderer: &mut ChunkRenderer) {
         let Some(loaded) = self.loaded.remove(&coord) else {
             return;
         };
+
+        renderer.free_chunk(&loaded.gpu_handle);
 
         if let Some(mut chunk) = self.pool[loaded.pool_slot].take() {
             chunk.clear();

@@ -39,7 +39,7 @@ async fn render_top_down_green_ratio() -> f32 {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("headless"),
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE,
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -68,7 +68,8 @@ async fn render_top_down_green_ratio() -> f32 {
         wy >= 0 && wy <= generator.height_at(wx, wz).clamp(0, CHUNK_SIZE - 1)
     });
     renderer.update_camera(&queue, view_proj);
-    renderer.upload_frame(&queue, std::iter::once((&mesh, glam::Vec3::ZERO)));
+    let handle = renderer.alloc_chunk(&queue, &mesh, glam::Vec3::ZERO);
+    renderer.set_visible(&queue, &[handle]);
 
     let msaa_color = create_msaa_color_view(&device, SIZE, SIZE, SAMPLES, FORMAT);
     let depth = create_depth_view(&device, SIZE, SIZE, SAMPLES);

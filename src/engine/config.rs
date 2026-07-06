@@ -123,7 +123,7 @@ impl From<ConfigFile> for EngineConfig {
             sprint_multiplier: f.sprint_multiplier,
             mouse_sensitivity: f.mouse_sensitivity,
             fov_y_radians: f.fov_degrees.to_radians(),
-            render_distance_chunks: f.render_distance_chunks.clamp(1, 15),
+            render_distance_chunks: f.render_distance_chunks.clamp(1, 32),
             clear_color: wgpu::Color {
                 r: f.clear_color_rgb[0],
                 g: f.clear_color_rgb[1],

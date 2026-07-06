@@ -3,7 +3,6 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::engine::config::EngineConfig;
-use crate::engine::core::mesher::DirectionalMesh;
 
 use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
@@ -55,12 +54,11 @@ impl GpuContext {
             .await
             .expect("Kein kompatibler GPU-Adapter gefunden");
 
-        let timer_features_supported = adapter.features().contains(super::gpu_timer::REQUIRED_FEATURES);
-        let required_features = if timer_features_supported {
-            super::gpu_timer::REQUIRED_FEATURES
-        } else {
-            wgpu::Features::empty()
-        };
+        let adapter_features = adapter.features();
+        let mut required_features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        if adapter_features.contains(super::gpu_timer::REQUIRED_FEATURES) {
+            required_features |= super::gpu_timer::REQUIRED_FEATURES;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -158,10 +156,6 @@ impl GpuContext {
             self.ssao_strength,
             self.ssao_enabled,
         );
-    }
-
-    pub fn upload_frame<'a>(&mut self, visible_chunks: impl Iterator<Item = (&'a DirectionalMesh, glam::Vec3)>) {
-        self.renderer.upload_frame(&self.queue, visible_chunks);
     }
 
     pub fn toggle_hud(&mut self) {
