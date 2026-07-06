@@ -23,3 +23,10 @@ msaa_samples = 4
 ssao_enabled = true
 ssao_radius = 2.0
 ssao_strength = 1.4
+# Fallbeschleunigung in Bloecken/Sekunde^2 (nur wirksam wenn nicht im Flugmodus, siehe unten).
+gravity = 26.0
+# Sprunggeschwindigkeit in Bloecken/Sekunde.
+jump_speed = 9.0
+# Startmodus: true = Flug (kein Fallen/Kollision), false = Laufen (Gravitation + Kollision).
+# Mit "F" jederzeit im Spiel umschaltbar.
+start_flying = true

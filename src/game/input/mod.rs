@@ -21,6 +21,8 @@ pub struct InputState {
     sprinting: bool,
     mouse_delta: (f32, f32),
     hud_toggle_requested: bool,
+    fly_toggle_requested: bool,
+    wireframe_toggle_requested: bool,
 }
 
 impl InputState {
@@ -34,6 +36,8 @@ impl InputState {
             KeyCode::ControlLeft | KeyCode::ControlRight => self.move_down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.sprinting = pressed,
             KeyCode::F3 if pressed => self.hud_toggle_requested = true,
+            KeyCode::F4 if pressed => self.wireframe_toggle_requested = true,
+            KeyCode::KeyF if pressed => self.fly_toggle_requested = true,
             _ => {}
         }
     }
@@ -42,8 +46,21 @@ impl InputState {
         self.sprinting
     }
 
+    /// Space dient im Flugmodus als Steigen, im Laufmodus als Sprung-Eingabe.
+    pub fn is_jump_or_ascend_held(&self) -> bool {
+        self.move_up
+    }
+
     pub fn take_hud_toggle_requested(&mut self) -> bool {
         std::mem::take(&mut self.hud_toggle_requested)
+    }
+
+    pub fn take_fly_toggle_requested(&mut self) -> bool {
+        std::mem::take(&mut self.fly_toggle_requested)
+    }
+
+    pub fn take_wireframe_toggle_requested(&mut self) -> bool {
+        std::mem::take(&mut self.wireframe_toggle_requested)
     }
 
     pub fn handle_mouse_delta(&mut self, dx: f32, dy: f32) {
@@ -55,8 +72,10 @@ impl InputState {
         std::mem::take(&mut self.mouse_delta)
     }
 
+    /// Horizontale Bewegungskommandos (WASD). Ascend/Descend werden separat behandelt, da sie im
+    /// Laufmodus keine Bedeutung haben (Space = Sprung, Strg = ungenutzt).
     pub fn active_commands(&self) -> Vec<MoveCommand> {
-        let mut commands = Vec::with_capacity(6);
+        let mut commands = Vec::with_capacity(4);
         if self.move_forward {
             commands.push(MoveCommand::Forward);
         }

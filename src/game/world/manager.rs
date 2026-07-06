@@ -70,6 +70,10 @@ impl ChunkManager {
         self.visible_count
     }
 
+    pub fn generator(&self) -> &Arc<TerrainGenerator> {
+        &self.generator
+    }
+
     pub fn update(
         &mut self,
         camera_position: glam::Vec3,
@@ -114,8 +118,7 @@ impl ChunkManager {
                 generator.generate_chunk(coord.0, coord.1, &mut chunk);
 
                 let mesh = mesh_chunk(&chunk, coord.0, coord.1, |world_x, world_y, world_z| {
-                    world_y >= 0
-                        && world_y <= generator.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1)
+                    generator.is_solid(world_x, world_y, world_z)
                 });
 
                 let _ = tx.send(GenerationResult { coord, pool_slot, chunk, mesh });

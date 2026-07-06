@@ -2,6 +2,8 @@
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniformData {
     pub view_proj: [[f32; 4]; 4],
+    /// x = Debug-Render-Modus (0 = texturiert, 1 = Wireframe/Mesh-Ansicht).
+    pub debug_mode: [u32; 4],
 }
 
 #[repr(C)]
@@ -104,7 +106,7 @@ pub fn create(
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,

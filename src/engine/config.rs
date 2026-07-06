@@ -17,6 +17,9 @@ pub struct EngineConfig {
     pub ssao_enabled: bool,
     pub ssao_radius: f32,
     pub ssao_strength: f32,
+    pub gravity: f32,
+    pub jump_speed: f32,
+    pub start_flying: bool,
 }
 
 impl Default for EngineConfig {
@@ -33,6 +36,9 @@ impl Default for EngineConfig {
             ssao_enabled: true,
             ssao_radius: 2.0,
             ssao_strength: 1.4,
+            gravity: 26.0,
+            jump_speed: 9.0,
+            start_flying: true,
         }
     }
 }
@@ -90,6 +96,9 @@ struct ConfigFile {
     ssao_enabled: bool,
     ssao_radius: f32,
     ssao_strength: f32,
+    gravity: f32,
+    jump_speed: f32,
+    start_flying: bool,
 }
 
 impl Default for ConfigFile {
@@ -112,6 +121,9 @@ impl From<EngineConfig> for ConfigFile {
             ssao_enabled: c.ssao_enabled,
             ssao_radius: c.ssao_radius,
             ssao_strength: c.ssao_strength,
+            gravity: c.gravity,
+            jump_speed: c.jump_speed,
+            start_flying: c.start_flying,
         }
     }
 }
@@ -135,6 +147,9 @@ impl From<ConfigFile> for EngineConfig {
             ssao_enabled: f.ssao_enabled,
             ssao_radius: f.ssao_radius,
             ssao_strength: f.ssao_strength,
+            gravity: f.gravity,
+            jump_speed: f.jump_speed,
+            start_flying: f.start_flying,
         }
     }
 }

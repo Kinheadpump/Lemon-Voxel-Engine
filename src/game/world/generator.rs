@@ -37,6 +37,14 @@ impl TerrainGenerator {
         (BASE_HEIGHT + raw * HEIGHT_AMPLITUDE) as i32
     }
 
+    /// Einzige Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener Chunk-Daten -
+    /// genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen) UND von der Physik (Kollision).
+    /// Da das Terrain rein prozedural ist (noch keine Block-Edits), ist eine Hoehenabfrage
+    /// ausreichend und immer verfuegbar, auch fuer noch nicht gemeshte Chunks.
+    pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        world_y >= 0 && world_y <= self.height_at(world_x, world_z).clamp(0, CHUNK_SIZE - 1)
+    }
+
     pub fn generate_chunk(&self, chunk_x: i32, chunk_z: i32, chunk: &mut Chunk) {
         chunk.clear();
 

@@ -12,6 +12,7 @@ use crate::engine::render::context::GpuContext;
 use crate::game::input::{InputState, MoveCommand};
 use crate::game::math::camera::Camera;
 use crate::game::math::frustum::Frustum;
+use crate::game::physics::PlayerPhysics;
 use crate::game::world::manager::ChunkManager;
 
 pub struct App {
@@ -19,6 +20,7 @@ pub struct App {
     gpu: Option<GpuContext>,
     camera: Camera,
     input: InputState,
+    physics: PlayerPhysics,
     chunk_manager: ChunkManager,
     last_frame: Instant,
     last_stats_log: Instant,
@@ -37,6 +39,7 @@ impl App {
                 config.fov_y_radians,
             ),
             input: InputState::default(),
+            physics: PlayerPhysics::new(config.start_flying),
             chunk_manager: ChunkManager::new(config.render_distance_chunks),
             last_frame: Instant::now(),
             last_stats_log: Instant::now(),
@@ -53,34 +56,60 @@ impl App {
     }
 
     fn apply_movement(&mut self, dt: f32) {
+        let (dx, dy) = self.input.take_mouse_delta();
+        self.camera.rotate(dx * self.config.mouse_sensitivity, -dy * self.config.mouse_sensitivity);
+
         let forward = self.camera.forward_flat();
         let right = self.camera.right();
-        let mut motion = glam::Vec3::ZERO;
+        let commands = self.input.active_commands();
 
-        for command in self.input.active_commands() {
+        let speed = if self.input.is_sprinting() {
+            self.config.movement_speed * self.config.sprint_multiplier
+        } else {
+            self.config.movement_speed
+        };
+
+        if self.physics.flying {
+            let mut motion = glam::Vec3::ZERO;
+            for command in commands {
+                match command {
+                    MoveCommand::Forward => motion += forward,
+                    MoveCommand::Backward => motion -= forward,
+                    MoveCommand::StrafeLeft => motion -= right,
+                    MoveCommand::StrafeRight => motion += right,
+                    MoveCommand::Ascend => motion += glam::Vec3::Y,
+                    MoveCommand::Descend => motion -= glam::Vec3::Y,
+                }
+            }
+            if motion != glam::Vec3::ZERO {
+                self.camera.position += motion.normalize() * speed * dt;
+            }
+            return;
+        }
+
+        let mut horizontal = glam::Vec3::ZERO;
+        for command in commands {
             match command {
-                MoveCommand::Forward => motion += forward,
-                MoveCommand::Backward => motion -= forward,
-                MoveCommand::StrafeLeft => motion -= right,
-                MoveCommand::StrafeRight => motion += right,
-                MoveCommand::Ascend => motion += glam::Vec3::Y,
-                MoveCommand::Descend => motion -= glam::Vec3::Y,
+                MoveCommand::Forward => horizontal += forward,
+                MoveCommand::Backward => horizontal -= forward,
+                MoveCommand::StrafeLeft => horizontal -= right,
+                MoveCommand::StrafeRight => horizontal += right,
+                MoveCommand::Ascend | MoveCommand::Descend => {}
             }
         }
-
-        if motion != glam::Vec3::ZERO {
-            let speed = if self.input.is_sprinting() {
-                self.config.movement_speed * self.config.sprint_multiplier
-            } else {
-                self.config.movement_speed
-            };
-            self.camera.position += motion.normalize() * speed * dt;
+        if horizontal != glam::Vec3::ZERO {
+            horizontal = horizontal.normalize() * speed;
         }
 
-        let (dx, dy) = self.input.take_mouse_delta();
-        self.camera.rotate(
-            dx * self.config.mouse_sensitivity,
-            -dy * self.config.mouse_sensitivity,
+        let generator = Arc::clone(self.chunk_manager.generator());
+        self.physics.advance(
+            dt,
+            &generator,
+            &mut self.camera.position,
+            horizontal,
+            self.input.is_jump_or_ascend_held(),
+            self.config.gravity,
+            self.config.jump_speed,
         );
     }
 }
@@ -151,6 +180,12 @@ impl ApplicationHandler for App {
                 if self.input.take_hud_toggle_requested() {
                     self.gpu.as_mut().expect("GPU-Kontext verschwunden").toggle_hud();
                 }
+                if self.input.take_fly_toggle_requested() {
+                    self.physics.toggle_flying();
+                }
+                if self.input.take_wireframe_toggle_requested() {
+                    self.gpu.as_mut().expect("GPU-Kontext verschwunden").renderer.toggle_wireframe();
+                }
 
                 let view_proj = self.camera.view_projection(aspect);
                 let frustum = Frustum::from_view_projection(view_proj);
@@ -170,6 +205,13 @@ impl ApplicationHandler for App {
                     Some(mb) => format!("{mb:.1}MB"),
                     None => "N/A".to_string(),
                 };
+                let mode_text = if self.physics.flying {
+                    "FLYING"
+                } else if self.physics.grounded {
+                    "WALKING"
+                } else {
+                    "FALLING"
+                };
                 let hud_lines = vec![
                     format!("FPS: {:.0}", self.fps_ema),
                     format!("FRAME: {:.2}MS / GPU: {}", dt * 1000.0, gpu_ms_text),
@@ -188,6 +230,7 @@ impl ApplicationHandler for App {
                         "POS: {:.1} / {:.1} / {:.1}",
                         self.camera.position.x, self.camera.position.y, self.camera.position.z
                     ),
+                    format!("MODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)"),
                 ];
                 gpu.update_hud_text(&hud_lines);
 
@@ -196,10 +239,11 @@ impl ApplicationHandler for App {
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;
                     log::info!(
-                        "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Modus: {} | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
                         self.fps_ema,
                         dt * 1000.0,
                         vram_text,
+                        mode_text,
                         self.chunk_manager.loaded_chunk_count(),
                         self.chunk_manager.visible_chunk_count(),
                         self.camera.position.x,

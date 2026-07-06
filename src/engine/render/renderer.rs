@@ -92,12 +92,15 @@ pub struct ChunkRenderer {
     directions: [DirectionArena; 6],
     origin_scratch: Vec<[f32; 2]>,
     visible_face_count: usize,
+    wireframe_enabled: bool,
 }
 
 impl ChunkRenderer {
     pub fn new(device: &wgpu::Device, pipeline: &ChunkPipeline, initial_view_proj: glam::Mat4) -> Self {
-        let camera_data =
-            pipeline::CameraUniformData { view_proj: initial_view_proj.to_cols_array_2d() };
+        let camera_data = pipeline::CameraUniformData {
+            view_proj: initial_view_proj.to_cols_array_2d(),
+            debug_mode: [0, 0, 0, 0],
+        };
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("camera_uniform_buffer"),
             contents: bytemuck::bytes_of(&camera_data),
@@ -108,7 +111,7 @@ impl ChunkRenderer {
             Self::create_direction_arena(device, pipeline, &camera_buffer, dir)
         });
 
-        Self { camera_buffer, directions, origin_scratch: Vec::new(), visible_face_count: 0 }
+        Self { camera_buffer, directions, origin_scratch: Vec::new(), visible_face_count: 0, wireframe_enabled: false }
     }
 
     fn create_direction_arena(
@@ -175,8 +178,15 @@ impl ChunkRenderer {
     }
 
     pub fn update_camera(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
-        let camera_data = pipeline::CameraUniformData { view_proj: view_proj.to_cols_array_2d() };
+        let camera_data = pipeline::CameraUniformData {
+            view_proj: view_proj.to_cols_array_2d(),
+            debug_mode: [self.wireframe_enabled as u32, 0, 0, 0],
+        };
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_data));
+    }
+
+    pub fn toggle_wireframe(&mut self) {
+        self.wireframe_enabled = !self.wireframe_enabled;
     }
 
     /// Laedt die Geometrie eines Chunks EINMALIG persistent hoch und liefert ein Handle zurueck.
