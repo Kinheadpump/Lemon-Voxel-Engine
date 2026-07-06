@@ -1,8 +1,5 @@
-pub mod game;
-pub mod engine;
-
-use engine::config::EngineConfig;
-use engine::core::app::App;
+use voxel_engine::engine::config::EngineConfig;
+use voxel_engine::engine::core::app::App;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
