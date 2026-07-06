@@ -2,8 +2,10 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt, DrawIndirectArgs};
 
 use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::DirectionalMesh;
+use crate::game::math::cascades::MAX_SHADOW_CASCADES;
 
 use super::pipeline::{self, ChunkPipeline, DIRECTION_VECTORS};
+use super::shadow::{ShadowDrawData, ShadowPass};
 
 const FACE_STRIDE_BYTES: u64 = 4;
 /// Groesse von `ChunkData` (WGSL: `vec4<f32>`) in Bytes.
@@ -78,6 +80,10 @@ struct DirectionArena {
     chunk_data_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Bind-Group gegen das Shadow-Pipeline-Layout, adressiert dieselben `faces_buffer`/
+    /// `chunk_data_buffer` wie oben - der Schatten-Pass zeichnet dieselbe Geometrie, nur mit
+    /// Licht- statt Kamera-Projektion (siehe `ShadowPass::render_cascades`).
+    shadow_bind_group: wgpu::BindGroup,
     allocator: SubAllocator,
     indirect_scratch: Vec<DrawIndirectArgs>,
     chunk_data_scratch: Vec<[f32; 4]>,
@@ -86,6 +92,7 @@ struct DirectionArena {
 
 pub struct ChunkRenderer {
     camera_buffer: wgpu::Buffer,
+    lighting_buffer: wgpu::Buffer,
     directions: [DirectionArena; 6],
     visible_face_count: usize,
     wireframe_enabled: bool,
@@ -98,10 +105,13 @@ impl ChunkRenderer {
         pipeline: &ChunkPipeline,
         initial_view_proj: glam::Mat4,
         config: &EngineConfig,
+        shadow_pass: &ShadowPass,
     ) -> Self {
         let camera_data = pipeline::CameraUniformData {
             view_proj: initial_view_proj.to_cols_array_2d(),
             debug_mode: [0, 0, 0, 0],
+            camera_pos: [0.0; 4],
+            camera_forward: [0.0, 0.0, 1.0, 0.0],
         };
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("camera_uniform_buffer"),
@@ -109,12 +119,26 @@ impl ChunkRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let lighting_data = pipeline::LightingUniformData {
+            cascade_view_proj: [glam::Mat4::IDENTITY.to_cols_array_2d(); MAX_SHADOW_CASCADES],
+            cascade_split_far: [f32::MAX; 4],
+            sun_direction: [0.0, 1.0, 0.0, 0.0],
+            sun_color_intensity: [1.0, 1.0, 1.0, 1.0],
+            ambient_count_resolution: [0.2, 0.0, 0.0, 0.0],
+        };
+        let lighting_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("lighting_uniform_buffer"),
+            contents: bytemuck::bytes_of(&lighting_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let directions = std::array::from_fn(|dir| {
-            Self::create_direction_arena(device, pipeline, &camera_buffer, dir, config)
+            Self::create_direction_arena(device, pipeline, &camera_buffer, &lighting_buffer, shadow_pass, dir, config)
         });
 
         Self {
             camera_buffer,
+            lighting_buffer,
             directions,
             visible_face_count: 0,
             wireframe_enabled: false,
@@ -126,6 +150,8 @@ impl ChunkRenderer {
         device: &wgpu::Device,
         pipeline: &ChunkPipeline,
         camera_buffer: &wgpu::Buffer,
+        lighting_buffer: &wgpu::Buffer,
+        shadow_pass: &ShadowPass,
         dir: usize,
         config: &EngineConfig,
     ) -> DirectionArena {
@@ -172,6 +198,25 @@ impl ChunkRenderer {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&pipeline.block_texture_sampler),
                 },
+                wgpu::BindGroupEntry { binding: 6, resource: lighting_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&shadow_pass.sampling_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&shadow_pass.comparison_sampler),
+                },
+            ],
+        });
+
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chunk_direction_shadow_bind_group"),
+            layout: &shadow_pass.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: shadow_pass.direction_buffer(dir).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: faces_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: chunk_data_buffer.as_entire_binding() },
             ],
         });
 
@@ -180,6 +225,7 @@ impl ChunkRenderer {
             chunk_data_buffer,
             indirect_buffer,
             bind_group,
+            shadow_bind_group,
             allocator: SubAllocator::new(config.max_faces_per_direction as u32),
             indirect_scratch: Vec::with_capacity(config.max_draws_per_direction),
             chunk_data_scratch: Vec::with_capacity(config.max_draws_per_direction),
@@ -187,12 +233,53 @@ impl ChunkRenderer {
         }
     }
 
-    pub fn update_camera(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
+    pub fn update_camera(&self, queue: &wgpu::Queue, view_proj: glam::Mat4, camera_pos: glam::Vec3, camera_forward: glam::Vec3) {
         let camera_data = pipeline::CameraUniformData {
             view_proj: view_proj.to_cols_array_2d(),
             debug_mode: [self.wireframe_enabled as u32, 0, 0, 0],
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
+            camera_forward: [camera_forward.x, camera_forward.y, camera_forward.z, 0.0],
         };
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_data));
+    }
+
+    /// Aktualisiert Sonnen-/Kaskaden-Daten fuer den Fragment-Shader. `cascades` ist immer
+    /// `MAX_SHADOW_CASCADES` lang; `cascade_count` sagt dem Shader, wie viele davon tatsaechlich
+    /// befuellt sind (ungenutzte Slots behalten `split_far = f32::MAX` und werden nie getroffen).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_lighting(
+        &self,
+        queue: &wgpu::Queue,
+        cascades: &[crate::game::math::cascades::Cascade; MAX_SHADOW_CASCADES],
+        cascade_count: u32,
+        shadow_map_resolution: u32,
+        sun_direction_to_sun: glam::Vec3,
+        sun_color: glam::Vec3,
+        sun_intensity: f32,
+        ambient: f32,
+    ) {
+        let lighting_data = pipeline::LightingUniformData {
+            cascade_view_proj: std::array::from_fn(|i| cascades[i].view_proj.to_cols_array_2d()),
+            cascade_split_far: std::array::from_fn(|i| cascades[i].split_far),
+            sun_direction: [sun_direction_to_sun.x, sun_direction_to_sun.y, sun_direction_to_sun.z, 0.0],
+            sun_color_intensity: [sun_color.x, sun_color.y, sun_color.z, sun_intensity],
+            ambient_count_resolution: [ambient, cascade_count as f32, shadow_map_resolution as f32, 0.0],
+        };
+        queue.write_buffer(&self.lighting_buffer, 0, bytemuck::bytes_of(&lighting_data));
+    }
+
+    /// Liefert pro Richtung die aktuell sichtbare Geometrie fuer den Schatten-Pass. Nutzt bewusst
+    /// dieselbe Kamera-Sichtbarkeitsmenge wie der Opaque-Pass statt einer eigenen
+    /// Licht-Frustum-Kullung pro Kaskade - das haelt den CPU-Anteil bei O(1) zusaetzlicher Arbeit
+    /// (keine zweite Culling-Passe), auf Kosten von etwas ueberschuessiger Schatten-Geometrie an
+    /// den Raendern der Kamera-Render-Distanz. Kann spaeter empirisch durch echte
+    /// Per-Kaskaden-Kullung ersetzt werden, falls das gemessen ein Problem ist.
+    pub fn shadow_draw_data(&self) -> [ShadowDrawData<'_>; 6] {
+        std::array::from_fn(|dir| ShadowDrawData {
+            bind_group: &self.directions[dir].shadow_bind_group,
+            indirect_buffer: &self.directions[dir].indirect_buffer,
+            draw_count: self.directions[dir].draw_count,
+        })
     }
 
     pub fn toggle_wireframe(&mut self) {

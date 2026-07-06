@@ -1,8 +1,12 @@
 enable draw_index;
 
+const MAX_SHADOW_CASCADES: u32 = 4u;
+
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     debug_mode: vec4<u32>,
+    camera_pos: vec4<f32>,
+    camera_forward: vec4<f32>,
 };
 
 struct DirectionUniform {
@@ -18,18 +22,30 @@ struct ChunkData {
     origin: vec4<f32>,
 };
 
+struct LightingUniform {
+    cascade_view_proj: array<mat4x4<f32>, MAX_SHADOW_CASCADES>,
+    cascade_split_far: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color_intensity: vec4<f32>,
+    ambient_count_resolution: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> direction: DirectionUniform;
 @group(0) @binding(2) var<storage, read> faces: array<u32>;
 @group(0) @binding(3) var<storage, read> chunk_data: array<ChunkData>;
 @group(0) @binding(4) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(5) var block_sampler: sampler;
+@group(0) @binding(6) var<uniform> lighting: LightingUniform;
+@group(0) @binding(7) var shadow_maps: texture_depth_2d_array;
+@group(0) @binding(8) var shadow_sampler: sampler_comparison;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) tex_layer: u32,
     @location(2) @interpolate(flat) quad_size: vec2<f32>,
+    @location(3) world_pos: vec3<f32>,
 };
 
 const CORNER_OFFSETS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
@@ -71,6 +87,7 @@ fn vs_main(
     out.uv = vec2<f32>(corner.x * width, corner.y * height);
     out.tex_layer = tex_layer;
     out.quad_size = vec2<f32>(width, height);
+    out.world_pos = world_pos;
     return out;
 }
 
@@ -85,6 +102,49 @@ fn wireframe_edge_factor(uv_normalized: vec2<f32>) -> f32 {
     return 1.0 - smoothstep(0.0, line_width, nearest);
 }
 
+/// Waehlt die naechstgelegene Kaskade ueber die Kamera-Vorwaerts-Distanz (nicht die
+/// Reverse-Z-NDC-Tiefe der Hauptkamera - die CPU-Seite splittet ebenfalls nach dieser Metrik, s.
+/// `compute_cascades`), transformiert `world_pos` in deren Licht-Clip-Raum und mittelt ein 3x3
+/// Percentage-Closer-Filter aus dem Hardware-Vergleichs-Sampler. Ausserhalb der maximalen
+/// Schatten-Distanz oder ausserhalb des Kaskaden-Frustums gilt eine Position als unbeschattet -
+/// das vermeidet Randartefakte durch die Bounding-Sphere-Naeherung der Kaskaden.
+fn sample_shadow(world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
+    let view_depth = dot(camera.camera_forward.xyz, world_pos - camera.camera_pos.xyz);
+    let cascade_count = u32(lighting.ambient_count_resolution.y);
+
+    var cascade = 0u;
+    var found = false;
+    for (var i = 0u; i < cascade_count; i++) {
+        if view_depth <= lighting.cascade_split_far[i] {
+            cascade = i;
+            found = true;
+            break;
+        }
+    }
+    if !found || n_dot_l <= 0.0 {
+        return 1.0;
+    }
+
+    let light_clip = lighting.cascade_view_proj[cascade] * vec4<f32>(world_pos, 1.0);
+    let light_ndc = light_clip.xyz / light_clip.w;
+    let shadow_uv = vec2<f32>(light_ndc.x * 0.5 + 0.5, 0.5 - light_ndc.y * 0.5);
+
+    if shadow_uv.x < 0.0 || shadow_uv.x > 1.0 || shadow_uv.y < 0.0 || shadow_uv.y > 1.0
+        || light_ndc.z < 0.0 || light_ndc.z > 1.0 {
+        return 1.0;
+    }
+
+    let texel = 1.0 / lighting.ambient_count_resolution.z;
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let offset = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum += textureSampleCompareLevel(shadow_maps, shadow_sampler, shadow_uv + offset, cascade, light_ndc.z);
+        }
+    }
+    return sum / 9.0;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if camera.debug_mode.x != 0u {
@@ -93,5 +153,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(vec3<f32>(edge), 1.0);
     }
 
-    return textureSample(block_textures, block_sampler, in.uv, i32(in.tex_layer));
+    let base = textureSample(block_textures, block_sampler, in.uv, i32(in.tex_layer));
+
+    let n_dot_l = max(dot(direction.normal.xyz, lighting.sun_direction.xyz), 0.0);
+    let shadow = sample_shadow(in.world_pos, n_dot_l);
+    let sun_light = lighting.sun_color_intensity.rgb * lighting.sun_color_intensity.a * n_dot_l * shadow;
+    let ambient = lighting.ambient_count_resolution.x;
+
+    return vec4<f32>(base.rgb * (ambient + sun_light), base.a);
 }

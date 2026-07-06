@@ -2,6 +2,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::game::math::cascades::MAX_SHADOW_CASCADES;
+
 pub const CONFIG_PATH: &str = "config.toml";
 
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +29,30 @@ pub struct EngineConfig {
     pub gravity: f32,
     pub jump_speed: f32,
     pub start_flying: bool,
+
+    /// Reale Sekunden fuer einen vollen Tag/Nacht-Zyklus (Sonnenwinkel 0..2*PI).
+    pub sun_cycle_seconds: f32,
+    /// Startpunkt im Zyklus, 0.0 = Sonnenaufgang, 0.25 = Zenit, 0.5 = Sonnenuntergang.
+    pub sun_initial_time_of_day: f32,
+    pub ambient_light: f32,
+    pub sun_intensity: f32,
+
+    /// 3-4 Kaskaden: mehr Kaskaden = feinere Aufloesungs-Staffelung nahe der Kamera, aber ein
+    /// zusaetzlicher Shadow-Pass-Durchlauf pro Kaskade.
+    pub shadow_cascade_count: u32,
+    pub shadow_map_resolution: u32,
+    /// Distanz ab der Kamera, bis zu der ueberhaupt Schatten berechnet werden - unabhaengig von der
+    /// (potenziell unendlichen) Reverse-Z-Fernsicht der Hauptkamera.
+    pub shadow_max_distance: f32,
+    /// Mischung zwischen logarithmischer und linearer Kaskaden-Aufteilung (0 = linear, 1 = log).
+    /// Log gewichtet mehr Aufloesung nahe der Kamera, was fuer Voxel-Kanten am wichtigsten ist.
+    pub shadow_split_lambda: f32,
+    pub shadow_depth_bias: f32,
+    pub shadow_depth_bias_slope_scale: f32,
+
+    pub sky_zenith_day_color: [f32; 3],
+    pub sky_horizon_day_color: [f32; 3],
+    pub sky_night_color: [f32; 3],
 
     pub terrain_seed: u32,
     pub terrain_noise_frequency: f32,
@@ -65,6 +91,22 @@ impl Default for EngineConfig {
             gravity: 26.0,
             jump_speed: 9.0,
             start_flying: true,
+
+            sun_cycle_seconds: 240.0,
+            sun_initial_time_of_day: 0.28,
+            ambient_light: 0.2,
+            sun_intensity: 1.0,
+
+            shadow_cascade_count: 4,
+            shadow_map_resolution: 2048,
+            shadow_max_distance: 220.0,
+            shadow_split_lambda: 0.6,
+            shadow_depth_bias: 2.0,
+            shadow_depth_bias_slope_scale: 2.0,
+
+            sky_zenith_day_color: [0.25, 0.55, 0.95],
+            sky_horizon_day_color: [0.75, 0.85, 0.95],
+            sky_night_color: [0.01, 0.015, 0.03],
 
             terrain_seed: 1337,
             terrain_noise_frequency: 0.02,
@@ -148,6 +190,22 @@ struct ConfigFile {
     jump_speed: f32,
     start_flying: bool,
 
+    sun_cycle_seconds: f32,
+    sun_initial_time_of_day: f32,
+    ambient_light: f32,
+    sun_intensity: f32,
+
+    shadow_cascade_count: u32,
+    shadow_map_resolution: u32,
+    shadow_max_distance: f32,
+    shadow_split_lambda: f32,
+    shadow_depth_bias: f32,
+    shadow_depth_bias_slope_scale: f32,
+
+    sky_zenith_day_color: [f32; 3],
+    sky_horizon_day_color: [f32; 3],
+    sky_night_color: [f32; 3],
+
     terrain_seed: u32,
     terrain_noise_frequency: f32,
     terrain_base_height: f32,
@@ -191,6 +249,22 @@ impl From<EngineConfig> for ConfigFile {
             gravity: c.gravity,
             jump_speed: c.jump_speed,
             start_flying: c.start_flying,
+
+            sun_cycle_seconds: c.sun_cycle_seconds,
+            sun_initial_time_of_day: c.sun_initial_time_of_day,
+            ambient_light: c.ambient_light,
+            sun_intensity: c.sun_intensity,
+
+            shadow_cascade_count: c.shadow_cascade_count,
+            shadow_map_resolution: c.shadow_map_resolution,
+            shadow_max_distance: c.shadow_max_distance,
+            shadow_split_lambda: c.shadow_split_lambda,
+            shadow_depth_bias: c.shadow_depth_bias,
+            shadow_depth_bias_slope_scale: c.shadow_depth_bias_slope_scale,
+
+            sky_zenith_day_color: c.sky_zenith_day_color,
+            sky_horizon_day_color: c.sky_horizon_day_color,
+            sky_night_color: c.sky_night_color,
 
             terrain_seed: c.terrain_seed,
             terrain_noise_frequency: c.terrain_noise_frequency,
@@ -236,6 +310,22 @@ impl From<ConfigFile> for EngineConfig {
             gravity: f.gravity,
             jump_speed: f.jump_speed,
             start_flying: f.start_flying,
+
+            sun_cycle_seconds: f.sun_cycle_seconds.max(1.0),
+            sun_initial_time_of_day: f.sun_initial_time_of_day.rem_euclid(1.0),
+            ambient_light: f.ambient_light.clamp(0.0, 1.0),
+            sun_intensity: f.sun_intensity.max(0.0),
+
+            shadow_cascade_count: f.shadow_cascade_count.clamp(3, MAX_SHADOW_CASCADES as u32),
+            shadow_map_resolution: f.shadow_map_resolution.clamp(256, 8192),
+            shadow_max_distance: f.shadow_max_distance.max(16.0),
+            shadow_split_lambda: f.shadow_split_lambda.clamp(0.0, 1.0),
+            shadow_depth_bias: f.shadow_depth_bias,
+            shadow_depth_bias_slope_scale: f.shadow_depth_bias_slope_scale,
+
+            sky_zenith_day_color: f.sky_zenith_day_color,
+            sky_horizon_day_color: f.sky_horizon_day_color,
+            sky_night_color: f.sky_night_color,
 
             terrain_seed: f.terrain_seed,
             terrain_noise_frequency: f.terrain_noise_frequency,

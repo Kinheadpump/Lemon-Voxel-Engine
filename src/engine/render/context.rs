@@ -3,11 +3,14 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::engine::config::EngineConfig;
+use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 
 use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
 use super::pipeline;
 use super::renderer::ChunkRenderer;
+use super::shadow::ShadowPass;
+use super::skybox::SkyboxPass;
 use super::ssao::SsaoPass;
 
 pub struct GpuContext {
@@ -25,6 +28,16 @@ pub struct GpuContext {
     hud: HudRenderer,
     gpu_timer: Option<GpuTimer>,
     ssao: SsaoPass,
+    shadow_pass: ShadowPass,
+    skybox: SkyboxPass,
+    /// Vom letzten `update_lighting`-Aufruf gemerkt, damit `render()` dieselben Kaskaden-Matrizen
+    /// zum Befuellen der Shadow-Map-Ebenen nutzt, die auch im Lighting-Uniform des Opaque-Passes
+    /// stehen (sonst liefen Shadow-Rendering und Sampling auseinander).
+    cascades: [Cascade; MAX_SHADOW_CASCADES],
+    cascade_count: u32,
+    shadow_map_resolution: u32,
+    last_view_proj: glam::Mat4,
+    last_camera_pos: glam::Vec3,
     msaa_samples: u32,
     /// SSAO liest die Tiefe ueber eine `texture_depth_multisampled_2d`-Bindung; bei MSAA=1 ist die
     /// Depth-Textur nicht multisampled, sodass die SSAO-Bindgroup gar nicht erst gebaut werden darf.
@@ -58,17 +71,25 @@ impl GpuContext {
             .expect("Kein kompatibler GPU-Adapter gefunden");
 
         let adapter_features = adapter.features();
-        let mut required_features =
-            wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::SHADER_DRAW_INDEX;
+        // IMMEDIATES traegt pro Schatten-Kaskade/Richtung nur die 64-Byte Licht-View-Projection -
+        // spart gegenueber Uniform-Buffern + Bind-Group-Wechseln pro Kaskade unnoetigen Overhead.
+        let mut required_features = wgpu::Features::INDIRECT_FIRST_INSTANCE
+            | wgpu::Features::SHADER_DRAW_INDEX
+            | wgpu::Features::IMMEDIATES;
         if adapter_features.contains(super::gpu_timer::REQUIRED_FEATURES) {
             required_features |= super::gpu_timer::REQUIRED_FEATURES;
         }
+
+        let required_limits = wgpu::Limits {
+            max_immediate_size: std::mem::size_of::<glam::Mat4>() as u32,
+            ..wgpu::Limits::default()
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("primary_device"),
                 required_features,
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -100,8 +121,14 @@ impl GpuContext {
         let msaa_samples = engine_config.msaa_samples.max(1);
         let msaa_active = msaa_samples > 1;
 
+        let shadow_pass = ShadowPass::new(
+            &device,
+            engine_config.shadow_map_resolution,
+            engine_config.shadow_depth_bias,
+            engine_config.shadow_depth_bias_slope_scale,
+        );
         let chunk_pipeline = pipeline::create(&device, &queue, config.format, msaa_samples);
-        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config);
+        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config, &shadow_pass);
         let msaa_color_view =
             pipeline::create_msaa_color_view(&device, config.width, config.height, msaa_samples, config.format);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height, msaa_samples);
@@ -113,6 +140,16 @@ impl GpuContext {
         } else if engine_config.ssao_enabled {
             log::warn!("SSAO deaktiviert: benoetigt Multisampled Depth (msaa_samples > 1)");
         }
+
+        let mut skybox = SkyboxPass::new(
+            &device,
+            config.format,
+            msaa_active,
+            engine_config.sky_zenith_day_color,
+            engine_config.sky_horizon_day_color,
+            engine_config.sky_night_color,
+        );
+        skybox.rebuild_bind_group(&device, &depth_view);
 
         let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
         let gpu_timer = GpuTimer::try_new(&device, &queue);
@@ -136,6 +173,13 @@ impl GpuContext {
             hud,
             gpu_timer,
             ssao,
+            shadow_pass,
+            skybox,
+            cascades: [Cascade::default(); MAX_SHADOW_CASCADES],
+            cascade_count: engine_config.shadow_cascade_count,
+            shadow_map_resolution: engine_config.shadow_map_resolution,
+            last_view_proj: initial_view_proj,
+            last_camera_pos: glam::Vec3::ZERO,
             msaa_samples,
             msaa_active,
             ssao_enabled: engine_config.ssao_enabled,
@@ -152,8 +196,35 @@ impl GpuContext {
         self.config.width as f32 / self.config.height as f32
     }
 
-    pub fn update_camera(&self, view_proj: glam::Mat4) {
-        self.renderer.update_camera(&self.queue, view_proj);
+    pub fn update_camera(&mut self, view_proj: glam::Mat4, camera_pos: glam::Vec3, camera_forward: glam::Vec3) {
+        self.renderer.update_camera(&self.queue, view_proj, camera_pos, camera_forward);
+        self.last_view_proj = view_proj;
+        self.last_camera_pos = camera_pos;
+    }
+
+    /// Aktualisiert Sonnen-/Kaskaden-Uniforms (Opaque-Pass + Skybox) UND merkt sich die
+    /// Kaskaden-Matrizen fuer den Shadow-Pass in `render()` - beide muessen exakt dieselben
+    /// Matrizen verwenden wie das Lighting-Uniform, sonst laufen Rendering und Sampling auseinander.
+    pub fn update_lighting(
+        &mut self,
+        cascades: [Cascade; MAX_SHADOW_CASCADES],
+        direction_to_sun: glam::Vec3,
+        sun_color: glam::Vec3,
+        sun_intensity: f32,
+        ambient: f32,
+    ) {
+        self.renderer.update_lighting(
+            &self.queue,
+            &cascades,
+            self.cascade_count,
+            self.shadow_map_resolution,
+            direction_to_sun,
+            sun_color,
+            sun_intensity,
+            ambient,
+        );
+        self.skybox.update_uniforms(&self.queue, self.last_view_proj, self.last_camera_pos, direction_to_sun);
+        self.cascades = cascades;
     }
 
     pub fn update_ssao(&self, projection: glam::Mat4) {
@@ -202,6 +273,7 @@ impl GpuContext {
         if self.msaa_active {
             self.ssao.rebuild_bind_group(&self.device, &self.depth_view, &self.resolve_color_view);
         }
+        self.skybox.rebuild_bind_group(&self.device, &self.depth_view);
     }
 
     pub fn render(&mut self) {
@@ -234,6 +306,17 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame_encoder"),
             });
+
+        self.shadow_pass.render_cascades(
+            &mut encoder,
+            &self.cascades,
+            self.cascade_count,
+            &self.renderer.shadow_draw_data(),
+        );
+
+        // Reserviert fuer einen zukuenftigen Compute-Pass (volumetrische Effekte/Godrays): laeuft
+        // hier, NACH dem Shadow-Pass (kann dessen Tiefendaten fuer Sonnenstrahlen nutzen) und VOR
+        // dem Opaque-Pass, ohne die Pass-Reihenfolge darunter/darueber aendern zu muessen.
 
         {
             let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
@@ -277,6 +360,29 @@ impl GpuContext {
 
         if let Some(gpu_timer) = self.gpu_timer.as_mut() {
             gpu_timer.resolve(&mut encoder);
+        }
+
+        {
+            // Skybox NACH dem Opaque-Pass: fuellt per Tiefen-Discard nur die Pixel, die noch auf
+            // dem Reverse-Z-Clear-Wert stehen. Ziel ist bei aktivem MSAA das schon aufgeloeste
+            // `resolve_color_view` (die SSAO-Passe direkt danach liest dieselbe View als Input),
+            // sonst direkt die Swapchain.
+            let skybox_target = if self.msaa_active { &self.resolve_color_view } else { &swapchain_view };
+            let mut skybox_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("skybox_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: skybox_target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.skybox.render(&mut skybox_pass);
         }
 
         if self.msaa_active {

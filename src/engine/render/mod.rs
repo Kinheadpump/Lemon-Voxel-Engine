@@ -3,5 +3,7 @@ pub mod gpu_timer;
 pub mod hud;
 pub mod pipeline;
 pub mod renderer;
+pub mod shadow;
+pub mod skybox;
 pub mod ssao;
 pub mod textures;

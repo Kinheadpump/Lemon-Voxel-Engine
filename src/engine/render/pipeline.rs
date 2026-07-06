@@ -4,6 +4,26 @@ pub struct CameraUniformData {
     pub view_proj: [[f32; 4]; 4],
     /// x = Debug-Render-Modus (0 = texturiert, 1 = Wireframe/Mesh-Ansicht).
     pub debug_mode: [u32; 4],
+    pub camera_pos: [f32; 4],
+    /// Fuer die Kaskaden-Auswahl im Fragment-Shader: `dot(camera_forward, world_pos - camera_pos)`
+    /// liefert dieselbe Tiefenmetrik, die die CPU-Seite (`compute_cascades`) fuer die
+    /// Split-Distanzen nutzt - unabhaengig von der Reverse-Z-NDC-Tiefe der Hauptkamera.
+    pub camera_forward: [f32; 4],
+}
+
+/// Wird einmal pro Frame aktualisiert; enthaelt alles, was der Fragment-Shader fuer
+/// direktionale Beleuchtung + Cascaded-Shadow-Sampling braucht.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LightingUniformData {
+    pub cascade_view_proj: [[[f32; 4]; 4]; crate::game::math::cascades::MAX_SHADOW_CASCADES],
+    /// Kamera-Distanz, bis zu der die jeweilige Kaskade zustaendig ist (siehe `Cascade::split_far`).
+    pub cascade_split_far: [f32; 4],
+    /// Richtung von einer Oberflaeche ZUR Sonne (fuer `dot(normal, sun_direction)`).
+    pub sun_direction: [f32; 4],
+    pub sun_color_intensity: [f32; 4],
+    /// x = ambient, y = aktive Kaskaden-Anzahl, z = Shadow-Map-Aufloesung (fuer PCF-Texelgroesse).
+    pub ambient_count_resolution: [f32; 4],
 }
 
 #[repr(C)]
@@ -116,7 +136,7 @@ pub fn create(
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -158,6 +178,32 @@ pub fn create(
                 binding: 5,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 count: None,
             },
         ],

@@ -13,7 +13,9 @@ use crate::engine::render::context::GpuContext;
 use crate::engine::render::textures::TEXTURE_LAYER_STONE;
 use crate::game::input::{InputState, MoveCommand};
 use crate::game::math::camera::Camera;
+use crate::game::math::cascades::compute_cascades;
 use crate::game::math::frustum::Frustum;
+use crate::game::math::sun::Sun;
 use crate::game::physics::PlayerPhysics;
 use crate::game::world::manager::{ChunkManager, INTERACTION_REACH};
 
@@ -24,6 +26,7 @@ pub struct App {
     config: EngineConfig,
     gpu: Option<GpuContext>,
     camera: Camera,
+    sun: Sun,
     input: InputState,
     physics: PlayerPhysics,
     chunk_manager: ChunkManager,
@@ -44,6 +47,7 @@ impl App {
                 -0.6,
                 config.fov_y_radians,
             ),
+            sun: Sun::new(config.sun_initial_time_of_day),
             input: InputState::default(),
             physics: PlayerPhysics::new(config.start_flying, &config),
             chunk_manager: ChunkManager::new(&config),
@@ -199,6 +203,7 @@ impl ApplicationHandler for App {
                 }
 
                 self.apply_movement(dt);
+                self.sun.advance(dt, self.config.sun_cycle_seconds);
 
                 let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
                 self.fps_ema =
@@ -208,8 +213,24 @@ impl ApplicationHandler for App {
                 let frustum = Frustum::from_view_projection(view_proj);
 
                 let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
-                gpu.update_camera(view_proj);
+                gpu.update_camera(view_proj, self.camera.position, self.camera.forward());
                 gpu.update_ssao(self.camera.projection_matrix(aspect));
+
+                let direction_to_sun = self.sun.direction_to_sun();
+                let cascades = compute_cascades(
+                    &self.camera,
+                    aspect,
+                    self.sun.light_direction(),
+                    self.config.shadow_cascade_count,
+                    self.config.shadow_max_distance,
+                    self.config.shadow_split_lambda,
+                    self.config.shadow_map_resolution,
+                );
+                // Warmes Licht knapp ueber dem Horizont, neutrales Weiss im Zenit - rein
+                // aesthetische Interpolation, keine physikalische Simulation.
+                let sun_height = direction_to_sun.y.max(0.0);
+                let sun_color = glam::Vec3::new(1.0, 0.85 + 0.15 * sun_height, 0.7 + 0.3 * sun_height);
+                gpu.update_lighting(cascades, direction_to_sun, sun_color, self.config.sun_intensity, self.config.ambient_light);
 
                 let queue = gpu.queue().clone();
 
