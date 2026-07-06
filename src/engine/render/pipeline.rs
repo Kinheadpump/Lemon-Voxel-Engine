@@ -296,6 +296,22 @@ pub fn create_msaa_color_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+/// Ziel des rohen (unverwischten) SSAO-Occlusion-Faktors - siehe `ssao::AO_FORMAT` und `blur.rs`.
+pub fn create_ao_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ssao_raw_ao_texture"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: super::ssao::AO_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 /// Aufgeloestes (nicht multisampled) Opaque-Farbziel, sampelbar fuer den Post-Processing-Pass.
 pub fn create_resolve_color_view(
     device: &wgpu::Device,

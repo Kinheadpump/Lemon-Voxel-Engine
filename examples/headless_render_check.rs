@@ -4,8 +4,9 @@
 
 use voxel_engine::engine::config::EngineConfig;
 use voxel_engine::engine::core::mesher::mesh_chunk;
+use voxel_engine::engine::render::blur::SsaoBlurPass;
 use voxel_engine::engine::render::pipeline::{
-    self, create_depth_view, create_msaa_color_view, create_resolve_color_view,
+    self, create_ao_view, create_depth_view, create_msaa_color_view, create_resolve_color_view,
 };
 use voxel_engine::engine::render::renderer::ChunkRenderer;
 use voxel_engine::engine::render::shadow::ShadowPass;
@@ -81,9 +82,13 @@ async fn render_top_down_green_ratio() -> f32 {
     let msaa_color = create_msaa_color_view(&device, SIZE, SIZE, SAMPLES, FORMAT);
     let depth = create_depth_view(&device, SIZE, SIZE, SAMPLES);
     let resolve = create_resolve_color_view(&device, SIZE, SIZE, FORMAT);
-    let mut ssao = SsaoPass::new(&device, FORMAT);
-    ssao.rebuild_bind_group(&device, &depth, &resolve);
+    let ao = create_ao_view(&device, SIZE, SIZE);
+    let mut ssao = SsaoPass::new(&device);
+    ssao.rebuild_bind_group(&device, &depth);
     ssao.update_uniforms(&queue, projection, SIZE as f32, SIZE as f32, 2.0, 1.4, true);
+    let mut blur = SsaoBlurPass::new(&device, FORMAT);
+    blur.rebuild_bind_group(&device, &ao, &depth, &resolve);
+    blur.update_uniforms(&queue, SIZE as f32, SIZE as f32, 0.0008);
 
     let output = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("output"),
@@ -121,7 +126,23 @@ async fn render_top_down_green_ratio() -> f32 {
     }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ssao"),
+            label: Some("ssao_raw_ao"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &ao,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        ssao.render(&mut pass);
+    }
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ssao_blur"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &output_view,
                 resolve_target: None,
@@ -133,7 +154,7 @@ async fn render_top_down_green_ratio() -> f32 {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        ssao.render(&mut pass);
+        blur.render(&mut pass);
     }
 
     let padded = (SIZE * 4).div_ceil(256) * 256;

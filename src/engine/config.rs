@@ -26,6 +26,10 @@ pub struct EngineConfig {
     pub ssao_enabled: bool,
     pub ssao_radius: f32,
     pub ssao_strength: f32,
+    /// Bilateral-Blur-Kantenschwelle (NDC-Tiefendifferenz) fuer den SSAO-Denoise-Pass: Nachbar-
+    /// Texel mit groesserer Tiefendifferenz gelten als andere Oberflaeche und fliessen nicht in den
+    /// Blur ein - verhindert Ueberblenden ueber Geometriekanten hinweg.
+    pub ssao_blur_depth_threshold: f32,
     pub gravity: f32,
     pub jump_speed: f32,
     pub start_flying: bool,
@@ -71,6 +75,14 @@ pub struct EngineConfig {
     pub chunk_pool_size: usize,
     pub max_faces_per_direction: usize,
     pub max_draws_per_direction: usize,
+
+    /// Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
+    /// Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden. Ohne diese Grenze
+    /// versucht der Main-Thread bei grossem `render_distance_chunks` (grosser Backlog beim
+    /// Welt-Start oder schnellem Fliegen), tausende Chunks in einem einzigen Frame zu dispatchen/
+    /// hochzuladen - das erzeugt Mehrsekunden-Freezes statt verteilter Frame-Zeit.
+    pub max_chunk_dispatches_per_frame: usize,
+    pub max_chunk_uploads_per_frame: usize,
 }
 
 impl Default for EngineConfig {
@@ -88,6 +100,7 @@ impl Default for EngineConfig {
             ssao_enabled: true,
             ssao_radius: 2.0,
             ssao_strength: 1.4,
+            ssao_blur_depth_threshold: 0.0008,
             gravity: 26.0,
             jump_speed: 9.0,
             start_flying: true,
@@ -128,6 +141,9 @@ impl Default for EngineConfig {
             chunk_pool_size: 800,
             max_faces_per_direction: 3_000_000,
             max_draws_per_direction: 4300,
+
+            max_chunk_dispatches_per_frame: 64,
+            max_chunk_uploads_per_frame: 64,
         }
     }
 }
@@ -186,6 +202,7 @@ struct ConfigFile {
     ssao_enabled: bool,
     ssao_radius: f32,
     ssao_strength: f32,
+    ssao_blur_depth_threshold: f32,
     gravity: f32,
     jump_speed: f32,
     start_flying: bool,
@@ -223,6 +240,14 @@ struct ConfigFile {
     chunk_pool_size: usize,
     max_faces_per_direction: usize,
     max_draws_per_direction: usize,
+
+    /// Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
+    /// Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden. Ohne diese Grenze
+    /// versucht der Main-Thread bei grossem `render_distance_chunks` (grosser Backlog beim
+    /// Welt-Start oder schnellem Fliegen), tausende Chunks in einem einzigen Frame zu dispatchen/
+    /// hochzuladen - das erzeugt Mehrsekunden-Freezes statt verteilter Frame-Zeit.
+    max_chunk_dispatches_per_frame: usize,
+    max_chunk_uploads_per_frame: usize,
 }
 
 impl Default for ConfigFile {
@@ -246,6 +271,7 @@ impl From<EngineConfig> for ConfigFile {
             ssao_enabled: c.ssao_enabled,
             ssao_radius: c.ssao_radius,
             ssao_strength: c.ssao_strength,
+            ssao_blur_depth_threshold: c.ssao_blur_depth_threshold,
             gravity: c.gravity,
             jump_speed: c.jump_speed,
             start_flying: c.start_flying,
@@ -283,6 +309,9 @@ impl From<EngineConfig> for ConfigFile {
             chunk_pool_size: c.chunk_pool_size,
             max_faces_per_direction: c.max_faces_per_direction,
             max_draws_per_direction: c.max_draws_per_direction,
+
+            max_chunk_dispatches_per_frame: c.max_chunk_dispatches_per_frame,
+            max_chunk_uploads_per_frame: c.max_chunk_uploads_per_frame,
         }
     }
 }
@@ -307,6 +336,7 @@ impl From<ConfigFile> for EngineConfig {
             ssao_enabled: f.ssao_enabled,
             ssao_radius: f.ssao_radius,
             ssao_strength: f.ssao_strength,
+            ssao_blur_depth_threshold: f.ssao_blur_depth_threshold.max(0.0),
             gravity: f.gravity,
             jump_speed: f.jump_speed,
             start_flying: f.start_flying,
@@ -344,6 +374,9 @@ impl From<ConfigFile> for EngineConfig {
             chunk_pool_size: f.chunk_pool_size.max(1),
             max_faces_per_direction: f.max_faces_per_direction.max(1),
             max_draws_per_direction: f.max_draws_per_direction.max(1),
+
+            max_chunk_dispatches_per_frame: f.max_chunk_dispatches_per_frame.max(1),
+            max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),
         }
     }
 }

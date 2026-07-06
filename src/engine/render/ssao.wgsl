@@ -9,9 +9,7 @@ struct SsaoParams {
 };
 
 @group(0) @binding(0) var depth_texture: texture_depth_multisampled_2d;
-@group(0) @binding(1) var color_texture: texture_2d<f32>;
-@group(0) @binding(2) var color_sampler: sampler;
-@group(0) @binding(3) var<uniform> params: SsaoParams;
+@group(0) @binding(1) var<uniform> params: SsaoParams;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -33,12 +31,16 @@ fn view_pos_from_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return view.xyz / view.w;
 }
 
+/// Schreibt NUR den rohen Occlusion-Faktor (kein Farb-Multiply mehr) in eine eigene Textur - der
+/// nachgeschaltete Bilateral-Blur-Pass (`blur.wgsl`) glaettet dieses verrauschte Zwischenergebnis,
+/// bevor es mit dem Bild multipliziert wird. Das Rauschen selbst kommt aus der pro-Pixel
+/// Zufallsrotation unten (`random_angle`), die absichtlich nur von der Bildschirm-Koordinate
+/// abhaengt - ohne Blur waere das ein bei Kamerabewegung bildschirmfixiertes Rausch-Muster
+/// ("deep-fried"-Look).
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let base_color = textureSample(color_texture, color_sampler, in.uv);
-
     if params.enabled.x == 0u {
-        return base_color;
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
 
     let screen_size = params.screen_size_radius_strength.xy;
@@ -49,7 +51,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let depth = textureLoad(depth_texture, pixel_coord, 0);
 
     if depth <= 0.0 {
-        return base_color;
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
 
     let view_pos = view_pos_from_uv(in.uv, depth);
@@ -85,5 +87,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let ao = clamp(1.0 - (occlusion / f32(KERNEL_SIZE)) * strength, 0.0, 1.0);
-    return vec4<f32>(base_color.rgb * ao, base_color.a);
+    return vec4<f32>(ao, ao, ao, 1.0);
 }

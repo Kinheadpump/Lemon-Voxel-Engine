@@ -105,6 +105,11 @@ pub struct ChunkManager {
     pending_scratch: Vec<ChunkCoord>,
     pending_set: HashSet<ChunkCoord>,
     visible_coords_scratch: Vec<ChunkCoord>,
+    /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations` - siehe Kommentar an
+    /// `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/uploaded ein
+    /// grosser Backlog (Welt-Start, schnelles Fliegen) tausende Chunks in einem einzigen Frame.
+    max_chunk_dispatches_per_frame: usize,
+    max_chunk_uploads_per_frame: usize,
 }
 
 impl ChunkManager {
@@ -134,6 +139,8 @@ impl ChunkManager {
             pending_scratch: Vec::new(),
             pending_set: HashSet::new(),
             visible_coords_scratch: Vec::new(),
+            max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
+            max_chunk_uploads_per_frame: config.max_chunk_uploads_per_frame,
         }
     }
 
@@ -298,10 +305,13 @@ impl ChunkManager {
         }
     }
 
-    /// Dispatcht so viele ausstehende Chunks wie der Pool hergibt. Laeuft jeden Frame, kostet im
-    /// eingeschwungenen Zustand (nichts mehr ausstehend) aber O(1) statt O(Ladevolumen).
+    /// Dispatcht bis zu `max_chunk_dispatches_per_frame` ausstehende Chunks. Gedeckelt, damit ein
+    /// grosser Backlog (Welt-Start, schnelles Fliegen ueber die Render-Distanz) nicht in einem
+    /// einzigen Frame tausende Rayon-Tasks spawnt (jede Closure verschiebt einen vollen 32-KiB-
+    /// Chunk per Move-Capture) - das verteilt die Dispatch-Kosten stattdessen ueber mehrere Frames.
     fn dispatch_pending(&mut self) {
-        while let Some(coord) = self.pending_scratch.pop() {
+        for _ in 0..self.max_chunk_dispatches_per_frame {
+            let Some(coord) = self.pending_scratch.pop() else { break };
             self.pending_set.remove(&coord);
 
             if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
@@ -366,8 +376,15 @@ impl ChunkManager {
     /// Kamera sich waehrend der Generierungszeit bereits so weit wegbewegt hat, dass der Chunk
     /// nicht mehr innerhalb der Render-Distanz liegt - so entsteht kein unnoetiger GPU-Upload fuer
     /// Chunks, die im selben Frame wieder entladen wuerden.
+    ///
+    /// Gedeckelt auf `max_chunk_uploads_per_frame`: ohne Limit drainte diese Schleife bei einem
+    /// grossen Backlog (z.B. 21k fertige Chunks kurz nach dem Welt-Start) alle wartenden Ergebnisse
+    /// in einem einzigen Frame - jedes davon mit `alloc_chunk`-Bufferschreibvorgaengen ueber 6
+    /// Richtungs-Arenen. Das war die Ursache der Mehrsekunden-Freezes; nicht abgeholte Ergebnisse
+    /// bleiben einfach im Channel und werden im naechsten Frame weiterverarbeitet.
     fn apply_completed_generations(&mut self, center: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
-        while let Ok(result) = self.result_rx.try_recv() {
+        for _ in 0..self.max_chunk_uploads_per_frame {
+            let Ok(result) = self.result_rx.try_recv() else { break };
             self.in_flight.remove(&result.coord);
 
             let still_in_range = (result.coord.0 - center.0).abs() <= self.render_distance_chunks

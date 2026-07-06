@@ -1,66 +1,44 @@
 use wgpu::util::DeviceExt;
 
-const KERNEL_SIZE: usize = 16;
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct SsaoParams {
-    inverse_projection: [[f32; 4]; 4],
-    projection: [[f32; 4]; 4],
-    screen_size_radius_strength: [f32; 4],
-    enabled: [u32; 4],
-    kernel: [[f32; 4]; KERNEL_SIZE],
+struct BlurParams {
+    screen_size_depth_threshold: [f32; 4],
 }
 
-fn generate_kernel() -> [[f32; 4]; KERNEL_SIZE] {
-    let mut state: u32 = 0x9E3779B9;
-    let mut next_f32 = || {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        (state as f64 / u32::MAX as f64) as f32
-    };
-
-    std::array::from_fn(|i| {
-        let x = next_f32() * 2.0 - 1.0;
-        let y = next_f32() * 2.0 - 1.0;
-        let z = next_f32();
-        let sample = glam::Vec3::new(x, y, z).normalize();
-
-        let linear = (i as f32 + 1.0) / KERNEL_SIZE as f32;
-        let scale = 0.1 + linear * linear * 0.9;
-        let sample = sample * scale;
-
-        [sample.x, sample.y, sample.z, 0.0]
-    })
-}
-
-/// Rendert NUR den rohen (verrauschten) Occlusion-Faktor in eine eigene Textur - siehe
-/// `blur.rs` fuer den nachgeschalteten Denoise-Pass, der das eigentlich sichtbare Ergebnis liefert.
-pub struct SsaoPass {
+/// Bilateraler Denoise-Pass fuer den rohen SSAO-Occlusion-Faktor (siehe `ssao.rs`): glaettet das
+/// Rauschen kantenerhaltend und multipliziert das Ergebnis erst hier mit der Szenenfarbe. Ohne
+/// diesen Pass war das SSAO-Rauschen direkt sichtbar und, da rein bildschirmkoordinaten-basiert,
+/// bei Kamerabewegung als bildschirmfixiertes statisches Rauschen wahrnehmbar ("deep-fried"-Look).
+pub struct SsaoBlurPass {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
-    kernel: [[f32; 4]; KERNEL_SIZE],
 }
 
-/// Lineares (nicht-sRGB) Einzelfaktor-Format fuer die rohe AO-Zwischentextur - ein Occlusion-
-/// Multiplikator ist kein Anzeige-Farbwert, eine sRGB-Kurve wuerde ihn verzerren.
-pub const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
-impl SsaoPass {
-    pub fn new(device: &wgpu::Device) -> Self {
+impl SsaoBlurPass {
+    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ssao_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("ssao.wgsl").into()),
+            label: Some("ssao_blur_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ssao_bind_group_layout"),
+            label: Some("ssao_blur_bind_group_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
@@ -70,7 +48,17 @@ impl SsaoPass {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -83,13 +71,13 @@ impl SsaoPass {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ssao_pipeline_layout"),
+            label: Some("ssao_blur_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ssao_pipeline"),
+            label: Some("ssao_blur_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -113,7 +101,7 @@ impl SsaoPass {
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: AO_FORMAT,
+                    format: surface_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -123,49 +111,36 @@ impl SsaoPass {
         });
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ssao_uniform_buffer"),
-            contents: bytemuck::bytes_of(&SsaoParams {
-                inverse_projection: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                projection: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                screen_size_radius_strength: [1.0, 1.0, 1.0, 1.0],
-                enabled: [0, 0, 0, 0],
-                kernel: generate_kernel(),
-            }),
+            label: Some("ssao_blur_uniform_buffer"),
+            contents: bytemuck::bytes_of(&BlurParams { screen_size_depth_threshold: [1.0, 1.0, 0.0008, 0.0] }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        Self { pipeline, bind_group_layout, uniform_buffer, bind_group: None, kernel: generate_kernel() }
+        Self { pipeline, bind_group_layout, uniform_buffer, bind_group: None }
     }
 
-    /// Muss nach jeder Aenderung der Depth-View (Init, Resize) aufgerufen werden.
-    pub fn rebuild_bind_group(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
+    /// Muss nach jeder Aenderung von AO-, Depth- oder Color-View (Init, Resize) aufgerufen werden.
+    pub fn rebuild_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        ao_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        color_view: &wgpu::TextureView,
+    ) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ssao_bind_group"),
+            label: Some("ssao_blur_bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(ao_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(color_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: self.uniform_buffer.as_entire_binding() },
             ],
         }));
     }
 
-    pub fn update_uniforms(
-        &self,
-        queue: &wgpu::Queue,
-        projection: glam::Mat4,
-        screen_width: f32,
-        screen_height: f32,
-        radius: f32,
-        strength: f32,
-        enabled: bool,
-    ) {
-        let params = SsaoParams {
-            inverse_projection: projection.inverse().to_cols_array_2d(),
-            projection: projection.to_cols_array_2d(),
-            screen_size_radius_strength: [screen_width, screen_height, radius, strength],
-            enabled: [enabled as u32, 0, 0, 0],
-            kernel: self.kernel,
-        };
+    pub fn update_uniforms(&self, queue: &wgpu::Queue, screen_width: f32, screen_height: f32, depth_threshold: f32) {
+        let params = BlurParams { screen_size_depth_threshold: [screen_width, screen_height, depth_threshold, 0.0] };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
     }
 

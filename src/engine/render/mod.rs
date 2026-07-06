@@ -1,3 +1,4 @@
+pub mod blur;
 pub mod context;
 pub mod gpu_timer;
 pub mod hud;

@@ -5,6 +5,7 @@ use winit::window::Window;
 use crate::engine::config::EngineConfig;
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 
+use super::blur::SsaoBlurPass;
 use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
 use super::pipeline;
@@ -24,10 +25,13 @@ pub struct GpuContext {
     msaa_color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resolve_color_view: wgpu::TextureView,
+    ao_view: wgpu::TextureView,
     clear_color: wgpu::Color,
     hud: HudRenderer,
     gpu_timer: Option<GpuTimer>,
     ssao: SsaoPass,
+    blur: SsaoBlurPass,
+    ssao_blur_depth_threshold: f32,
     shadow_pass: ShadowPass,
     skybox: SkyboxPass,
     /// Vom letzten `update_lighting`-Aufruf gemerkt, damit `render()` dieselben Kaskaden-Matrizen
@@ -133,10 +137,13 @@ impl GpuContext {
             pipeline::create_msaa_color_view(&device, config.width, config.height, msaa_samples, config.format);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height, msaa_samples);
         let resolve_color_view = pipeline::create_resolve_color_view(&device, config.width, config.height, config.format);
+        let ao_view = pipeline::create_ao_view(&device, config.width, config.height);
 
-        let mut ssao = SsaoPass::new(&device, config.format);
+        let mut ssao = SsaoPass::new(&device);
+        let mut blur = SsaoBlurPass::new(&device, config.format);
         if msaa_active {
-            ssao.rebuild_bind_group(&device, &depth_view, &resolve_color_view);
+            ssao.rebuild_bind_group(&device, &depth_view);
+            blur.rebuild_bind_group(&device, &ao_view, &depth_view, &resolve_color_view);
         } else if engine_config.ssao_enabled {
             log::warn!("SSAO deaktiviert: benoetigt Multisampled Depth (msaa_samples > 1)");
         }
@@ -169,10 +176,13 @@ impl GpuContext {
             msaa_color_view,
             depth_view,
             resolve_color_view,
+            ao_view,
             clear_color: engine_config.clear_color,
             hud,
             gpu_timer,
             ssao,
+            blur,
+            ssao_blur_depth_threshold: engine_config.ssao_blur_depth_threshold,
             shadow_pass,
             skybox,
             cascades: [Cascade::default(); MAX_SHADOW_CASCADES],
@@ -237,6 +247,12 @@ impl GpuContext {
             self.ssao_strength,
             self.ssao_enabled && self.msaa_active,
         );
+        self.blur.update_uniforms(
+            &self.queue,
+            self.config.width as f32,
+            self.config.height as f32,
+            self.ssao_blur_depth_threshold,
+        );
     }
 
     pub fn toggle_hud(&mut self) {
@@ -270,8 +286,10 @@ impl GpuContext {
             pipeline::create_msaa_color_view(&self.device, width, height, self.msaa_samples, self.config.format);
         self.depth_view = pipeline::create_depth_view(&self.device, width, height, self.msaa_samples);
         self.resolve_color_view = pipeline::create_resolve_color_view(&self.device, width, height, self.config.format);
+        self.ao_view = pipeline::create_ao_view(&self.device, width, height);
         if self.msaa_active {
-            self.ssao.rebuild_bind_group(&self.device, &self.depth_view, &self.resolve_color_view);
+            self.ssao.rebuild_bind_group(&self.device, &self.depth_view);
+            self.blur.rebuild_bind_group(&self.device, &self.ao_view, &self.depth_view, &self.resolve_color_view);
         }
         self.skybox.rebuild_bind_group(&self.device, &self.depth_view);
     }
@@ -386,8 +404,34 @@ impl GpuContext {
         }
 
         if self.msaa_active {
+            // Schreibt NUR den rohen (verrauschten) Occlusion-Faktor in `ao_view` - noch keine
+            // Farbe. Der Blur-Pass danach glaettet das kantenerhaltend und multipliziert es erst
+            // dann mit dem Bild; ohne diese Trennung war das Rauschen direkt sichtbar und, weil rein
+            // bildschirmkoordinaten-basiert, bei Kamerabewegung wie ein bildschirmfixiertes
+            // statisches Rauschen wahrnehmbar ("deep-fried"-Look).
             let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ssao_post_process_pass"),
+                label: Some("ssao_raw_ao_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ao_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.ssao.render(&mut ssao_pass);
+        }
+
+        if self.msaa_active {
+            let mut blur_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao_blur_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
                     resolve_target: None,
@@ -400,7 +444,7 @@ impl GpuContext {
                 multiview_mask: None,
             });
 
-            self.ssao.render(&mut ssao_pass);
+            self.blur.render(&mut blur_pass);
         }
 
         {
