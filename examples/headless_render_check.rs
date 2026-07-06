@@ -2,13 +2,14 @@
 // echte Engine-Pipeline (MSAA + SSAO), liest die Pixel zurueck und prueft, dass die Gras-Oberflaeche
 // tatsaechlich gruen erscheint. Faengt invertiertes Culling / Tiefen-Regressionen fruehzeitig ab.
 
+use voxel_engine::engine::config::EngineConfig;
 use voxel_engine::engine::core::mesher::mesh_chunk;
 use voxel_engine::engine::render::pipeline::{
     self, create_depth_view, create_msaa_color_view, create_resolve_color_view,
 };
 use voxel_engine::engine::render::renderer::ChunkRenderer;
 use voxel_engine::engine::render::ssao::SsaoPass;
-use voxel_engine::game::world::chunk::{Chunk, CHUNK_SIZE};
+use voxel_engine::game::world::chunk::Chunk;
 use voxel_engine::game::world::generator::TerrainGenerator;
 
 const SIZE: u32 = 256;
@@ -39,7 +40,7 @@ async fn render_top_down_green_ratio() -> f32 {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("headless"),
-            required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE,
+            required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::SHADER_DRAW_INDEX,
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -58,15 +59,14 @@ async fn render_top_down_green_ratio() -> f32 {
     );
     let view_proj = projection * view;
 
+    let config = EngineConfig::default();
     let chunk_pipeline = pipeline::create(&device, &queue, FORMAT, SAMPLES);
-    let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, view_proj);
+    let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, view_proj, &config);
 
-    let generator = TerrainGenerator::new();
+    let generator = TerrainGenerator::new(&config);
     let mut chunk = Chunk::empty();
-    generator.generate_chunk(0, 0, &mut chunk);
-    let mesh = mesh_chunk(&chunk, 0, 0, |wx, wy, wz| {
-        wy >= 0 && wy <= generator.height_at(wx, wz).clamp(0, CHUNK_SIZE - 1)
-    });
+    generator.generate_chunk(0, 0, 0, &mut chunk);
+    let mesh = mesh_chunk(&chunk, 0, 0, 0, |wx, wy, wz| generator.is_solid(wx, wy, wz));
     renderer.update_camera(&queue, view_proj);
     let handle = renderer.alloc_chunk(&queue, &mesh, glam::Vec3::ZERO);
     renderer.set_visible(&queue, &[handle]);
