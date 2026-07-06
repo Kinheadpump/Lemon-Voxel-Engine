@@ -45,10 +45,11 @@ impl TerrainGenerator {
     /// Fallback-Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener/editierter
     /// Chunk-Daten - genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten
     /// Chunks) UND von `ChunkManager::is_solid_at` fuer Regionen, die (noch) nicht geladen sind.
-    /// Kein Clamp mehr auf eine einzelne Chunk-Hoehe - das Terrain ist jetzt vertikal ungebunden,
-    /// die Chunk-Aufteilung in Y ist reine Streaming-Granularitaet.
+    /// Kein Limit mehr nach oben ODER unten: alles oberhalb der Terrainoberflaeche ist Luft, alles
+    /// darunter ist (unendlich tief) massiver Fels - die Chunk-Aufteilung in Y ist reine
+    /// Streaming-Granularitaet, kein Weltrand.
     pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
-        world_y >= 0 && world_y <= self.height_at(world_x, world_z)
+        world_y <= self.height_at(world_x, world_z)
     }
 
     pub fn generate_chunk(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
@@ -62,7 +63,7 @@ impl TerrainGenerator {
 
                 for local_y in 0..CHUNK_SIZE {
                     let world_y = chunk_y * CHUNK_SIZE + local_y;
-                    if world_y < 0 || world_y > height {
+                    if world_y > height {
                         continue;
                     }
 

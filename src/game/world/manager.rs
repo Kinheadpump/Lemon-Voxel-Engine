@@ -17,13 +17,18 @@ use super::raycast::{RaycastHit, raycast};
 /// Maximale Raycast-Reichweite fuer Abbauen/Platzieren.
 pub const INTERACTION_REACH: f32 = 6.0;
 
-/// (chunk_x, chunk_y, chunk_z) - Y ist jetzt Teil der Chunk-Koordinate, damit Terrain vertikal
-/// ueber mehrere Chunks gestapelt werden kann statt in eine einzelne Schicht gezwungen zu sein.
+/// (chunk_x, chunk_y, chunk_z) - Y ist Teil der Chunk-Koordinate, damit Terrain vertikal ueber
+/// beliebig viele Chunks gestapelt werden kann statt in eine einzelne Schicht oder einen festen
+/// Hoehenbereich gezwungen zu sein.
 type ChunkCoord = (i32, i32, i32);
 
 struct LoadedChunk {
     pool_slot: usize,
     gpu_handle: ChunkGpuHandle,
+    /// Reiner Luft-Chunk (z.B. weit oberhalb des Terrains) - wird aus der Sichtbarkeitspruefung
+    /// ausgeklammert, damit die pro-Frame-Kosten mit der tatsaechlich sichtbaren Geometrie skalieren
+    /// statt mit der (bei vertikal unbegrenzter Welt potenziell riesigen) Gesamtzahl geladener Chunks.
+    is_empty: bool,
 }
 
 struct GenerationResult {
@@ -31,6 +36,7 @@ struct GenerationResult {
     pool_slot: usize,
     chunk: Chunk,
     mesh: DirectionalMesh,
+    is_empty: bool,
 }
 
 fn chunk_origin(coord: ChunkCoord) -> glam::Vec3 {
@@ -83,18 +89,28 @@ pub struct ChunkManager {
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
-    world_height_chunks: i32,
+    vertical_render_distance_chunks: i32,
     visible_handles: Vec<ChunkGpuHandle>,
     visible_count: usize,
+    /// Chunk-Koordinate der Kamera im letzten Frame, in dem das Ladefenster neu aufgebaut wurde.
+    /// Der komplette Soll/Entlade-Scan (O(Ladevolumen)) muss nur laufen, wenn sich diese
+    /// Mittelpunkt-Koordinate tatsaechlich aendert - im Stillstand (oder bei reiner Kamerarotation)
+    /// entstehen sonst pro Frame tausende ueberfluessige HashSet-Operationen.
+    last_center: Option<ChunkCoord>,
     desired_scratch: HashSet<ChunkCoord>,
     unload_scratch: Vec<ChunkCoord>,
+    /// Noch nicht dispatchte, aber gewuenschte Chunks (neu ins Ladefenster gerutscht oder wegen
+    /// Pool-Erschoepfung zurueckgestellt). Wird pro Frame nur um tatsaechlich neue Arbeit erweitert
+    /// bzw. abgearbeitet - kein Full-Rescan des gesamten Ladevolumens mehr pro Frame.
+    pending_scratch: Vec<ChunkCoord>,
+    pending_set: HashSet<ChunkCoord>,
     visible_coords_scratch: Vec<ChunkCoord>,
 }
 
 impl ChunkManager {
-    /// Der Pool muss `(2*render_distance_chunks+1)^2 * world_height_chunks` Chunks abdecken,
-    /// sonst werden Chunks am Rand der Render-Distanz stillschweigend nicht geladen (siehe
-    /// `chunk_pool_size`-Kommentar in `EngineConfig`). Jeder Chunk belegt 64 KiB RAM.
+    /// Der Pool muss `(2*render_distance_chunks+1)^2 * (2*vertical_render_distance_chunks+1)`
+    /// Chunks abdecken, sonst werden Chunks am Rand der Render-Distanz stillschweigend nicht
+    /// geladen (siehe `chunk_pool_size`-Kommentar in `EngineConfig`). Jeder Chunk belegt 64 KiB RAM.
     pub fn new(config: &EngineConfig) -> Self {
         let pool = (0..config.chunk_pool_size).map(|_| Some(Chunk::empty())).collect();
         let pool_free_list = (0..config.chunk_pool_size).collect();
@@ -109,11 +125,14 @@ impl ChunkManager {
             result_tx,
             result_rx,
             render_distance_chunks: config.render_distance_chunks,
-            world_height_chunks: config.world_height_chunks,
+            vertical_render_distance_chunks: config.vertical_render_distance_chunks,
             visible_handles: Vec::new(),
             visible_count: 0,
+            last_center: None,
             desired_scratch: HashSet::new(),
             unload_scratch: Vec::new(),
+            pending_scratch: Vec::new(),
+            pending_set: HashSet::new(),
             visible_coords_scratch: Vec::new(),
         }
     }
@@ -200,7 +219,8 @@ impl ChunkManager {
         let Some(chunk) = self.pool[pool_slot].as_ref() else {
             return;
         };
-        let mesh = if chunk.is_empty() {
+        let is_empty = chunk.is_empty();
+        let mesh = if is_empty {
             DirectionalMesh::default()
         } else {
             mesh_chunk(chunk, coord.0, coord.1, coord.2, |world_x, world_y, world_z| {
@@ -213,6 +233,7 @@ impl ChunkManager {
 
         if let Some(loaded) = self.loaded.get_mut(&coord) {
             loaded.gpu_handle = new_handle;
+            loaded.is_empty = is_empty;
         }
     }
 
@@ -223,16 +244,31 @@ impl ChunkManager {
         queue: &wgpu::Queue,
         renderer: &mut ChunkRenderer,
     ) {
-        let center_x = (camera_position.x / CHUNK_SIZE as f32).floor() as i32;
-        let center_z = (camera_position.z / CHUNK_SIZE as f32).floor() as i32;
+        let center = (
+            (camera_position.x / CHUNK_SIZE as f32).floor() as i32,
+            (camera_position.y / CHUNK_SIZE as f32).floor() as i32,
+            (camera_position.z / CHUNK_SIZE as f32).floor() as i32,
+        );
 
-        self.apply_completed_generations(center_x, center_z, queue, renderer);
+        self.apply_completed_generations(center, queue, renderer);
 
+        if self.last_center != Some(center) {
+            self.rebuild_load_window(center, renderer);
+            self.last_center = Some(center);
+        }
+
+        self.dispatch_pending();
+        self.update_visibility(frustum, queue, renderer);
+    }
+
+    /// Baut Soll-Menge, Entlade-Liste und die Liste neu zu ladender Chunks komplett neu auf - nur
+    /// noetig, wenn der Kamera-Mittelpunkt tatsaechlich einen neuen Chunk betreten hat.
+    fn rebuild_load_window(&mut self, center: ChunkCoord, renderer: &mut ChunkRenderer) {
         self.desired_scratch.clear();
         for dz in -self.render_distance_chunks..=self.render_distance_chunks {
             for dx in -self.render_distance_chunks..=self.render_distance_chunks {
-                for cy in 0..self.world_height_chunks {
-                    self.desired_scratch.insert((center_x + dx, cy, center_z + dz));
+                for dy in -self.vertical_render_distance_chunks..=self.vertical_render_distance_chunks {
+                    self.desired_scratch.insert((center.0 + dx, center.1 + dy, center.2 + dz));
                 }
             }
         }
@@ -245,14 +281,37 @@ impl ChunkManager {
             self.unload_chunk(coord, renderer);
         }
 
-        for coord in &self.desired_scratch {
-            let coord = *coord;
+        // Chunks, die aus dem Fenster gewandert sind, bevor sie je dispatcht wurden, muessen aus
+        // der Pending-Liste verschwinden - sonst wuerde spaeter fuer eine laengst irrelevante
+        // Position noch ein Generierungs-Job gestartet.
+        let desired = &self.desired_scratch;
+        self.pending_set.retain(|coord| desired.contains(coord));
+        self.pending_scratch.retain(|coord| self.pending_set.contains(coord));
+
+        for &coord in &self.desired_scratch {
+            if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
+                continue;
+            }
+            if self.pending_set.insert(coord) {
+                self.pending_scratch.push(coord);
+            }
+        }
+    }
+
+    /// Dispatcht so viele ausstehende Chunks wie der Pool hergibt. Laeuft jeden Frame, kostet im
+    /// eingeschwungenen Zustand (nichts mehr ausstehend) aber O(1) statt O(Ladevolumen).
+    fn dispatch_pending(&mut self) {
+        while let Some(coord) = self.pending_scratch.pop() {
+            self.pending_set.remove(&coord);
+
             if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
                 continue;
             }
 
             let Some(pool_slot) = self.pool_free_list.pop() else {
-                continue;
+                self.pending_set.insert(coord);
+                self.pending_scratch.push(coord);
+                break;
             };
 
             let mut chunk = self.pool[pool_slot].take().expect("Pool-Slot bereits leer");
@@ -264,9 +323,11 @@ impl ChunkManager {
             rayon::spawn(move || {
                 generator.generate_chunk(coord.0, coord.1, coord.2, &mut chunk);
 
-                // Bei vertikal gestapelten Chunks ist der Grossteil (alles oberhalb der
-                // Terrainhoehe) reine Luft - das teure Greedy-Meshing lohnt sich dafuer nicht.
-                let mesh = if chunk.is_empty() {
+                // Reine Luft-Chunks (z.B. weit oberhalb des Terrains) erzeugen ohnehin keine
+                // Faces - das teure Greedy-Meshing (6 Richtungen * 32 Ebenen) lohnt sich dafuer
+                // nicht.
+                let is_empty = chunk.is_empty();
+                let mesh = if is_empty {
                     DirectionalMesh::default()
                 } else {
                     mesh_chunk(&chunk, coord.0, coord.1, coord.2, |world_x, world_y, world_z| {
@@ -274,16 +335,17 @@ impl ChunkManager {
                     })
                 };
 
-                let _ = tx.send(GenerationResult { coord, pool_slot, chunk, mesh });
+                let _ = tx.send(GenerationResult { coord, pool_slot, chunk, mesh, is_empty });
             });
         }
-
-        self.update_visibility(frustum, queue, renderer);
     }
 
     fn update_visibility(&mut self, frustum: &Frustum, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         self.visible_coords_scratch.clear();
-        self.visible_coords_scratch.par_extend(self.loaded.par_iter().filter_map(|(coord, _)| {
+        self.visible_coords_scratch.par_extend(self.loaded.par_iter().filter_map(|(coord, loaded)| {
+            if loaded.is_empty {
+                return None;
+            }
             let min = chunk_origin(*coord);
             let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
             frustum.intersects_aabb(min, max).then_some(*coord)
@@ -304,18 +366,13 @@ impl ChunkManager {
     /// Kamera sich waehrend der Generierungszeit bereits so weit wegbewegt hat, dass der Chunk
     /// nicht mehr innerhalb der Render-Distanz liegt - so entsteht kein unnoetiger GPU-Upload fuer
     /// Chunks, die im selben Frame wieder entladen wuerden.
-    fn apply_completed_generations(
-        &mut self,
-        center_x: i32,
-        center_z: i32,
-        queue: &wgpu::Queue,
-        renderer: &mut ChunkRenderer,
-    ) {
+    fn apply_completed_generations(&mut self, center: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         while let Ok(result) = self.result_rx.try_recv() {
             self.in_flight.remove(&result.coord);
 
-            let still_in_range = (result.coord.0 - center_x).abs() <= self.render_distance_chunks
-                && (result.coord.2 - center_z).abs() <= self.render_distance_chunks;
+            let still_in_range = (result.coord.0 - center.0).abs() <= self.render_distance_chunks
+                && (result.coord.1 - center.1).abs() <= self.vertical_render_distance_chunks
+                && (result.coord.2 - center.2).abs() <= self.render_distance_chunks;
 
             if !still_in_range {
                 self.pool[result.pool_slot] = Some(result.chunk);
@@ -328,7 +385,7 @@ impl ChunkManager {
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
                 result.coord,
-                LoadedChunk { pool_slot: result.pool_slot, gpu_handle },
+                LoadedChunk { pool_slot: result.pool_slot, gpu_handle, is_empty: result.is_empty },
             );
         }
     }
