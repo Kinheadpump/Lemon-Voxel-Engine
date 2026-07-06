@@ -1,3 +1,5 @@
+enable draw_index;
+
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     debug_mode: vec4<u32>,
@@ -9,10 +11,17 @@ struct DirectionUniform {
     v_axis: vec4<f32>,
 };
 
+/// Ein Eintrag pro Indirect-Draw-Aufruf (also ein Eintrag pro sichtbarem Chunk in dieser
+/// Richtung), adressiert per `@builtin(draw_index)` - nicht pro Face wie zuvor. Reduziert die
+/// Chunk-Origin-Speicherlast von O(Faces) auf O(sichtbare Chunks).
+struct ChunkData {
+    origin: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> direction: DirectionUniform;
 @group(0) @binding(2) var<storage, read> faces: array<u32>;
-@group(0) @binding(3) var<storage, read> chunk_origins: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> chunk_data: array<ChunkData>;
 @group(0) @binding(4) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(5) var block_sampler: sampler;
 
@@ -36,6 +45,7 @@ const CORNER_OFFSETS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
+    @builtin(draw_index) draw_index: u32,
 ) -> VertexOutput {
     let packed = faces[instance_index];
 
@@ -48,8 +58,7 @@ fn vs_main(
 
     let local_pos = vec3<f32>(local_x, local_y, local_z);
     let plane_offset = max(direction.normal.xyz, vec3<f32>(0.0));
-    let chunk_xz = chunk_origins[instance_index];
-    let chunk_origin = vec3<f32>(chunk_xz.x, 0.0, chunk_xz.y);
+    let chunk_origin = chunk_data[draw_index].origin.xyz;
     let origin = chunk_origin + local_pos + plane_offset;
 
     let corner = CORNER_OFFSETS[vertex_index % 6u];

@@ -23,6 +23,7 @@ pub struct InputState {
     hud_toggle_requested: bool,
     fly_toggle_requested: bool,
     wireframe_toggle_requested: bool,
+    active_commands_scratch: Vec<MoveCommand>,
 }
 
 impl InputState {
@@ -74,26 +75,26 @@ impl InputState {
 
     /// Horizontale Bewegungskommandos (WASD). Ascend/Descend werden separat behandelt, da sie im
     /// Laufmodus keine Bedeutung haben (Space = Sprung, Strg = ungenutzt).
-    pub fn active_commands(&self) -> Vec<MoveCommand> {
-        let mut commands = Vec::with_capacity(4);
+    pub fn active_commands(&mut self) -> &[MoveCommand] {
+        self.active_commands_scratch.clear();
         if self.move_forward {
-            commands.push(MoveCommand::Forward);
+            self.active_commands_scratch.push(MoveCommand::Forward);
         }
         if self.move_backward {
-            commands.push(MoveCommand::Backward);
+            self.active_commands_scratch.push(MoveCommand::Backward);
         }
         if self.move_left {
-            commands.push(MoveCommand::StrafeLeft);
+            self.active_commands_scratch.push(MoveCommand::StrafeLeft);
         }
         if self.move_right {
-            commands.push(MoveCommand::StrafeRight);
+            self.active_commands_scratch.push(MoveCommand::StrafeRight);
         }
         if self.move_up {
-            commands.push(MoveCommand::Ascend);
+            self.active_commands_scratch.push(MoveCommand::Ascend);
         }
         if self.move_down {
-            commands.push(MoveCommand::Descend);
+            self.active_commands_scratch.push(MoveCommand::Descend);
         }
-        commands
+        &self.active_commands_scratch
     }
 }

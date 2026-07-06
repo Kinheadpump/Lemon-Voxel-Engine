@@ -26,6 +26,9 @@ pub struct GpuContext {
     gpu_timer: Option<GpuTimer>,
     ssao: SsaoPass,
     msaa_samples: u32,
+    /// SSAO liest die Tiefe ueber eine `texture_depth_multisampled_2d`-Bindung; bei MSAA=1 ist die
+    /// Depth-Textur nicht multisampled, sodass die SSAO-Bindgroup gar nicht erst gebaut werden darf.
+    msaa_active: bool,
     ssao_enabled: bool,
     ssao_radius: f32,
     ssao_strength: f32,
@@ -55,7 +58,8 @@ impl GpuContext {
             .expect("Kein kompatibler GPU-Adapter gefunden");
 
         let adapter_features = adapter.features();
-        let mut required_features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let mut required_features =
+            wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::SHADER_DRAW_INDEX;
         if adapter_features.contains(super::gpu_timer::REQUIRED_FEATURES) {
             required_features |= super::gpu_timer::REQUIRED_FEATURES;
         }
@@ -94,16 +98,21 @@ impl GpuContext {
         surface.configure(&device, &config);
 
         let msaa_samples = engine_config.msaa_samples.max(1);
+        let msaa_active = msaa_samples > 1;
 
         let chunk_pipeline = pipeline::create(&device, &queue, config.format, msaa_samples);
-        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj);
+        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config);
         let msaa_color_view =
             pipeline::create_msaa_color_view(&device, config.width, config.height, msaa_samples, config.format);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height, msaa_samples);
         let resolve_color_view = pipeline::create_resolve_color_view(&device, config.width, config.height, config.format);
 
         let mut ssao = SsaoPass::new(&device, config.format);
-        ssao.rebuild_bind_group(&device, &depth_view, &resolve_color_view);
+        if msaa_active {
+            ssao.rebuild_bind_group(&device, &depth_view, &resolve_color_view);
+        } else if engine_config.ssao_enabled {
+            log::warn!("SSAO deaktiviert: benoetigt Multisampled Depth (msaa_samples > 1)");
+        }
 
         let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
         let gpu_timer = GpuTimer::try_new(&device, &queue);
@@ -128,6 +137,7 @@ impl GpuContext {
             gpu_timer,
             ssao,
             msaa_samples,
+            msaa_active,
             ssao_enabled: engine_config.ssao_enabled,
             ssao_radius: engine_config.ssao_radius,
             ssao_strength: engine_config.ssao_strength,
@@ -154,7 +164,7 @@ impl GpuContext {
             self.config.height as f32,
             self.ssao_radius,
             self.ssao_strength,
-            self.ssao_enabled,
+            self.ssao_enabled && self.msaa_active,
         );
     }
 
@@ -162,10 +172,10 @@ impl GpuContext {
         self.hud.toggle();
     }
 
-    pub fn update_hud_text(&mut self, lines: &[String]) {
+    pub fn update_hud_text(&mut self, text: &str) {
         let width = self.config.width as f32;
         let height = self.config.height as f32;
-        self.hud.update_text(&self.queue, width, height, lines);
+        self.hud.update_text(&self.queue, width, height, text);
     }
 
     pub fn last_gpu_time_ms(&self) -> Option<f32> {
@@ -189,7 +199,9 @@ impl GpuContext {
             pipeline::create_msaa_color_view(&self.device, width, height, self.msaa_samples, self.config.format);
         self.depth_view = pipeline::create_depth_view(&self.device, width, height, self.msaa_samples);
         self.resolve_color_view = pipeline::create_resolve_color_view(&self.device, width, height, self.config.format);
-        self.ssao.rebuild_bind_group(&self.device, &self.depth_view, &self.resolve_color_view);
+        if self.msaa_active {
+            self.ssao.rebuild_bind_group(&self.device, &self.depth_view, &self.resolve_color_view);
+        }
     }
 
     pub fn render(&mut self) {
@@ -226,11 +238,20 @@ impl GpuContext {
         {
             let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
 
+            // Ohne MSAA (sample_count == 1) darf kein `resolve_target` gesetzt werden - wgpu
+            // verlangt dafuer eine tatsaechlich multisampled Quelle. Es wird dann direkt in die
+            // Swapchain gerendert und der SSAO-Post-Process-Pass komplett uebersprungen.
+            let (color_view, resolve_target) = if self.msaa_active {
+                (&self.msaa_color_view, Some(&self.resolve_color_view))
+            } else {
+                (&swapchain_view, None)
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("chunk_opaque_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_color_view,
-                    resolve_target: Some(&self.resolve_color_view),
+                    view: color_view,
+                    resolve_target,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear_color),
@@ -258,7 +279,7 @@ impl GpuContext {
             gpu_timer.resolve(&mut encoder);
         }
 
-        {
+        if self.msaa_active {
             let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ssao_post_process_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

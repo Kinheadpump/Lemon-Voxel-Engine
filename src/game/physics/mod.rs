@@ -1,14 +1,7 @@
 use glam::Vec3;
 
+use crate::engine::config::EngineConfig;
 use crate::game::world::generator::TerrainGenerator;
-
-pub const FIXED_TIMESTEP: f32 = 1.0 / 60.0;
-const MAX_STEPS_PER_FRAME: u32 = 8;
-
-const PLAYER_HALF_WIDTH: f32 = 0.3;
-const PLAYER_HEIGHT: f32 = 1.8;
-pub const PLAYER_EYE_HEIGHT: f32 = 1.6;
-const GROUND_PROBE_DISTANCE: f32 = 0.05;
 
 /// Physik-Zustand des Spielers: Fallen/Springen/Kollision (wenn nicht im Flugmodus) via fester
 /// Zeitschrittweite, damit Gravitation und Sprunghoehe unabhaengig von der Framerate sind.
@@ -17,11 +10,32 @@ pub struct PlayerPhysics {
     pub grounded: bool,
     pub flying: bool,
     accumulator: f32,
+    fixed_timestep: f32,
+    max_steps_per_frame: u32,
+    player_half_width: f32,
+    player_height: f32,
+    player_eye_height: f32,
+    ground_probe_distance: f32,
 }
 
 impl PlayerPhysics {
-    pub fn new(start_flying: bool) -> Self {
-        Self { velocity: Vec3::ZERO, grounded: false, flying: start_flying, accumulator: 0.0 }
+    pub fn new(start_flying: bool, config: &EngineConfig) -> Self {
+        Self {
+            velocity: Vec3::ZERO,
+            grounded: false,
+            flying: start_flying,
+            accumulator: 0.0,
+            fixed_timestep: config.fixed_timestep,
+            max_steps_per_frame: config.max_physics_steps_per_frame,
+            player_half_width: config.player_half_width,
+            player_height: config.player_height,
+            player_eye_height: config.player_eye_height,
+            ground_probe_distance: config.ground_probe_distance,
+        }
+    }
+
+    pub fn eye_height(&self) -> f32 {
+        self.player_eye_height
     }
 
     pub fn toggle_flying(&mut self) {
@@ -29,7 +43,7 @@ impl PlayerPhysics {
         self.velocity = Vec3::ZERO;
     }
 
-    /// Verarbeitet die reale Frame-Zeit in festen 1/60s-Schritten (kappt Nachhol-Schritte bei
+    /// Verarbeitet die reale Frame-Zeit in festen Zeitschritten (kappt Nachhol-Schritte bei
     /// Framerate-Einbruechen, um eine "Spiral of Death" zu vermeiden).
     pub fn advance(
         &mut self,
@@ -44,9 +58,9 @@ impl PlayerPhysics {
         self.accumulator += frame_dt.min(0.25);
 
         let mut steps = 0;
-        while self.accumulator >= FIXED_TIMESTEP && steps < MAX_STEPS_PER_FRAME {
+        while self.accumulator >= self.fixed_timestep && steps < self.max_steps_per_frame {
             self.step(generator, eye_position, horizontal_move, jump_held, gravity, jump_speed);
-            self.accumulator -= FIXED_TIMESTEP;
+            self.accumulator -= self.fixed_timestep;
             steps += 1;
         }
     }
@@ -66,40 +80,88 @@ impl PlayerPhysics {
         if self.grounded && jump_held {
             self.velocity.y = jump_speed;
         } else {
-            self.velocity.y -= gravity * FIXED_TIMESTEP;
+            self.velocity.y -= gravity * self.fixed_timestep;
         }
 
-        let mut feet = *eye_position - Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
-        let delta = self.velocity * FIXED_TIMESTEP;
+        let mut feet = *eye_position - Vec3::new(0.0, self.player_eye_height, 0.0);
+        let delta = self.velocity * self.fixed_timestep;
 
         feet.x += delta.x;
-        if aabb_overlaps_solid(generator, feet) {
+        if aabb_overlaps_solid(generator, feet, self.player_half_width, self.player_height) {
             feet.x -= delta.x;
             self.velocity.x = 0.0;
         }
 
         feet.z += delta.z;
-        if aabb_overlaps_solid(generator, feet) {
+        if aabb_overlaps_solid(generator, feet, self.player_half_width, self.player_height) {
             feet.z -= delta.z;
             self.velocity.z = 0.0;
         }
 
-        feet.y += delta.y;
-        if aabb_overlaps_solid(generator, feet) {
-            feet.y -= delta.y;
+        if resolve_vertical_collision(
+            generator,
+            &mut feet,
+            delta.y,
+            self.player_half_width,
+            self.player_height,
+        ) {
             self.velocity.y = 0.0;
         }
 
-        self.grounded =
-            aabb_overlaps_solid(generator, feet - Vec3::new(0.0, GROUND_PROBE_DISTANCE, 0.0));
+        self.grounded = aabb_overlaps_solid(
+            generator,
+            feet - Vec3::new(0.0, self.ground_probe_distance, 0.0),
+            self.player_half_width,
+            self.player_height,
+        );
 
-        *eye_position = feet + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
+        *eye_position = feet + Vec3::new(0.0, self.player_eye_height, 0.0);
     }
 }
 
-fn aabb_overlaps_solid(generator: &TerrainGenerator, feet: Vec3) -> bool {
-    let min = feet - Vec3::new(PLAYER_HALF_WIDTH, 0.0, PLAYER_HALF_WIDTH);
-    let max = feet + Vec3::new(PLAYER_HALF_WIDTH, PLAYER_HEIGHT, PLAYER_HALF_WIDTH);
+/// Loest eine vertikale Bewegung um `delta_y` auf. Statt bei Kollision nur den kompletten
+/// Bewegungsschritt zurueckzunehmen (verursacht Jittering, da die Fuesse dann leicht ueber/unter
+/// der tatsaechlichen Voxel-Oberflaeche schweben), wird die Fussposition exakt auf die getroffene
+/// Voxel-Grenze gesnappt. Liefert `true`, wenn eine Kollision aufgetreten ist.
+fn resolve_vertical_collision(
+    generator: &TerrainGenerator,
+    feet: &mut Vec3,
+    delta_y: f32,
+    player_half_width: f32,
+    player_height: f32,
+) -> bool {
+    const EPSILON: f32 = 1e-4;
+    let x0 = (feet.x - player_half_width).floor() as i32;
+    let x1 = (feet.x + player_half_width - EPSILON).floor() as i32;
+    let z0 = (feet.z - player_half_width).floor() as i32;
+    let z1 = (feet.z + player_half_width - EPSILON).floor() as i32;
+
+    let footprint_solid_at = |y: i32| (z0..=z1).any(|z| (x0..=x1).any(|x| generator.is_solid(x, y, z)));
+
+    if delta_y < 0.0 {
+        let scan_top = feet.y.floor() as i32;
+        let scan_bottom = (feet.y + delta_y).floor() as i32;
+        if let Some(surface_y) = (scan_bottom..=scan_top).rev().find(|&y| footprint_solid_at(y)) {
+            feet.y = (surface_y + 1) as f32;
+            return true;
+        }
+        feet.y += delta_y;
+        false
+    } else {
+        let scan_bottom = (feet.y + player_height).floor() as i32;
+        let scan_top = (feet.y + delta_y + player_height).floor() as i32;
+        if let Some(ceiling_y) = (scan_bottom..=scan_top).find(|&y| footprint_solid_at(y)) {
+            feet.y = ceiling_y as f32 - player_height;
+            return true;
+        }
+        feet.y += delta_y;
+        false
+    }
+}
+
+fn aabb_overlaps_solid(generator: &TerrainGenerator, feet: Vec3, player_half_width: f32, player_height: f32) -> bool {
+    let min = feet - Vec3::new(player_half_width, 0.0, player_half_width);
+    let max = feet + Vec3::new(player_half_width, player_height, player_half_width);
     const EPSILON: f32 = 1e-4;
 
     let x0 = min.x.floor() as i32;

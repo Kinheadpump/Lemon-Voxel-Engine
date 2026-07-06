@@ -2,39 +2,44 @@ use bevy_math::Vec2;
 use noiz::Noise;
 use noiz::prelude::*;
 
+use crate::engine::config::EngineConfig;
 use crate::engine::render::textures::{TEXTURE_LAYER_DIRT, TEXTURE_LAYER_GRASS, TEXTURE_LAYER_STONE};
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 
-const WORLD_SEED: u32 = 1337;
-const NOISE_FREQUENCY: f32 = 0.02;
-const BASE_HEIGHT: f32 = 12.0;
-const HEIGHT_AMPLITUDE: f32 = 10.0;
-const DIRT_LAYER_DEPTH: i32 = 3;
-
-/// Die Ursprungszelle des `noiz`-Gradientenrauschens (Welt-Koordinaten nahe (0,0)) ist
-/// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
-/// verschiebt jede Sample-Koordinate weit weg vom Ursprung und umgeht das vollstaendig.
-const NOISE_ORIGIN_OFFSET: f32 = 10_000.0;
-
 pub struct TerrainGenerator {
     noise: Noise<common_noise::Perlin>,
+    noise_frequency: f32,
+    base_height: f32,
+    height_amplitude: f32,
+    dirt_layer_depth: i32,
+    /// Die Ursprungszelle des `noiz`-Gradientenrauschens (Welt-Koordinaten nahe (0,0)) ist
+    /// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
+    /// verschiebt jede Sample-Koordinate weit weg vom Ursprung und umgeht das vollstaendig.
+    noise_origin_offset: f32,
 }
 
 impl TerrainGenerator {
-    pub fn new() -> Self {
+    pub fn new(config: &EngineConfig) -> Self {
         let mut noise = Noise::<common_noise::Perlin>::default();
-        noise.set_seed(WORLD_SEED);
-        Self { noise }
+        noise.set_seed(config.terrain_seed);
+        Self {
+            noise,
+            noise_frequency: config.terrain_noise_frequency,
+            base_height: config.terrain_base_height,
+            height_amplitude: config.terrain_height_amplitude,
+            dirt_layer_depth: config.terrain_dirt_layer_depth,
+            noise_origin_offset: config.terrain_noise_origin_offset,
+        }
     }
 
     pub fn height_at(&self, world_x: i32, world_z: i32) -> i32 {
         let sample_point = Vec2::new(
-            world_x as f32 * NOISE_FREQUENCY + NOISE_ORIGIN_OFFSET,
-            world_z as f32 * NOISE_FREQUENCY + NOISE_ORIGIN_OFFSET,
+            world_x as f32 * self.noise_frequency + self.noise_origin_offset,
+            world_z as f32 * self.noise_frequency + self.noise_origin_offset,
         );
         let raw: f32 = self.noise.sample(sample_point);
-        (BASE_HEIGHT + raw * HEIGHT_AMPLITUDE) as i32
+        (self.base_height + raw * self.height_amplitude) as i32
     }
 
     /// Einzige Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener Chunk-Daten -
@@ -58,7 +63,7 @@ impl TerrainGenerator {
                     let depth_from_surface = height - local_y;
                     let block_id = if depth_from_surface == 0 {
                         TEXTURE_LAYER_GRASS
-                    } else if depth_from_surface <= DIRT_LAYER_DEPTH {
+                    } else if depth_from_surface <= self.dirt_layer_depth {
                         TEXTURE_LAYER_DIRT
                     } else {
                         TEXTURE_LAYER_STONE
@@ -68,11 +73,5 @@ impl TerrainGenerator {
                 }
             }
         }
-    }
-}
-
-impl Default for TerrainGenerator {
-    fn default() -> Self {
-        Self::new()
     }
 }

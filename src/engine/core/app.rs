@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +26,7 @@ pub struct App {
     last_frame: Instant,
     last_stats_log: Instant,
     fps_ema: f32,
+    hud_text: String,
 }
 
 impl App {
@@ -39,11 +41,12 @@ impl App {
                 config.fov_y_radians,
             ),
             input: InputState::default(),
-            physics: PlayerPhysics::new(config.start_flying),
-            chunk_manager: ChunkManager::new(config.render_distance_chunks),
+            physics: PlayerPhysics::new(config.start_flying, &config),
+            chunk_manager: ChunkManager::new(&config),
             last_frame: Instant::now(),
             last_stats_log: Instant::now(),
             fps_ema: 0.0,
+            hud_text: String::with_capacity(256),
         }
     }
 
@@ -61,7 +64,6 @@ impl App {
 
         let forward = self.camera.forward_flat();
         let right = self.camera.right();
-        let commands = self.input.active_commands();
 
         let speed = if self.input.is_sprinting() {
             self.config.movement_speed * self.config.sprint_multiplier
@@ -69,9 +71,11 @@ impl App {
             self.config.movement_speed
         };
 
+        let commands = self.input.active_commands();
+
         if self.physics.flying {
             let mut motion = glam::Vec3::ZERO;
-            for command in commands {
+            for &command in commands {
                 match command {
                     MoveCommand::Forward => motion += forward,
                     MoveCommand::Backward => motion -= forward,
@@ -88,7 +92,7 @@ impl App {
         }
 
         let mut horizontal = glam::Vec3::ZERO;
-        for command in commands {
+        for &command in commands {
             match command {
                 MoveCommand::Forward => horizontal += forward,
                 MoveCommand::Backward => horizontal -= forward,
@@ -171,12 +175,9 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
-                self.apply_movement(dt);
-
-                let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-                self.fps_ema =
-                    if self.fps_ema <= 0.0 { instant_fps } else { self.fps_ema * 0.9 + instant_fps * 0.1 };
-
+                // Toggles muessen VOR Bewegung/Kamera-Update konsumiert werden, damit z.B. ein
+                // Fly-Toggle noch im selben Frame die Bewegungsart beeinflusst und ein
+                // Wireframe-Toggle noch im selben Frame ins Kamera-Uniform einfliesst.
                 if self.input.take_hud_toggle_requested() {
                     self.gpu.as_mut().expect("GPU-Kontext verschwunden").toggle_hud();
                 }
@@ -186,6 +187,12 @@ impl ApplicationHandler for App {
                 if self.input.take_wireframe_toggle_requested() {
                     self.gpu.as_mut().expect("GPU-Kontext verschwunden").renderer.toggle_wireframe();
                 }
+
+                self.apply_movement(dt);
+
+                let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                self.fps_ema =
+                    if self.fps_ema <= 0.0 { instant_fps } else { self.fps_ema * 0.9 + instant_fps * 0.1 };
 
                 let view_proj = self.camera.view_projection(aspect);
                 let frustum = Frustum::from_view_projection(view_proj);
@@ -197,14 +204,6 @@ impl ApplicationHandler for App {
                 let queue = gpu.queue().clone();
                 self.chunk_manager.update(self.camera.position, &frustum, &queue, &mut gpu.renderer);
 
-                let gpu_ms_text = match gpu.last_gpu_time_ms() {
-                    Some(ms) => format!("{ms:.2}MS"),
-                    None => "N/A".to_string(),
-                };
-                let vram_text = match gpu.vram_usage_mb() {
-                    Some(mb) => format!("{mb:.1}MB"),
-                    None => "N/A".to_string(),
-                };
                 let mode_text = if self.physics.flying {
                     "FLYING"
                 } else if self.physics.grounded {
@@ -212,32 +211,44 @@ impl ApplicationHandler for App {
                 } else {
                     "FALLING"
                 };
-                let hud_lines = vec![
-                    format!("FPS: {:.0}", self.fps_ema),
-                    format!("FRAME: {:.2}MS / GPU: {}", dt * 1000.0, gpu_ms_text),
-                    format!("VRAM: {}", vram_text),
-                    format!(
-                        "CHUNKS: {} / {} VISIBLE",
-                        self.chunk_manager.loaded_chunk_count(),
-                        self.chunk_manager.visible_chunk_count()
-                    ),
-                    format!(
-                        "DRAW CALLS: {} / FACES: {}",
-                        gpu.renderer.draw_call_count(),
-                        gpu.renderer.total_face_count()
-                    ),
-                    format!(
-                        "POS: {:.1} / {:.1} / {:.1}",
-                        self.camera.position.x, self.camera.position.y, self.camera.position.z
-                    ),
-                    format!("MODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)"),
-                ];
-                gpu.update_hud_text(&hud_lines);
+
+                self.hud_text.clear();
+                let _ = write!(self.hud_text, "FPS: {:.0}\nFRAME: {:.2}MS / GPU: ", self.fps_ema, dt * 1000.0);
+                match gpu.last_gpu_time_ms() {
+                    Some(ms) => {
+                        let _ = write!(self.hud_text, "{ms:.2}MS");
+                    }
+                    None => self.hud_text.push_str("N/A"),
+                }
+                self.hud_text.push_str("\nVRAM: ");
+                match gpu.vram_usage_mb() {
+                    Some(mb) => {
+                        let _ = write!(self.hud_text, "{mb:.1}MB");
+                    }
+                    None => self.hud_text.push_str("N/A"),
+                }
+                let _ = write!(
+                    self.hud_text,
+                    "\nCHUNKS: {} / {} VISIBLE\nDRAW CALLS: {} / FACES: {}\nPOS: {:.1} / {:.1} / {:.1}\nMODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)",
+                    self.chunk_manager.loaded_chunk_count(),
+                    self.chunk_manager.visible_chunk_count(),
+                    gpu.renderer.draw_call_count(),
+                    gpu.renderer.total_face_count(),
+                    self.camera.position.x,
+                    self.camera.position.y,
+                    self.camera.position.z
+                );
+                gpu.update_hud_text(&self.hud_text);
 
                 gpu.render();
 
                 if now.duration_since(self.last_stats_log).as_secs_f32() >= 1.0 {
                     self.last_stats_log = now;
+                    // Nur einmal pro Sekunde - eine String-Allokation hier ist unkritisch.
+                    let vram_text = match gpu.vram_usage_mb() {
+                        Some(mb) => format!("{mb:.1}MB"),
+                        None => "N/A".to_string(),
+                    };
                     log::info!(
                         "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Modus: {} | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
                         self.fps_ema,

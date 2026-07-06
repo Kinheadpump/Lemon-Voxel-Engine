@@ -1,24 +1,20 @@
 use wgpu::util::{BufferInitDescriptor, DeviceExt, DrawIndirectArgs};
 
+use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::DirectionalMesh;
 
 use super::pipeline::{self, ChunkPipeline, DIRECTION_VECTORS};
 
-/// Kapazitaet des persistenten Face-Buffers pro Richtung (in Faces/Instanzen). Grosszuegig fuer
-/// grosse Render-Distanzen; eine fehlgeschlagene Allokation ueberspringt den Chunk graceful.
-pub const MAX_FACES_PER_DIR: usize = 3_000_000;
-
-/// Obergrenze gleichzeitig sichtbarer Chunks (Groesse des Indirect-Batch pro Richtung).
-pub const MAX_DRAWS_PER_DIR: usize = 4300;
-
 const FACE_STRIDE_BYTES: u64 = 4;
-const ORIGIN_STRIDE_BYTES: u64 = 8;
+/// Groesse von `ChunkData` (WGSL: `vec4<f32>`) in Bytes.
+const CHUNK_DATA_STRIDE_BYTES: u64 = 16;
 
 /// Handle auf die persistent hochgeladene Geometrie eines Chunks. Pro Richtung ein
 /// (first_instance, face_count)-Paar im jeweiligen Richtungs-Buffer.
 #[derive(Clone, Copy, Default)]
 pub struct ChunkGpuHandle {
     slots: [Slot; 6],
+    origin_xz: [f32; 2],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -79,24 +75,30 @@ impl SubAllocator {
 
 struct DirectionArena {
     faces_buffer: wgpu::Buffer,
-    origins_buffer: wgpu::Buffer,
+    chunk_data_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     allocator: SubAllocator,
     indirect_scratch: Vec<DrawIndirectArgs>,
+    chunk_data_scratch: Vec<[f32; 4]>,
     draw_count: u32,
 }
 
 pub struct ChunkRenderer {
     camera_buffer: wgpu::Buffer,
     directions: [DirectionArena; 6],
-    origin_scratch: Vec<[f32; 2]>,
     visible_face_count: usize,
     wireframe_enabled: bool,
+    max_draws_per_direction: usize,
 }
 
 impl ChunkRenderer {
-    pub fn new(device: &wgpu::Device, pipeline: &ChunkPipeline, initial_view_proj: glam::Mat4) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        pipeline: &ChunkPipeline,
+        initial_view_proj: glam::Mat4,
+        config: &EngineConfig,
+    ) -> Self {
         let camera_data = pipeline::CameraUniformData {
             view_proj: initial_view_proj.to_cols_array_2d(),
             debug_mode: [0, 0, 0, 0],
@@ -108,10 +110,16 @@ impl ChunkRenderer {
         });
 
         let directions = std::array::from_fn(|dir| {
-            Self::create_direction_arena(device, pipeline, &camera_buffer, dir)
+            Self::create_direction_arena(device, pipeline, &camera_buffer, dir, config)
         });
 
-        Self { camera_buffer, directions, origin_scratch: Vec::new(), visible_face_count: 0, wireframe_enabled: false }
+        Self {
+            camera_buffer,
+            directions,
+            visible_face_count: 0,
+            wireframe_enabled: false,
+            max_draws_per_direction: config.max_draws_per_direction,
+        }
     }
 
     fn create_direction_arena(
@@ -119,6 +127,7 @@ impl ChunkRenderer {
         pipeline: &ChunkPipeline,
         camera_buffer: &wgpu::Buffer,
         dir: usize,
+        config: &EngineConfig,
     ) -> DirectionArena {
         let direction_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("direction_uniform_buffer"),
@@ -128,21 +137,21 @@ impl ChunkRenderer {
 
         let faces_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_faces_persistent"),
-            size: MAX_FACES_PER_DIR as u64 * FACE_STRIDE_BYTES,
+            size: config.max_faces_per_direction as u64 * FACE_STRIDE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let origins_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk_origins_persistent"),
-            size: MAX_FACES_PER_DIR as u64 * ORIGIN_STRIDE_BYTES,
+        let chunk_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk_data_per_draw"),
+            size: config.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_indirect_batch"),
-            size: (MAX_DRAWS_PER_DIR * std::mem::size_of::<DrawIndirectArgs>()) as u64,
+            size: (config.max_draws_per_direction * std::mem::size_of::<DrawIndirectArgs>()) as u64,
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -154,7 +163,7 @@ impl ChunkRenderer {
                 wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: direction_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: faces_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: origins_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: chunk_data_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&pipeline.block_texture_view),
@@ -168,11 +177,12 @@ impl ChunkRenderer {
 
         DirectionArena {
             faces_buffer,
-            origins_buffer,
+            chunk_data_buffer,
             indirect_buffer,
             bind_group,
-            allocator: SubAllocator::new(MAX_FACES_PER_DIR as u32),
-            indirect_scratch: Vec::with_capacity(MAX_DRAWS_PER_DIR),
+            allocator: SubAllocator::new(config.max_faces_per_direction as u32),
+            indirect_scratch: Vec::with_capacity(config.max_draws_per_direction),
+            chunk_data_scratch: Vec::with_capacity(config.max_draws_per_direction),
             draw_count: 0,
         }
     }
@@ -197,8 +207,7 @@ impl ChunkRenderer {
         mesh: &DirectionalMesh,
         origin: glam::Vec3,
     ) -> ChunkGpuHandle {
-        let origin_xz = [origin.x, origin.z];
-        let mut handle = ChunkGpuHandle::default();
+        let mut handle = ChunkGpuHandle { slots: Default::default(), origin_xz: [origin.x, origin.z] };
 
         for (dir, arena) in self.directions.iter_mut().enumerate() {
             let faces = &mesh.faces[dir];
@@ -217,14 +226,6 @@ impl ChunkRenderer {
                 bytemuck::cast_slice(faces),
             );
 
-            self.origin_scratch.clear();
-            self.origin_scratch.resize(faces.len(), origin_xz);
-            queue.write_buffer(
-                &arena.origins_buffer,
-                offset as u64 * ORIGIN_STRIDE_BYTES,
-                bytemuck::cast_slice(&self.origin_scratch),
-            );
-
             handle.slots[dir] = Slot { offset, count };
         }
 
@@ -239,15 +240,18 @@ impl ChunkRenderer {
     }
 
     /// Baut den Indirect-Draw-Batch fuer die aktuell sichtbaren Chunks neu auf. Nur diese kleine
-    /// Argument-Liste wird pro Frame hochgeladen - die Geometrie bleibt persistent.
+    /// Argument-Liste und die dazugehoerigen Chunk-Origins (ein `ChunkData`-Eintrag pro Draw, per
+    /// `@builtin(draw_index)` im Shader adressiert) werden pro Frame hochgeladen - die Geometrie
+    /// selbst bleibt persistent.
     pub fn set_visible(&mut self, queue: &wgpu::Queue, visible: &[ChunkGpuHandle]) {
         self.visible_face_count = 0;
 
         for (dir, arena) in self.directions.iter_mut().enumerate() {
             arena.indirect_scratch.clear();
+            arena.chunk_data_scratch.clear();
             for handle in visible {
                 let slot = handle.slots[dir];
-                if slot.count == 0 || arena.indirect_scratch.len() >= MAX_DRAWS_PER_DIR {
+                if slot.count == 0 || arena.indirect_scratch.len() >= self.max_draws_per_direction {
                     continue;
                 }
                 arena.indirect_scratch.push(DrawIndirectArgs {
@@ -256,13 +260,17 @@ impl ChunkRenderer {
                     first_vertex: 0,
                     first_instance: slot.offset,
                 });
+                arena.chunk_data_scratch.push([handle.origin_xz[0], 0.0, handle.origin_xz[1], 0.0]);
                 self.visible_face_count += slot.count as usize;
             }
 
             arena.draw_count = arena.indirect_scratch.len() as u32;
             if arena.draw_count > 0 {
-                let bytes: &[u8] = bytemuck::cast_slice(&arena.indirect_scratch);
-                queue.write_buffer(&arena.indirect_buffer, 0, bytes);
+                let indirect_bytes: &[u8] = bytemuck::cast_slice(&arena.indirect_scratch);
+                queue.write_buffer(&arena.indirect_buffer, 0, indirect_bytes);
+
+                let chunk_data_bytes: &[u8] = bytemuck::cast_slice(&arena.chunk_data_scratch);
+                queue.write_buffer(&arena.chunk_data_buffer, 0, chunk_data_bytes);
             }
         }
     }

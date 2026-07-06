@@ -178,11 +178,11 @@ impl HudRenderer {
         queue: &wgpu::Queue,
         screen_width: f32,
         screen_height: f32,
-        lines: &[String],
+        text: &str,
     ) {
         self.scratch.clear();
 
-        for (line_index, line) in lines.iter().enumerate() {
+        for (line_index, line) in text.lines().enumerate() {
             let base_y = MARGIN + line_index as f32 * LINE_ADVANCE;
 
             for (char_index, ch) in line.chars().enumerate() {

@@ -20,6 +20,24 @@ pub struct EngineConfig {
     pub gravity: f32,
     pub jump_speed: f32,
     pub start_flying: bool,
+
+    pub terrain_seed: u32,
+    pub terrain_noise_frequency: f32,
+    pub terrain_base_height: f32,
+    pub terrain_height_amplitude: f32,
+    pub terrain_dirt_layer_depth: i32,
+    pub terrain_noise_origin_offset: f32,
+
+    pub player_half_width: f32,
+    pub player_height: f32,
+    pub player_eye_height: f32,
+    pub ground_probe_distance: f32,
+    pub fixed_timestep: f32,
+    pub max_physics_steps_per_frame: u32,
+
+    pub chunk_pool_size: usize,
+    pub max_faces_per_direction: usize,
+    pub max_draws_per_direction: usize,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +57,24 @@ impl Default for EngineConfig {
             gravity: 26.0,
             jump_speed: 9.0,
             start_flying: true,
+
+            terrain_seed: 1337,
+            terrain_noise_frequency: 0.02,
+            terrain_base_height: 12.0,
+            terrain_height_amplitude: 10.0,
+            terrain_dirt_layer_depth: 3,
+            terrain_noise_origin_offset: 10_000.0,
+
+            player_half_width: 0.3,
+            player_height: 1.8,
+            player_eye_height: 1.6,
+            ground_probe_distance: 0.1,
+            fixed_timestep: 1.0 / 60.0,
+            max_physics_steps_per_frame: 8,
+
+            chunk_pool_size: 4300,
+            max_faces_per_direction: 3_000_000,
+            max_draws_per_direction: 4300,
         }
     }
 }
@@ -99,6 +135,24 @@ struct ConfigFile {
     gravity: f32,
     jump_speed: f32,
     start_flying: bool,
+
+    terrain_seed: u32,
+    terrain_noise_frequency: f32,
+    terrain_base_height: f32,
+    terrain_height_amplitude: f32,
+    terrain_dirt_layer_depth: i32,
+    terrain_noise_origin_offset: f32,
+
+    player_half_width: f32,
+    player_height: f32,
+    player_eye_height: f32,
+    ground_probe_distance: f32,
+    fixed_timestep: f32,
+    max_physics_steps_per_frame: u32,
+
+    chunk_pool_size: usize,
+    max_faces_per_direction: usize,
+    max_draws_per_direction: usize,
 }
 
 impl Default for ConfigFile {
@@ -124,6 +178,24 @@ impl From<EngineConfig> for ConfigFile {
             gravity: c.gravity,
             jump_speed: c.jump_speed,
             start_flying: c.start_flying,
+
+            terrain_seed: c.terrain_seed,
+            terrain_noise_frequency: c.terrain_noise_frequency,
+            terrain_base_height: c.terrain_base_height,
+            terrain_height_amplitude: c.terrain_height_amplitude,
+            terrain_dirt_layer_depth: c.terrain_dirt_layer_depth,
+            terrain_noise_origin_offset: c.terrain_noise_origin_offset,
+
+            player_half_width: c.player_half_width,
+            player_height: c.player_height,
+            player_eye_height: c.player_eye_height,
+            ground_probe_distance: c.ground_probe_distance,
+            fixed_timestep: c.fixed_timestep,
+            max_physics_steps_per_frame: c.max_physics_steps_per_frame,
+
+            chunk_pool_size: c.chunk_pool_size,
+            max_faces_per_direction: c.max_faces_per_direction,
+            max_draws_per_direction: c.max_draws_per_direction,
         }
     }
 }
@@ -150,6 +222,24 @@ impl From<ConfigFile> for EngineConfig {
             gravity: f.gravity,
             jump_speed: f.jump_speed,
             start_flying: f.start_flying,
+
+            terrain_seed: f.terrain_seed,
+            terrain_noise_frequency: f.terrain_noise_frequency,
+            terrain_base_height: f.terrain_base_height,
+            terrain_height_amplitude: f.terrain_height_amplitude,
+            terrain_dirt_layer_depth: f.terrain_dirt_layer_depth,
+            terrain_noise_origin_offset: f.terrain_noise_origin_offset,
+
+            player_half_width: f.player_half_width,
+            player_height: f.player_height,
+            player_eye_height: f.player_eye_height,
+            ground_probe_distance: f.ground_probe_distance,
+            fixed_timestep: f.fixed_timestep.max(1.0 / 480.0),
+            max_physics_steps_per_frame: f.max_physics_steps_per_frame.max(1),
+
+            chunk_pool_size: f.chunk_pool_size.max(1),
+            max_faces_per_direction: f.max_faces_per_direction.max(1),
+            max_draws_per_direction: f.max_draws_per_direction.max(1),
         }
     }
 }
