@@ -1,0 +1,24 @@
+# Voxel-Engine Konfiguration (Vorlage).
+# Beim ersten Start erzeugt die Engine automatisch eine `config.toml` mit diesen Defaults.
+# `config.toml` ist maschinenlokal und wird nicht versioniert - diese Datei dient als Referenz.
+
+# Basis-Fluggeschwindigkeit in Bloecken/Sekunde.
+movement_speed = 12.0
+# Faktor auf die Geschwindigkeit, solange Shift gehalten wird (Sprint).
+sprint_multiplier = 4.0
+# Maussensitivitaet in Radiant pro Pixel.
+mouse_sensitivity = 0.0025
+# Vertikales Sichtfeld in Grad.
+fov_degrees = 60.0
+# Chunk-Radius um den Spieler (1..15). 4 => 9x9 Chunks, 6 => 13x13, usw.
+render_distance_chunks = 4
+# Hintergrund-/Himmelfarbe als linearer RGB-Wert (0.0..1.0).
+clear_color_rgb = [0.02, 0.02, 0.02]
+# Debug-HUD (F3) beim Start sichtbar.
+hud_visible_default = true
+# MSAA-Samplezahl (1, 2, 4, 8).
+msaa_samples = 4
+# Screen-Space Ambient Occlusion.
+ssao_enabled = true
+ssao_radius = 2.0
+ssao_strength = 1.4

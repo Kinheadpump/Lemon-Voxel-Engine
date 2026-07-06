@@ -18,6 +18,7 @@ pub struct InputState {
     move_right: bool,
     move_up: bool,
     move_down: bool,
+    sprinting: bool,
     mouse_delta: (f32, f32),
     hud_toggle_requested: bool,
 }
@@ -30,10 +31,15 @@ impl InputState {
             KeyCode::KeyA => self.move_left = pressed,
             KeyCode::KeyD => self.move_right = pressed,
             KeyCode::Space => self.move_up = pressed,
-            KeyCode::ShiftLeft => self.move_down = pressed,
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.move_down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.sprinting = pressed,
             KeyCode::F3 if pressed => self.hud_toggle_requested = true,
             _ => {}
         }
+    }
+
+    pub fn is_sprinting(&self) -> bool {
+        self.sprinting
     }
 
     pub fn take_hud_toggle_requested(&mut self) -> bool {

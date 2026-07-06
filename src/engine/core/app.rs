@@ -69,7 +69,12 @@ impl App {
         }
 
         if motion != glam::Vec3::ZERO {
-            self.camera.position += motion.normalize() * self.config.movement_speed * dt;
+            let speed = if self.input.is_sprinting() {
+                self.config.movement_speed * self.config.sprint_multiplier
+            } else {
+                self.config.movement_speed
+            };
+            self.camera.position += motion.normalize() * speed * dt;
         }
 
         let (dx, dy) = self.input.take_mouse_delta();

@@ -17,3 +17,6 @@ bevy_math = "0.19"
 
 rayon = "1.12"
 bytemuck = { version = "1.25", features = ["derive"] }
+
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"

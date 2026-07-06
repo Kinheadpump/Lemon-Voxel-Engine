@@ -1,4 +1,4 @@
-use voxel_engine::engine::config::EngineConfig;
+use voxel_engine::engine::config::{CONFIG_PATH, EngineConfig};
 use voxel_engine::engine::core::app::App;
 
 fn main() {
@@ -7,6 +7,6 @@ fn main() {
         .filter_module("wgpu_core", log::LevelFilter::Error)
         .init();
 
-    let config = EngineConfig::default();
+    let config = EngineConfig::load_or_create(CONFIG_PATH);
     App::run(config);
 }
