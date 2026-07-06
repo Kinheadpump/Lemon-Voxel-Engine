@@ -29,6 +29,10 @@ struct LoadedChunk {
     /// ausgeklammert, damit die pro-Frame-Kosten mit der tatsaechlich sichtbaren Geometrie skalieren
     /// statt mit der (bei vertikal unbegrenzter Welt potenziell riesigen) Gesamtzahl geladener Chunks.
     is_empty: bool,
+    /// Bereits in `unload_scratch` eingereiht (aber noch nicht abgearbeitet). Verhindert, dass
+    /// derselbe Chunk bei mehreren Fenster-Rebuilds vor dem gedeckelten Entladen mehrfach in die
+    /// Warteschlange gelegt wird.
+    queued_for_unload: bool,
 }
 
 struct GenerationResult {
@@ -105,11 +109,13 @@ pub struct ChunkManager {
     pending_scratch: Vec<ChunkCoord>,
     pending_set: HashSet<ChunkCoord>,
     visible_coords_scratch: Vec<ChunkCoord>,
-    /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations` - siehe Kommentar an
-    /// `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/uploaded ein
-    /// grosser Backlog (Welt-Start, schnelles Fliegen) tausende Chunks in einem einzigen Frame.
+    /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations`/`drain_unloads` - siehe
+    /// Kommentar an `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/
+    /// uploaded/entlaedt ein grosser Backlog (Welt-Start, schnelles Fliegen, vertikales Fallen)
+    /// tausende Chunks in einem einzigen Frame.
     max_chunk_dispatches_per_frame: usize,
     max_chunk_uploads_per_frame: usize,
+    max_chunk_unloads_per_frame: usize,
 }
 
 impl ChunkManager {
@@ -141,6 +147,7 @@ impl ChunkManager {
             visible_coords_scratch: Vec::new(),
             max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: config.max_chunk_uploads_per_frame,
+            max_chunk_unloads_per_frame: config.max_chunk_unloads_per_frame,
         }
     }
 
@@ -260,17 +267,21 @@ impl ChunkManager {
         self.apply_completed_generations(center, queue, renderer);
 
         if self.last_center != Some(center) {
-            self.rebuild_load_window(center, renderer);
+            self.rebuild_load_window(center);
             self.last_center = Some(center);
         }
 
+        self.drain_unloads(renderer);
         self.dispatch_pending();
         self.update_visibility(frustum, queue, renderer);
     }
 
-    /// Baut Soll-Menge, Entlade-Liste und die Liste neu zu ladender Chunks komplett neu auf - nur
-    /// noetig, wenn der Kamera-Mittelpunkt tatsaechlich einen neuen Chunk betreten hat.
-    fn rebuild_load_window(&mut self, center: ChunkCoord, renderer: &mut ChunkRenderer) {
+    /// Baut Soll-Menge neu auf und reiht neu aus dem Fenster gefallene Chunks in die (ueber mehrere
+    /// Frames gedeckelt abgearbeitete) Entlade-Warteschlange ein - nur noetig, wenn der Kamera-
+    /// Mittelpunkt tatsaechlich einen neuen Chunk betreten hat. Die eigentlichen Entladungen laufen
+    /// gedeckelt in `drain_unloads`, weil ein Chunk-Grenz-Uebergang (v.a. vertikal beim Fallen) eine
+    /// ganze Chunk-Ebene auf einmal aus dem Fenster schiebt.
+    fn rebuild_load_window(&mut self, center: ChunkCoord) {
         self.desired_scratch.clear();
         for dz in -self.render_distance_chunks..=self.render_distance_chunks {
             for dx in -self.render_distance_chunks..=self.render_distance_chunks {
@@ -280,12 +291,11 @@ impl ChunkManager {
             }
         }
 
-        self.unload_scratch.clear();
-        self.unload_scratch.extend(
-            self.loaded.keys().copied().filter(|coord| !self.desired_scratch.contains(coord)),
-        );
-        while let Some(coord) = self.unload_scratch.pop() {
-            self.unload_chunk(coord, renderer);
+        for (coord, loaded) in self.loaded.iter_mut() {
+            if !loaded.queued_for_unload && !self.desired_scratch.contains(coord) {
+                loaded.queued_for_unload = true;
+                self.unload_scratch.push(*coord);
+            }
         }
 
         // Chunks, die aus dem Fenster gewandert sind, bevor sie je dispatcht wurden, muessen aus
@@ -302,6 +312,25 @@ impl ChunkManager {
             if self.pending_set.insert(coord) {
                 self.pending_scratch.push(coord);
             }
+        }
+    }
+
+    /// Arbeitet bis zu `max_chunk_unloads_per_frame` Eintraege der Entlade-Warteschlange ab. Jede
+    /// `free_chunk`-Freigabe ist O(Freelist); ohne diesen Deckel wuerde das Entladen einer ganzen
+    /// Chunk-Ebene (Tausende) in einem Frame rucken. Ein zwischenzeitlich wieder ins Fenster
+    /// gewanderter Chunk wird nicht entladen, sondern nur wieder freigegeben.
+    fn drain_unloads(&mut self, renderer: &mut ChunkRenderer) {
+        for _ in 0..self.max_chunk_unloads_per_frame {
+            let Some(coord) = self.unload_scratch.pop() else { break };
+
+            if self.desired_scratch.contains(&coord) {
+                if let Some(loaded) = self.loaded.get_mut(&coord) {
+                    loaded.queued_for_unload = false;
+                }
+                continue;
+            }
+
+            self.unload_chunk(coord, renderer);
         }
     }
 
@@ -402,7 +431,12 @@ impl ChunkManager {
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
                 result.coord,
-                LoadedChunk { pool_slot: result.pool_slot, gpu_handle, is_empty: result.is_empty },
+                LoadedChunk {
+                    pool_slot: result.pool_slot,
+                    gpu_handle,
+                    is_empty: result.is_empty,
+                    queued_for_unload: false,
+                },
             );
         }
     }

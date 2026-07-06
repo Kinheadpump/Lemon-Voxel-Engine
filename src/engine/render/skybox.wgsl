@@ -24,14 +24,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+{SKY_HELPERS}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(depth_texture));
     let pixel_coord = vec2<i32>(in.uv * dims);
 
     // Reverse-Z: der Opaque-Pass clearet auf 0.0 ("unendlich fern"). Alles > 0.0 hat also bereits
-    // Geometrie - dort darf der Himmel nichts ueberschreiben.
-    if textureLoad(depth_texture, pixel_coord, 0) > 0.0 {
+    // Geometrie - dort darf der Himmel nichts ueberschreiben. Bei MSAA MUSS ueber ALLE Samples
+    // geprueft werden: an Silhouettenkanten ist Sample 0 oft unbedeckt (0.0), waehrend andere
+    // Samples Geometrie treffen. Nur Sample 0 zu testen malte den Himmel ueber die bereits
+    // aufgeloeste Kantenfarbe und riss so beim Umschauen flackernde Loecher in die Silhouetten.
+    if {DEPTH_HAS_GEOMETRY} {
         discard;
     }
 

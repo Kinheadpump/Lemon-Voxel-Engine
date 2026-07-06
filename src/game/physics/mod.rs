@@ -15,6 +15,7 @@ pub struct PlayerPhysics {
     player_height: f32,
     player_eye_height: f32,
     ground_probe_distance: f32,
+    terminal_velocity: f32,
 }
 
 impl PlayerPhysics {
@@ -30,6 +31,7 @@ impl PlayerPhysics {
             player_height: config.player_height,
             player_eye_height: config.player_eye_height,
             ground_probe_distance: config.ground_probe_distance,
+            terminal_velocity: config.terminal_velocity,
         }
     }
 
@@ -98,7 +100,10 @@ impl PlayerPhysics {
         if self.grounded && jump_held {
             self.velocity.y = jump_speed;
         } else {
-            self.velocity.y -= gravity * self.fixed_timestep;
+            // Terminal-Velocity-Clamp: verhindert unbegrenzt wachsende Fallgeschwindigkeit in der
+            // vertikal unbegrenzten Welt - sonst muesste der Lande-Frame einen zu `delta_y`
+            // proportionalen (also riesigen) Sweep-Kollisions-Scan abarbeiten und ruckelt.
+            self.velocity.y = (self.velocity.y - gravity * self.fixed_timestep).max(-self.terminal_velocity);
         }
 
         let mut feet = *eye_position - Vec3::new(0.0, self.player_eye_height, 0.0);

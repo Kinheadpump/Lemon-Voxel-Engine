@@ -26,10 +26,33 @@ pub struct SkyboxPass {
 
 /// Zwei Shader-Varianten noetig: die Depth-Textur des Opaque-Passes ist bei aktivem MSAA
 /// multisampled, bei deaktiviertem MSAA nicht - WGPU erlaubt keine Laufzeit-Umschaltung des
-/// Bindingtyps, daher wird die Textur-Deklaration bei Pipeline-Erstellung textuell eingesetzt.
+/// Bindingtyps, daher werden Textur-Deklaration UND die zugehoerige Geometrie-Abdeckungspruefung
+/// bei Pipeline-Erstellung textuell eingesetzt. Multisampled wird ueber alle Samples geprueft
+/// (Silhouetten-Kantenloecher, s. `skybox.wgsl`), einfach-gesampelt genuegt Sample 0.
 fn shader_source(multisampled: bool) -> String {
-    let depth_texture_type = if multisampled { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
-    include_str!("skybox.wgsl").replace("{DEPTH_TEXTURE_TYPE}", depth_texture_type)
+    let (depth_texture_type, has_geometry) = if multisampled {
+        (
+            "texture_depth_multisampled_2d",
+            "sky_pixel_has_geometry(pixel_coord)",
+        )
+    } else {
+        ("texture_depth_2d", "textureLoad(depth_texture, pixel_coord, 0) > 0.0")
+    };
+
+    let helper = if multisampled {
+        "fn sky_pixel_has_geometry(pixel_coord: vec2<i32>) -> bool {\n    \
+         let sample_count = i32(textureNumSamples(depth_texture));\n    \
+         for (var s = 0; s < sample_count; s++) {\n        \
+         if textureLoad(depth_texture, pixel_coord, s) > 0.0 { return true; }\n    \
+         }\n    return false;\n}\n"
+    } else {
+        ""
+    };
+
+    include_str!("skybox.wgsl")
+        .replace("{DEPTH_TEXTURE_TYPE}", depth_texture_type)
+        .replace("{DEPTH_HAS_GEOMETRY}", has_geometry)
+        .replace("{SKY_HELPERS}", helper)
 }
 
 impl SkyboxPass {

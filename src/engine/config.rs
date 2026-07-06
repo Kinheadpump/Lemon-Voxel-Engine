@@ -32,6 +32,10 @@ pub struct EngineConfig {
     pub ssao_blur_depth_threshold: f32,
     pub gravity: f32,
     pub jump_speed: f32,
+    /// Maximale Fallgeschwindigkeit (Betrag, Bloecke/s). In der vertikal unbegrenzten Welt wuerde
+    /// die Geschwindigkeit sonst bei tiefen Faellen unbegrenzt wachsen - der Lande-Frame muesste
+    /// dann einen entsprechend riesigen Sweep-Kollisions-Scan abarbeiten (Frame-Drop bei Aufprall).
+    pub terminal_velocity: f32,
     pub start_flying: bool,
 
     /// Reale Sekunden fuer einen vollen Tag/Nacht-Zyklus (Sonnenwinkel 0..2*PI).
@@ -83,6 +87,11 @@ pub struct EngineConfig {
     /// hochzuladen - das erzeugt Mehrsekunden-Freezes statt verteilter Frame-Zeit.
     pub max_chunk_dispatches_per_frame: usize,
     pub max_chunk_uploads_per_frame: usize,
+    /// Obergrenze fuer Chunk-Entladungen pro Frame. Beim Ueberqueren einer Chunk-Grenze (v.a. der
+    /// vertikalen beim Fallen/Landen) wandert eine ganze Chunk-Ebene aus dem Ladefenster - ohne
+    /// Deckel wuerden alle betroffenen Chunks (Tausende) in einem einzigen Frame entladen, jede
+    /// `free_chunk`-Freigabe ist dabei O(Freelist). Das war die Ursache der Ruckler beim Landen.
+    pub max_chunk_unloads_per_frame: usize,
 }
 
 impl Default for EngineConfig {
@@ -103,6 +112,7 @@ impl Default for EngineConfig {
             ssao_blur_depth_threshold: 0.0008,
             gravity: 26.0,
             jump_speed: 9.0,
+            terminal_velocity: 80.0,
             start_flying: true,
 
             sun_cycle_seconds: 240.0,
@@ -144,6 +154,7 @@ impl Default for EngineConfig {
 
             max_chunk_dispatches_per_frame: 64,
             max_chunk_uploads_per_frame: 64,
+            max_chunk_unloads_per_frame: 128,
         }
     }
 }
@@ -205,6 +216,7 @@ struct ConfigFile {
     ssao_blur_depth_threshold: f32,
     gravity: f32,
     jump_speed: f32,
+    terminal_velocity: f32,
     start_flying: bool,
 
     sun_cycle_seconds: f32,
@@ -248,6 +260,7 @@ struct ConfigFile {
     /// hochzuladen - das erzeugt Mehrsekunden-Freezes statt verteilter Frame-Zeit.
     max_chunk_dispatches_per_frame: usize,
     max_chunk_uploads_per_frame: usize,
+    max_chunk_unloads_per_frame: usize,
 }
 
 impl Default for ConfigFile {
@@ -274,6 +287,7 @@ impl From<EngineConfig> for ConfigFile {
             ssao_blur_depth_threshold: c.ssao_blur_depth_threshold,
             gravity: c.gravity,
             jump_speed: c.jump_speed,
+            terminal_velocity: c.terminal_velocity,
             start_flying: c.start_flying,
 
             sun_cycle_seconds: c.sun_cycle_seconds,
@@ -312,6 +326,7 @@ impl From<EngineConfig> for ConfigFile {
 
             max_chunk_dispatches_per_frame: c.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: c.max_chunk_uploads_per_frame,
+            max_chunk_unloads_per_frame: c.max_chunk_unloads_per_frame,
         }
     }
 }
@@ -339,6 +354,7 @@ impl From<ConfigFile> for EngineConfig {
             ssao_blur_depth_threshold: f.ssao_blur_depth_threshold.max(0.0),
             gravity: f.gravity,
             jump_speed: f.jump_speed,
+            terminal_velocity: f.terminal_velocity.max(1.0),
             start_flying: f.start_flying,
 
             sun_cycle_seconds: f.sun_cycle_seconds.max(1.0),
@@ -377,6 +393,7 @@ impl From<ConfigFile> for EngineConfig {
 
             max_chunk_dispatches_per_frame: f.max_chunk_dispatches_per_frame.max(1),
             max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),
+            max_chunk_unloads_per_frame: f.max_chunk_unloads_per_frame.max(1),
         }
     }
 }

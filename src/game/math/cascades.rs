@@ -79,28 +79,34 @@ pub fn compute_cascades(
         }
 
         let center = corners.iter().fold(Vec3::ZERO, |acc, &c| acc + c) / corners.len() as f32;
+        // Umschliessende Kugel (rotationsinvariant): unter reiner Kamerarotation dreht sich der
+        // Frustum-Ausschnitt starr um die Kamera, die Eckdistanzen zum Schwerpunkt bleiben also
+        // gleich - der Radius (und damit die Texelgroesse) ist von der Blickrichtung unabhaengig.
         let radius = corners.iter().map(|&c| center.distance(c)).fold(0.0f32, f32::max).max(0.1);
-
-        let eye = center - light_direction * radius * 2.0;
-        let light_view = glam::camera::rh::view::look_to_mat4(eye, light_direction, light_up);
-
-        // Texel-Snapping: der Kaskaden-Mittelpunkt wandert kontinuierlich mit der Kamera, das
-        // Shadow-Map-Texelraster darf das aber nicht - sonst "schwimmt" die Sub-Texel-Position des
-        // Rasters von Frame zu Frame und erzeugt das beruechtigte Shimmering auf den Kanten. Da die
-        // Sphere-Radius pro Kaskade bei fixer Kamera-FOV/Split konstant bleibt, reicht es, das
-        // Projektions-Fenster auf ein Vielfaches der Texelgroesse zu runden.
         let texel_size = (radius * 2.0) / shadow_map_resolution as f32;
-        let center_light_space = light_view.transform_point3(center);
-        let snapped_x = (center_light_space.x / texel_size).floor() * texel_size;
-        let snapped_y = (center_light_space.y / texel_size).floor() * texel_size;
-        let delta_x = snapped_x - center_light_space.x;
-        let delta_y = snapped_y - center_light_space.y;
 
+        // Texel-Snapping muss in einem BLICKRICHTUNGS-UNABHAENGIGEN Licht-Frame passieren. Zuvor
+        // wurde im Frame der finalen Licht-View gesnappt, deren `eye` selbst am wandernden `center`
+        // klebte - `center` lag darin quasi konstant bei (0,0,-2r), das Snapping war also praktisch
+        // wirkungslos und die Schatten "schwammen" bei jeder Kopfdrehung. Jetzt: Kugelmittelpunkt in
+        // eine reine Rotations-View (Augpunkt im Ursprung) projizieren, dort aufs Texelraster runden
+        // und zurueck in Weltkoordinaten - so rastet das Schattenraster stabil ein.
+        let light_rotation = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, light_direction, light_up);
+        let center_light_space = light_rotation.transform_point3(center);
+        let snapped_light_space = Vec3::new(
+            (center_light_space.x / texel_size).round() * texel_size,
+            (center_light_space.y / texel_size).round() * texel_size,
+            center_light_space.z,
+        );
+        let snapped_center = light_rotation.inverse().transform_point3(snapped_light_space);
+
+        let eye = snapped_center - light_direction * radius * 2.0;
+        let light_view = glam::camera::rh::view::look_to_mat4(eye, light_direction, light_up);
         let light_proj = glam::camera::rh::proj::directx::orthographic(
-            -radius + delta_x,
-            radius + delta_x,
-            -radius + delta_y,
-            radius + delta_y,
+            -radius,
+            radius,
+            -radius,
+            radius,
             0.0,
             radius * 4.0,
         );
