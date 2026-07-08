@@ -41,7 +41,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let ndc_xy = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let world_h = params.inverse_view_proj * vec4<f32>(ndc_xy, 0.0, 1.0);
+    // NDC-Z = 1.0 (Near-Ebene in unserer Reverse-Z-Konvention), NICHT 0.0 (Far): bei einer
+    // UNENDLICHEN Reverse-Z-Projektion ist Z=0.0 exakt der Punkt im Unendlichen - die inverse
+    // Projektionsmatrix liefert dort einen homogenen Vektor mit w=0 (reine Richtung ohne Position),
+    // und die anschliessende Division durch w erzeugt Inf/NaN. Jeder endliche Z-Wert entlang
+    // desselben Sichtstrahls liefert nach der Normalisierung dieselbe Richtung - Z=1.0 ist einfach
+    // der naechste sichere Punkt. Dieser Bug liess die Sonnen-/Mond-Scheibe (die exakte Naehe zu
+    // dot()=1.0 braucht) nie treffen, waehrend der grobe Himmel-Farbverlauf durch GPU-eigene
+    // NaN-Clamp-Heuristiken zufaellig noch halbwegs plausibel aussah.
+    let world_h = params.inverse_view_proj * vec4<f32>(ndc_xy, 1.0, 1.0);
     let world_point = world_h.xyz / world_h.w;
     let ray_dir = normalize(world_point - params.camera_pos.xyz);
 

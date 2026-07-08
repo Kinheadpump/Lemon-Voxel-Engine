@@ -145,8 +145,8 @@ impl Default for EngineConfig {
             shadow_depth_bias: 2.0,
             shadow_depth_bias_slope_scale: 2.0,
 
-            sky_zenith_day_color: [0.25, 0.55, 0.95],
-            sky_horizon_day_color: [0.75, 0.85, 0.95],
+            sky_zenith_day_color: [0.21, 0.47, 0.81],
+            sky_horizon_day_color: [0.64, 0.72, 0.81],
             sky_night_color: [0.01, 0.015, 0.03],
 
             godray_count: 512,
