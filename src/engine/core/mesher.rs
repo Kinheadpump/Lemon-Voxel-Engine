@@ -21,12 +21,40 @@ pub const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
 const CHUNK_SIZE_USIZE: usize = CHUNK_SIZE as usize;
 
 type FaceMask = [[u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE];
+/// Eine Achsen-Spalten-Tabelle: 32x32 Positionen in der Ebene senkrecht zur Achse, je ein u32-
+/// Bitfeld ueber die 32 Voxel ENTLANG der Achse (Bit i = Voxel an Achsenposition i ist massiv).
+/// CHUNK_SIZE=32 passt exakt in ein u32 - das ist die Grundlage von "Binary Greedy Meshing".
+type AxisColumns = [[u32; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE];
+
+struct MeshingScratch {
+    mask: FaceMask,
+    solid_x: AxisColumns,
+    solid_y: AxisColumns,
+    solid_z: AxisColumns,
+    /// Pro Richtung (Index = DIR_*) das Ergebnis von `compute_exposure`: Bit `layer` gesetzt heisst
+    /// "Voxel bei dieser Achsenposition hat auf der `dir`-Seite kein massives Nachbarvoxel" - fertig
+    /// vorberechnet fuer den kompletten Chunk, bevor irgendein Face gebaut wird.
+    exposure: [AxisColumns; 6],
+    /// Pro Richtung die OR-Reduktion aller 1024 `exposure`-Spalten - Bit `layer` gesetzt heisst "in
+    /// dieser Ebene liegt IRGENDWO mindestens ein Face". Ebenen mit Bit 0 werden in `mesh_chunk`
+    /// komplett uebersprungen (kein Populate, kein Merge-Aufruf).
+    any_exposed: [u32; 6],
+}
 
 thread_local! {
-    /// Wiederverwendeter Scratch-Puffer fuer die 2D-Face-Maske (32x32 = 2 KiB), EINMAL pro
-    /// Rayon-Worker-Thread alloziert statt 192-mal pro Chunk (6 Richtungen * 32 Ebenen). Bleibt
-    /// zwischen Aufrufen garantiert komplett auf 0 - siehe Invariante an `build_face_mask`.
-    static MASK_SCRATCH: RefCell<FaceMask> = const { RefCell::new([[0u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE]) };
+    /// Wiederverwendeter Scratch-Speicher (~39 KiB: 2 KiB Merge-Maske + 3x4 KiB Achsen-Spalten +
+    /// 6x4 KiB Exposure-Tabellen), EINMAL pro Rayon-Worker-Thread alloziert statt pro Chunk. Passt
+    /// bequem in L2-Cache.
+    static SCRATCH: RefCell<MeshingScratch> = const {
+        RefCell::new(MeshingScratch {
+            mask: [[0u16; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE],
+            solid_x: [[0u32; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE],
+            solid_y: [[0u32; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE],
+            solid_z: [[0u32; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE],
+            exposure: [[[0u32; CHUNK_SIZE_USIZE]; CHUNK_SIZE_USIZE]; 6],
+            any_exposed: [0u32; 6],
+        })
+    };
 }
 
 #[derive(Default)]
@@ -59,12 +87,9 @@ fn pos_from_layer_uv(dir: usize, layer: i32, u: i32, v: i32) -> (i32, i32, i32) 
 
 /// Fuer welche Richtungen `pos_from_layer_uv` `v` (statt `u`) auf die X-Achse des flachen
 /// `x + y*32 + z*1024`-Arrays abbildet - X ist die einzige Achse mit Stride 1 (echt
-/// zusammenhaengender Speicher). Per Profiling gefunden (`profile_mesh_chunk_phases`-Test):
-/// DIR_POS_X und DIR_NEG_Y hatten `v` auf die Z-Achse (Stride 1024 = 2 KiB-Sprung PRO VOXEL)
-/// gemappt, DIR_POS_Z auf Y (Stride 32) - beides fern von sequenziellem Zugriff. Scannen wir
-/// stattdessen fuer diese Richtungen `u` als innere statt `v` als innere Schleifenvariable, landet
-/// die schnellstlaufende Schleife immer auf der guenstigsten verfuegbaren Achse (X wo moeglich,
-/// sonst Y statt Z) - reine Iterationsreihenfolge, keine Verhaltensaenderung.
+/// zusammenhaengender Speicher). Nur noch fuer `merge_mask_into_faces`/das finale Mask-Array
+/// relevant (die teure Rand-Pruefung selbst laeuft jetzt ueber `compute_exposure`, s.u.), bleibt
+/// aber aus dem urspruenglichen Profiling erhalten, weil Zugriffsreihenfolge weiterhin zaehlt.
 const SWAP_UV_LOOP_ORDER: [bool; 6] = [
     false, // DIR_NEG_X: v->Y (Stride 32) ist bereits die beste erreichbare Achse (X ist hier "layer", fix)
     true,  // DIR_POS_X: u->Y (Stride 32) statt v->Z (Stride 1024)
@@ -74,46 +99,154 @@ const SWAP_UV_LOOP_ORDER: [bool; 6] = [
     true,  // DIR_POS_Z: u->X (Stride 1) statt v->Y (Stride 32)
 ];
 
-/// Liest einen Nachbarblock. Liegt die Position innerhalb des lokalen Chunks, wird das lokale
-/// Array genutzt. Liegt sie ausserhalb (immer exakt 1 Schritt in GENAU der `dir`-Achse, da `x,y,z`
-/// hier stets aus `pos_from_layer_uv` + einem Einheitsversatz stammen), wird zuerst die lokal
-/// gecachte `neighbor`-Referenz probiert (billiger Array-Zugriff statt HashMap-Lookup) und nur wenn
-/// dieser Nachbar gar nicht geladen ist (z.B. Rand der Render-Distanz, oder der asynchrone
-/// Rayon-Meshing-Pfad, der keine Referenzen ueber die Thread-Grenze halten kann) auf die
-/// prozedurale Welt-Vorhersage zurueckgefallen.
-#[inline(always)]
-fn is_solid<F: Fn(i32, i32, i32) -> bool>(
-    chunk: &Chunk,
-    neighbor: Option<&Chunk>,
-    chunk_x: i32,
-    chunk_y: i32,
-    chunk_z: i32,
-    x: i32,
-    y: i32,
-    z: i32,
-    neighbor_solid_at_world: &F,
-) -> bool {
-    if (0..CHUNK_SIZE).contains(&x) && (0..CHUNK_SIZE).contains(&y) && (0..CHUNK_SIZE).contains(&z) {
-        return chunk.get_block(x, y, z) != 0;
+/// Phase 1 (Binary Greedy Meshing): EIN sequenzieller Durchlauf ueber alle 32768 Voxel des Chunks
+/// (exakt die Flat-Array-Reihenfolge: x schnellst-, z langsamst-laufend) fuellt gleichzeitig alle
+/// drei Achsen-Bitfelder. Ersetzt die vorherigen bis zu 196.608 Einzelpruefungen (6 Richtungen * 32
+/// Ebenen * 1024 Zellen) durch genau 32768 sequenzielle, cache-optimale Lesevorgaenge - jedes Voxel
+/// wird nur noch EIN einziges Mal angefasst statt bis zu 6-mal ueber alle Richtungen hinweg.
+fn build_solidity_columns(chunk: &Chunk, solid_x: &mut AxisColumns, solid_y: &mut AxisColumns, solid_z: &mut AxisColumns) {
+    for z in 0..CHUNK_SIZE_USIZE {
+        for y in 0..CHUNK_SIZE_USIZE {
+            for x in 0..CHUNK_SIZE_USIZE {
+                if chunk.get_block(x as i32, y as i32, z as i32) == 0 {
+                    continue;
+                }
+                solid_x[y][z] |= 1 << x;
+                solid_y[x][z] |= 1 << y;
+                solid_z[x][y] |= 1 << z;
+            }
+        }
     }
-
-    if let Some(neighbor_chunk) = neighbor {
-        return neighbor_chunk.get_block(x.rem_euclid(CHUNK_SIZE), y.rem_euclid(CHUNK_SIZE), z.rem_euclid(CHUNK_SIZE))
-            != 0;
-    }
-
-    neighbor_solid_at_world(chunk_x * CHUNK_SIZE + x, chunk_y * CHUNK_SIZE + y, chunk_z * CHUNK_SIZE + z)
 }
 
-fn build_face_mask<F: Fn(i32, i32, i32) -> bool>(
-    chunk: &Chunk,
+/// Liefert, ob die Position exakt einen Schritt ausserhalb des Chunks entlang einer Achse massiv
+/// ist - genau EIN Aufruf pro Rand-Spalte statt vorher potenziell einer pro Rand-VOXEL. `local` ist
+/// die Position bereits in den Nachbar-Chunk gewrappt (0 oder 31), `world` die absolute
+/// Weltkoordinate fuer den prozeduralen Fallback.
+#[inline(always)]
+fn boundary_solid<F: Fn(i32, i32, i32) -> bool>(
     neighbor: Option<&Chunk>,
+    local: (i32, i32, i32),
+    world: (i32, i32, i32),
+    neighbor_solid_at_world: &F,
+) -> bool {
+    if let Some(chunk) = neighbor {
+        chunk.get_block(local.0, local.1, local.2) != 0
+    } else {
+        neighbor_solid_at_world(world.0, world.1, world.2)
+    }
+}
+
+/// Phase 2: aus den Achsen-Bitfeldern werden pro Spalte BEIDE Face-Richtungen gleichzeitig per
+/// Shift+AND-NOT bestimmt - `col & !(col >> 1 mit eingeschobenem Rand-Bit)` markiert alle 32
+/// moeglichen Positionen einer Spalte auf einmal als "Richtung +Achse exponiert", `col << 1`
+/// analog fuer "-Achse exponiert". Das ersetzt 32 skalare Nachbar-Vergleiche pro Spalte durch 2
+/// Bit-Operationen. Das Rand-Bit (Nachbar-Chunk oder prozeduraler Fallback) wird genau EINMAL pro
+/// Spalte eingespeist statt einmal pro Voxel. `any_exposed[dir]` sammelt zusaetzlich per OR ueber
+/// alle 1024 Spalten, in welchen Ebenen ueberhaupt IRGENDEIN Face liegt - `mesh_chunk` ueberspringt
+/// damit komplett leere Ebenen (haeufig bei durchgehend massiven oder komplett umschlossenen
+/// Chunks) statt sie trotzdem leer zu durchlaufen.
+#[allow(clippy::too_many_arguments)]
+fn compute_exposure<F: Fn(i32, i32, i32) -> bool>(
     chunk_x: i32,
     chunk_y: i32,
     chunk_z: i32,
+    neighbors: [Option<&Chunk>; 6],
+    solid_x: &AxisColumns,
+    solid_y: &AxisColumns,
+    solid_z: &AxisColumns,
+    exposure: &mut [AxisColumns; 6],
+    any_exposed: &mut [u32; 6],
+    neighbor_solid_at_world: &F,
+) {
+    for z in 0..CHUNK_SIZE_USIZE {
+        for y in 0..CHUNK_SIZE_USIZE {
+            let col = solid_x[y][z];
+            let below = boundary_solid(
+                neighbors[DIR_NEG_X],
+                (CHUNK_SIZE - 1, y as i32, z as i32),
+                (chunk_x * CHUNK_SIZE - 1, chunk_y * CHUNK_SIZE + y as i32, chunk_z * CHUNK_SIZE + z as i32),
+                neighbor_solid_at_world,
+            );
+            let above = boundary_solid(
+                neighbors[DIR_POS_X],
+                (0, y as i32, z as i32),
+                (chunk_x * CHUNK_SIZE + CHUNK_SIZE, chunk_y * CHUNK_SIZE + y as i32, chunk_z * CHUNK_SIZE + z as i32),
+                neighbor_solid_at_world,
+            );
+            let extended_above = (col >> 1) | ((above as u32) << 31);
+            let extended_below = (col << 1) | (below as u32);
+            let pos = col & !extended_above;
+            let neg = col & !extended_below;
+            exposure[DIR_POS_X][y][z] = pos;
+            exposure[DIR_NEG_X][y][z] = neg;
+            any_exposed[DIR_POS_X] |= pos;
+            any_exposed[DIR_NEG_X] |= neg;
+        }
+    }
+
+    for z in 0..CHUNK_SIZE_USIZE {
+        for x in 0..CHUNK_SIZE_USIZE {
+            let col = solid_y[x][z];
+            let below = boundary_solid(
+                neighbors[DIR_NEG_Y],
+                (x as i32, CHUNK_SIZE - 1, z as i32),
+                (chunk_x * CHUNK_SIZE + x as i32, chunk_y * CHUNK_SIZE - 1, chunk_z * CHUNK_SIZE + z as i32),
+                neighbor_solid_at_world,
+            );
+            let above = boundary_solid(
+                neighbors[DIR_POS_Y],
+                (x as i32, 0, z as i32),
+                (chunk_x * CHUNK_SIZE + x as i32, chunk_y * CHUNK_SIZE + CHUNK_SIZE, chunk_z * CHUNK_SIZE + z as i32),
+                neighbor_solid_at_world,
+            );
+            let extended_above = (col >> 1) | ((above as u32) << 31);
+            let extended_below = (col << 1) | (below as u32);
+            let pos = col & !extended_above;
+            let neg = col & !extended_below;
+            exposure[DIR_POS_Y][x][z] = pos;
+            exposure[DIR_NEG_Y][x][z] = neg;
+            any_exposed[DIR_POS_Y] |= pos;
+            any_exposed[DIR_NEG_Y] |= neg;
+        }
+    }
+
+    for y in 0..CHUNK_SIZE_USIZE {
+        for x in 0..CHUNK_SIZE_USIZE {
+            let col = solid_z[x][y];
+            let below = boundary_solid(
+                neighbors[DIR_NEG_Z],
+                (x as i32, y as i32, CHUNK_SIZE - 1),
+                (chunk_x * CHUNK_SIZE + x as i32, chunk_y * CHUNK_SIZE + y as i32, chunk_z * CHUNK_SIZE - 1),
+                neighbor_solid_at_world,
+            );
+            let above = boundary_solid(
+                neighbors[DIR_POS_Z],
+                (x as i32, y as i32, 0),
+                (chunk_x * CHUNK_SIZE + x as i32, chunk_y * CHUNK_SIZE + y as i32, chunk_z * CHUNK_SIZE + CHUNK_SIZE),
+                neighbor_solid_at_world,
+            );
+            let extended_above = (col >> 1) | ((above as u32) << 31);
+            let extended_below = (col << 1) | (below as u32);
+            let pos = col & !extended_above;
+            let neg = col & !extended_below;
+            exposure[DIR_POS_Z][x][y] = pos;
+            exposure[DIR_NEG_Z][x][y] = neg;
+            any_exposed[DIR_POS_Z] |= pos;
+            any_exposed[DIR_NEG_Z] |= neg;
+        }
+    }
+}
+
+/// Phase 3: fuellt die 2D-Merge-Maske fuer eine (Richtung, Ebene) NUR noch per Bit-Test aus der
+/// vorberechneten Exposure-Tabelle - keine Nachbar-Pruefung, kein zweiter Speicherzugriff mehr pro
+/// Zelle. `chunk.get_block` wird nur noch fuer tatsaechlich exponierte (also garantiert massive)
+/// Zellen aufgerufen, um die Textur-ID zu holen.
+fn populate_mask_from_exposure(
+    chunk: &Chunk,
+    exposure_for_dir: &AxisColumns,
     dir: usize,
     layer: i32,
-    neighbor_solid_at_world: &F,
     mask: &mut FaceMask,
 ) {
     debug_assert!(
@@ -122,31 +255,23 @@ fn build_face_mask<F: Fn(i32, i32, i32) -> bool>(
          `merge_mask_into_faces` verletzt"
     );
 
-    let (ox, oy, oz) = NEIGHBOR_OFFSETS[dir];
     let swap = SWAP_UV_LOOP_ORDER[dir];
 
     for a in 0..CHUNK_SIZE {
         for b in 0..CHUNK_SIZE {
             let (u, v) = if swap { (b, a) } else { (a, b) };
             let (x, y, z) = pos_from_layer_uv(dir, layer, u, v);
-            let block_id = chunk.get_block(x, y, z);
-            if block_id == 0 {
-                continue;
-            }
 
-            let neighbor_solid = is_solid(
-                chunk,
-                neighbor,
-                chunk_x,
-                chunk_y,
-                chunk_z,
-                x + ox,
-                y + oy,
-                z + oz,
-                neighbor_solid_at_world,
-            );
-            if !neighbor_solid {
-                mask[u as usize][v as usize] = block_id;
+            // Exposure-Tabellen sind wie ihre zugehoerige `solid_*`-Spaltentabelle indiziert:
+            // X-Richtungen ueber (y,z), Y-Richtungen ueber (x,z), Z-Richtungen ueber (x,y).
+            let column = match dir {
+                DIR_NEG_X | DIR_POS_X => exposure_for_dir[y as usize][z as usize],
+                DIR_NEG_Y | DIR_POS_Y => exposure_for_dir[x as usize][z as usize],
+                _ => exposure_for_dir[x as usize][y as usize],
+            };
+
+            if (column >> layer) & 1 != 0 {
+                mask[u as usize][v as usize] = chunk.get_block(x, y, z);
             }
         }
     }
@@ -154,9 +279,9 @@ fn build_face_mask<F: Fn(i32, i32, i32) -> bool>(
 
 /// Greedy-Merge UND Face-Encoding in einem Durchgang: verbrauchte Zellen werden auf 0
 /// zurueckgesetzt (dadurch ist die Maske nach dieser Funktion garantiert wieder komplett 0 -
-/// `build_face_mask` muss sie folglich nie explizit leeren) und jedes fertige Rechteck wird SOFORT
-/// als komprimiertes u32 in `output` gepusht. Es existiert bewusst keine Zwischen-Liste aus
-/// Rechtecken mehr, die spaeter erst in den Output kopiert wuerde.
+/// `populate_mask_from_exposure` muss sie folglich nie explizit leeren) und jedes fertige Rechteck
+/// wird SOFORT als komprimiertes u32 in `output` gepusht. Es existiert bewusst keine Zwischen-Liste
+/// aus Rechtecken mehr, die spaeter erst in den Output kopiert wuerde.
 fn merge_mask_into_faces(mask: &mut FaceMask, dir: usize, layer: i32, output: &mut Vec<u32>) {
     for v in 0..CHUNK_SIZE_USIZE {
         for u in 0..CHUNK_SIZE_USIZE {
@@ -212,24 +337,50 @@ pub fn mesh_chunk<F: Fn(i32, i32, i32) -> bool>(
 ) -> DirectionalMesh {
     let mut mesh = DirectionalMesh::default();
 
-    MASK_SCRATCH.with_borrow_mut(|mask| {
+    SCRATCH.with_borrow_mut(|scratch| {
+        let MeshingScratch { mask, solid_x, solid_y, solid_z, exposure, any_exposed } = &mut *scratch;
+
+        build_solidity_columns(chunk, solid_x, solid_y, solid_z);
+        compute_exposure(
+            chunk_x,
+            chunk_y,
+            chunk_z,
+            neighbors,
+            solid_x,
+            solid_y,
+            solid_z,
+            exposure,
+            any_exposed,
+            &neighbor_solid_at_world,
+        );
+
         for dir in 0..6 {
-            let neighbor = neighbors[dir];
             for layer in 0..CHUNK_SIZE {
-                build_face_mask(
-                    chunk,
-                    neighbor,
-                    chunk_x,
-                    chunk_y,
-                    chunk_z,
-                    dir,
-                    layer,
-                    &neighbor_solid_at_world,
-                    mask,
-                );
+                // Ganze Ebenen ohne ein einziges exponiertes Face ueberspringen (haeufig bei
+                // durchgehend massiven oder komplett umschlossenen Chunks) - spart den vollen
+                // 1024-Zellen-Populate- UND den Merge-Durchlauf fuer diese Ebene komplett.
+                if (any_exposed[dir] >> layer) & 1 == 0 {
+                    continue;
+                }
+                populate_mask_from_exposure(chunk, &exposure[dir], dir, layer, mask);
                 merge_mask_into_faces(mask, dir, layer, &mut mesh.faces[dir]);
             }
         }
+
+        // Die Achsen-/Exposure-/Aggregat-Tabellen sind NICHT selbstreinigend (anders als `mask`) -
+        // sie werden pro Chunk komplett ueberschrieben, aber `build_solidity_columns`/
+        // `compute_exposure` nutzen `|=` (additiv), muessen also von 0 starten. Ein `memset` auf
+        // drei 4-KiB-, sechs 4-KiB- und ein 24-Byte-Array ist immer noch um Groessenordnungen
+        // billiger als der eingesparte Scan.
+        for column in solid_x.iter_mut().chain(solid_y.iter_mut()).chain(solid_z.iter_mut()) {
+            column.fill(0);
+        }
+        for table in exposure.iter_mut() {
+            for column in table.iter_mut() {
+                column.fill(0);
+            }
+        }
+        any_exposed.fill(0);
     });
 
     mesh
@@ -290,11 +441,56 @@ mod tests {
     }
 
     #[test]
+    fn boundary_face_exposed_when_neighbor_not_loaded_and_world_reports_air() {
+        let mut chunk = Chunk::empty();
+        chunk.set_block(31, 5, 5, 1);
+
+        // Kein gecachter Nachbar UND die prozedurale Welt-Vorhersage sagt "Luft" -> Face muss da sein.
+        let mesh = mesh_chunk(&chunk, 0, 0, 0, [None; 6], no_world_neighbors);
+        assert_eq!(mesh.faces[DIR_POS_X].len(), 1);
+    }
+
+    #[test]
+    fn boundary_face_hidden_when_world_fallback_reports_solid() {
+        let mut chunk = Chunk::empty();
+        chunk.set_block(31, 5, 5, 1);
+
+        // Nur die +X-Seite (x=32) ist ein echter Chunk-Rand und faellt auf den Welt-Fallback
+        // zurueck. Alle anderen 5 Nachbarpositionen (x=30, y=4/6, z=4/6) liegen im lokalen Chunk-
+        // Inneren und sind dort Luft - unabhaengig vom Fallback exponiert.
+        let mesh = mesh_chunk(&chunk, 0, 0, 0, [None; 6], |_, _, _| true);
+        assert_eq!(mesh.faces[DIR_POS_X].len(), 0);
+        assert_eq!(mesh.faces[DIR_NEG_X].len(), 1);
+        assert_eq!(mesh.faces[DIR_NEG_Y].len(), 1);
+        assert_eq!(mesh.faces[DIR_POS_Y].len(), 1);
+        assert_eq!(mesh.faces[DIR_NEG_Z].len(), 1);
+        assert_eq!(mesh.faces[DIR_POS_Z].len(), 1);
+    }
+
+    #[test]
+    fn fully_solid_chunk_produces_no_interior_faces() {
+        let mut chunk = Chunk::empty();
+        for i in 0..CHUNK_SIZE {
+            for j in 0..CHUNK_SIZE {
+                for k in 0..CHUNK_SIZE {
+                    chunk.set_block(i, j, k, 1);
+                }
+            }
+        }
+
+        // Komplett von massiven Nachbarn umgeben -> ueberhaupt keine Faces.
+        let mesh = mesh_chunk(&chunk, 0, 0, 0, [None; 6], |_, _, _| true);
+        for faces in &mesh.faces {
+            assert_eq!(faces.len(), 0);
+        }
+    }
+
+    #[test]
     fn mask_scratch_is_clean_after_repeated_calls() {
         // Regressionstest fuer die Selbstreinigungs-Invariante: mehrere aufeinanderfolgende
-        // `mesh_chunk`-Aufrufe im selben Thread duerfen den `debug_assert` in `build_face_mask`
-        // nicht verletzen (liefe in Debug-Builds sofort in einen Panic, falls die Maske nicht
-        // vollstaendig auf 0 zurueckgesetzt wird).
+        // `mesh_chunk`-Aufrufe im selben Thread duerfen den `debug_assert` in
+        // `populate_mask_from_exposure` nicht verletzen (liefe in Debug-Builds sofort in einen
+        // Panic, falls die Maske nicht vollstaendig auf 0 zurueckgesetzt wird).
         for i in 0..3 {
             let mut chunk = Chunk::empty();
             chunk.set_block(i, i, i, 1);
@@ -302,13 +498,46 @@ mod tests {
         }
     }
 
-    /// Diagnose-Benchmark, KEIN Korrektheitstest - zerlegt die Gesamt-Meshing-Zeit in die beiden
-    /// Phasen (Rand-Voxel-Scan vs. Greedy-Merge+Encode), um zu bestimmen, wo die ~1.3ms/Chunk aus
-    /// dem `examples/mesh_bench.rs`-Ergebnis tatsaechlich hingehen. Manuell ausfuehren mit:
-    /// `cargo test --release --lib -- --ignored --nocapture profile_mesh_chunk_phases`
+    /// Diagnose-Benchmark, KEIN Korrektheitstest - misst die reine `mesh_chunk`-Zeit direkt (die
+    /// Phasenaufteilung aus der Vorgaenger-Version ist mit dem Binary-Greedy-Umbau ueberholt, die
+    /// Phasen laufen jetzt nicht mehr pro (Richtung,Ebene) einzeln). Manuell ausfuehren mit:
+    /// `cargo test --release --lib -- --ignored --nocapture profile_mesh_chunk_total`
     #[test]
     #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
-    fn profile_mesh_chunk_phases() {
+    fn profile_mesh_chunk_total() {
+        use std::time::Instant;
+
+        use crate::engine::config::EngineConfig;
+        use crate::game::world::generator::TerrainGenerator;
+
+        let config = EngineConfig::default();
+        let generator = TerrainGenerator::new(&config);
+        let mut chunk = Chunk::empty();
+        generator.generate_chunk(4, 0, 4, &mut chunk);
+        assert!(!chunk.is_empty());
+
+        let neighbor_solid = |x: i32, y: i32, z: i32| generator.is_solid(x, y, z);
+        const ITERATIONS: usize = 2000;
+
+        for _ in 0..50 {
+            std::hint::black_box(mesh_chunk(&chunk, 4, 0, 4, [None; 6], neighbor_solid));
+        }
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(mesh_chunk(&chunk, 4, 0, 4, [None; 6], neighbor_solid));
+        }
+        let elapsed = start.elapsed();
+        let per_chunk_us = elapsed.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        println!("Warm-Meshing (Binary Greedy): {per_chunk_us:.2} us/Chunk");
+    }
+
+    /// Diagnose-Benchmark, KEIN Korrektheitstest - zerlegt `mesh_chunk` in seine 4 Phasen
+    /// (Spalten-Bau, Exposure-Berechnung, Populate+Merge, Scratch-Reinigung). Manuell ausfuehren:
+    /// `cargo test --release --lib -- --ignored --nocapture profile_mesh_chunk_binary_phases`
+    #[test]
+    #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
+    fn profile_mesh_chunk_binary_phases() {
         use std::time::{Duration, Instant};
 
         use crate::engine::config::EngineConfig;
@@ -324,54 +553,75 @@ mod tests {
         const ITERATIONS: usize = 2000;
 
         let run = || {
-            let mut mask_time = Duration::ZERO;
-            let mut merge_time = Duration::ZERO;
+            let mut columns_time = Duration::ZERO;
+            let mut exposure_time = Duration::ZERO;
+            let mut populate_merge_time = Duration::ZERO;
+            let mut cleanup_time = Duration::ZERO;
             let mut mesh = DirectionalMesh::default();
 
-            MASK_SCRATCH.with_borrow_mut(|mask| {
+            SCRATCH.with_borrow_mut(|scratch| {
+                let MeshingScratch { mask, solid_x, solid_y, solid_z, exposure, any_exposed } = &mut *scratch;
+
+                let t0 = Instant::now();
+                build_solidity_columns(&chunk, solid_x, solid_y, solid_z);
+                columns_time += t0.elapsed();
+
+                let t1 = Instant::now();
+                compute_exposure(4, 0, 4, [None; 6], solid_x, solid_y, solid_z, exposure, any_exposed, &neighbor_solid);
+                exposure_time += t1.elapsed();
+
+                let t2 = Instant::now();
                 for dir in 0..6 {
                     for layer in 0..CHUNK_SIZE {
-                        let t0 = Instant::now();
-                        build_face_mask(&chunk, None, 4, 0, 4, dir, layer, &neighbor_solid, mask);
-                        mask_time += t0.elapsed();
-
-                        let t1 = Instant::now();
+                        if (any_exposed[dir] >> layer) & 1 == 0 {
+                            continue;
+                        }
+                        populate_mask_from_exposure(&chunk, &exposure[dir], dir, layer, mask);
                         merge_mask_into_faces(mask, dir, layer, &mut mesh.faces[dir]);
-                        merge_time += t1.elapsed();
                     }
                 }
+                populate_merge_time += t2.elapsed();
+
+                let t3 = Instant::now();
+                for column in solid_x.iter_mut().chain(solid_y.iter_mut()).chain(solid_z.iter_mut()) {
+                    column.fill(0);
+                }
+                for table in exposure.iter_mut() {
+                    for column in table.iter_mut() {
+                        column.fill(0);
+                    }
+                }
+                any_exposed.fill(0);
+                cleanup_time += t3.elapsed();
             });
 
             for faces in &mut mesh.faces {
                 faces.clear();
             }
 
-            (mask_time, merge_time)
+            (columns_time, exposure_time, populate_merge_time, cleanup_time)
         };
 
         for _ in 0..50 {
             std::hint::black_box(run());
         }
 
-        let mut mask_total = Duration::ZERO;
-        let mut merge_total = Duration::ZERO;
+        let mut totals = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         for _ in 0..ITERATIONS {
-            let (m, g) = run();
-            mask_total += m;
-            merge_total += g;
+            let (a, b, c, d) = run();
+            totals.0 += a;
+            totals.1 += b;
+            totals.2 += c;
+            totals.3 += d;
         }
 
-        let mask_us = mask_total.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
-        let merge_us = merge_total.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
-        let total_us = mask_us + merge_us;
-        println!(
-            "Rand-Voxel-Scan (build_face_mask):    {mask_us:8.2} us/Chunk ({:5.1}%)",
-            mask_us / total_us * 100.0
-        );
-        println!(
-            "Greedy-Merge+Encode (merge_mask_into_faces): {merge_us:8.2} us/Chunk ({:5.1}%)",
-            merge_us / total_us * 100.0
-        );
-        println!("Summe (nur Zeitmessung, ohne Instant::now()-Overhead): {total_us:8.2} us/Chunk");
+        let us = |d: Duration| d.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        let (c_us, e_us, p_us, cl_us) = (us(totals.0), us(totals.1), us(totals.2), us(totals.3));
+        let total = c_us + e_us + p_us + cl_us;
+        println!("Phase 1 build_solidity_columns: {c_us:8.2} us/Chunk ({:5.1}%)", c_us / total * 100.0);
+        println!("Phase 2 compute_exposure:        {e_us:8.2} us/Chunk ({:5.1}%)", e_us / total * 100.0);
+        println!("Phase 3 populate+merge (6*32):    {p_us:8.2} us/Chunk ({:5.1}%)", p_us / total * 100.0);
+        println!("Phase 4 scratch-cleanup:         {cl_us:8.2} us/Chunk ({:5.1}%)", cl_us / total * 100.0);
+        println!("Summe: {total:8.2} us/Chunk");
     }
 }
