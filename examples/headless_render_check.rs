@@ -1,22 +1,29 @@
-// Visuelle Regressions-Pruefung ohne Fenster: rendert Chunk (0,0) senkrecht von oben durch die
-// echte Engine-Pipeline (MSAA + SSAO), liest die Pixel zurueck und prueft, dass die Gras-Oberflaeche
-// tatsaechlich gruen erscheint. Faengt invertiertes Culling / Tiefen-Regressionen fruehzeitig ab.
+// Visuelle Regressions-Pruefung ohne Fenster: rendert einen Huegel-Chunk senkrecht von oben durch
+// die echte Engine-Pipeline (MSAA + SSAO), liest die Pixel zurueck und prueft, dass die
+// Gras-Oberflaeche tatsaechlich gruen erscheint. Faengt invertiertes Culling / Tiefen-Regressionen
+// fruehzeitig ab.
 
 use voxel_engine::engine::config::EngineConfig;
 use voxel_engine::engine::core::mesher::mesh_chunk;
 use voxel_engine::engine::render::blur::SsaoBlurPass;
+use voxel_engine::engine::render::hzb::HzbPass;
 use voxel_engine::engine::render::pipeline::{
     self, create_ao_view, create_depth_view, create_msaa_color_view, create_resolve_color_view,
 };
 use voxel_engine::engine::render::renderer::ChunkRenderer;
 use voxel_engine::engine::render::shadow::ShadowPass;
 use voxel_engine::engine::render::ssao::SsaoPass;
-use voxel_engine::game::world::chunk::Chunk;
+use voxel_engine::game::world::chunk::{CHUNK_SIZE, Chunk};
 use voxel_engine::game::world::generator::TerrainGenerator;
 
 const SIZE: u32 = 256;
 const SAMPLES: u32 = 4;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// XZ-Chunk-Index eines bewaldeten Huegels weit ueber Meereshoehe (Welt-Y-Hoehe dort ~24-31) - der
+/// Weltursprung (Chunk 0,0) liegt beim aktuellen Generator direkt auf Meereshoehe und zeigt daher
+/// Strand (Sand) statt Gras.
+const CHUNK_X: i32 = -6;
+const CHUNK_Z: i32 = -20;
 
 fn main() {
     let green_ratio = pollster::block_on(render_top_down_green_ratio());
@@ -47,7 +54,8 @@ async fn render_top_down_green_ratio() -> f32 {
             label: Some("headless"),
             required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE
                 | wgpu::Features::SHADER_DRAW_INDEX
-                | wgpu::Features::IMMEDIATES,
+                | wgpu::Features::IMMEDIATES
+                | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
             required_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -56,7 +64,7 @@ async fn render_top_down_green_ratio() -> f32 {
         .await
         .expect("kein device");
 
-    let eye = glam::Vec3::new(16.0, 40.0, 16.0);
+    let eye = glam::Vec3::new((CHUNK_X * CHUNK_SIZE + 16) as f32, 60.0, (CHUNK_Z * CHUNK_SIZE + 16) as f32);
     let projection =
         glam::camera::rh::proj::directx::perspective_infinite_reverse(60f32.to_radians(), 1.0, 0.1);
     let view = glam::camera::rh::view::look_to_mat4(
@@ -73,14 +81,18 @@ async fn render_top_down_green_ratio() -> f32 {
 
     let generator = TerrainGenerator::new(&config);
     let mut chunk = Chunk::empty();
-    generator.generate_chunk(0, 0, 0, &mut chunk);
-    let mesh = mesh_chunk(&chunk, 0, 0, 0, [None; 6], |wx, wy, wz| generator.is_solid(wx, wy, wz));
+    generator.generate_chunk(CHUNK_X, 0, CHUNK_Z, &mut chunk);
+    let mesh = mesh_chunk(&chunk, CHUNK_X, 0, CHUNK_Z, [None; 6], |wx, wy, wz| generator.is_solid(wx, wy, wz));
     renderer.update_camera(&queue, view_proj, eye, glam::Vec3::new(0.0, -1.0, 0.0));
-    let handle = renderer.alloc_chunk(&queue, &mesh, glam::Vec3::ZERO);
-    renderer.set_visible(&queue, &[handle]);
+    let handle = renderer.alloc_chunk(&queue, &mesh);
+    let aabb_min = glam::Vec3::new((CHUNK_X * CHUNK_SIZE) as f32, 0.0, (CHUNK_Z * CHUNK_SIZE) as f32);
+    let aabb_max = aabb_min + glam::Vec3::splat(CHUNK_SIZE as f32);
+    renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, &handle);
 
     let msaa_color = create_msaa_color_view(&device, SIZE, SIZE, SAMPLES, FORMAT);
     let depth = create_depth_view(&device, SIZE, SIZE, SAMPLES);
+    let hzb = HzbPass::new(&device, SIZE, SIZE, &depth, SAMPLES > 1, SAMPLES);
+    renderer.rebuild_cull_bind_group(&device, &hzb);
     let resolve = create_resolve_color_view(&device, SIZE, SIZE, FORMAT);
     let ao = create_ao_view(&device, SIZE, SIZE);
     let mut ssao = SsaoPass::new(&device);
@@ -103,6 +115,8 @@ async fn render_top_down_green_ratio() -> f32 {
     let output_view = output.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    hzb.generate(&mut encoder);
+    renderer.dispatch_cull(&mut encoder, &queue, view_proj, &hzb);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("chunk"),
