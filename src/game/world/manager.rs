@@ -9,7 +9,6 @@ use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk};
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
-use crate::game::math::frustum::Frustum;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generator::TerrainGenerator;
@@ -100,8 +99,6 @@ pub struct ChunkManager {
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
     vertical_render_distance_chunks: i32,
-    visible_handles: Vec<ChunkGpuHandle>,
-    visible_count: usize,
     /// Chunk-Koordinate der Kamera im letzten Frame, in dem das Ladefenster neu aufgebaut wurde.
     /// Der komplette Soll/Entlade-Scan (O(Ladevolumen)) muss nur laufen, wenn sich diese
     /// Mittelpunkt-Koordinate tatsaechlich aendert - im Stillstand (oder bei reiner Kamerarotation)
@@ -114,9 +111,8 @@ pub struct ChunkManager {
     /// bzw. abgearbeitet - kein Full-Rescan des gesamten Ladevolumens mehr pro Frame.
     pending_scratch: Vec<ChunkCoord>,
     pending_set: HashSet<ChunkCoord>,
-    visible_coords_scratch: Vec<ChunkCoord>,
     shadow_visible_coords_scratch: Vec<ChunkCoord>,
-    shadow_visible_handles: Vec<ChunkGpuHandle>,
+    shadow_visible_handles: Vec<(ChunkGpuHandle, glam::Vec3)>,
     /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations`/`drain_unloads` - siehe
     /// Kommentar an `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/
     /// uploaded/entlaedt ein grosser Backlog (Welt-Start, schnelles Fliegen, vertikales Fallen)
@@ -145,14 +141,11 @@ impl ChunkManager {
             result_rx,
             render_distance_chunks: config.render_distance_chunks,
             vertical_render_distance_chunks: config.vertical_render_distance_chunks,
-            visible_handles: Vec::new(),
-            visible_count: 0,
             last_center: None,
             desired_scratch: HashSet::new(),
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
             pending_set: HashSet::new(),
-            visible_coords_scratch: Vec::new(),
             shadow_visible_coords_scratch: Vec::new(),
             shadow_visible_handles: Vec::new(),
             max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
@@ -163,10 +156,6 @@ impl ChunkManager {
 
     pub fn loaded_chunk_count(&self) -> usize {
         self.loaded.len()
-    }
-
-    pub fn visible_chunk_count(&self) -> usize {
-        self.visible_count
     }
 
     pub fn generator(&self) -> &Arc<TerrainGenerator> {
@@ -269,7 +258,15 @@ impl ChunkManager {
         };
 
         renderer.free_chunk(&old_handle);
-        let new_handle = renderer.alloc_chunk(queue, &mesh, chunk_origin(coord));
+        let new_handle = renderer.alloc_chunk(queue, &mesh);
+
+        if is_empty {
+            renderer.clear_chunk_meta(queue, pool_slot);
+        } else {
+            let min = chunk_origin(coord);
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            renderer.update_chunk_meta(queue, pool_slot, min, max, &new_handle);
+        }
 
         if let Some(loaded) = self.loaded.get_mut(&coord) {
             loaded.gpu_handle = new_handle;
@@ -281,7 +278,6 @@ impl ChunkManager {
     pub fn update(
         &mut self,
         camera_position: glam::Vec3,
-        frustum: &Frustum,
         cascades: &[Cascade; MAX_SHADOW_CASCADES],
         cascade_count: u32,
         queue: &wgpu::Queue,
@@ -300,9 +296,8 @@ impl ChunkManager {
             self.last_center = Some(center);
         }
 
-        self.drain_unloads(renderer);
+        self.drain_unloads(queue, renderer);
         self.dispatch_pending();
-        self.update_visibility(frustum, queue, renderer);
         self.update_shadow_visibility(cascades, cascade_count, queue, renderer);
     }
 
@@ -349,7 +344,7 @@ impl ChunkManager {
     /// `free_chunk`-Freigabe ist O(Freelist); ohne diesen Deckel wuerde das Entladen einer ganzen
     /// Chunk-Ebene (Tausende) in einem Frame rucken. Ein zwischenzeitlich wieder ins Fenster
     /// gewanderter Chunk wird nicht entladen, sondern nur wieder freigegeben.
-    fn drain_unloads(&mut self, renderer: &mut ChunkRenderer) {
+    fn drain_unloads(&mut self, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         for _ in 0..self.max_chunk_unloads_per_frame {
             let Some(coord) = self.unload_scratch.pop() else { break };
 
@@ -360,7 +355,7 @@ impl ChunkManager {
                 continue;
             }
 
-            self.unload_chunk(coord, renderer);
+            self.unload_chunk(coord, queue, renderer);
         }
     }
 
@@ -413,28 +408,6 @@ impl ChunkManager {
         }
     }
 
-    fn update_visibility(&mut self, frustum: &Frustum, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
-        self.visible_coords_scratch.clear();
-        self.visible_coords_scratch.par_extend(self.loaded.par_iter().filter_map(|(coord, loaded)| {
-            if loaded.is_empty {
-                return None;
-            }
-            let min = chunk_origin(*coord);
-            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
-            frustum.intersects_aabb(min, max).then_some(*coord)
-        }));
-
-        self.visible_handles.clear();
-        for coord in &self.visible_coords_scratch {
-            if let Some(loaded) = self.loaded.get(coord) {
-                self.visible_handles.push(loaded.gpu_handle);
-            }
-        }
-        self.visible_count = self.visible_handles.len();
-
-        renderer.set_visible(queue, &self.visible_handles);
-    }
-
     /// Schatten-Sichtbarkeit ueber Licht-Kugel- statt Kamera-Frustum-Kullung: ein Chunk gilt als
     /// schatten-relevant, wenn seine AABB IRGENDEINE aktive Kaskaden-Kugel schneidet - unabhaengig
     /// davon, ob er gerade im Kamera-Frustum liegt. Das entkoppelt die Schatten-Geometrie von der
@@ -463,7 +436,7 @@ impl ChunkManager {
         self.shadow_visible_handles.clear();
         for coord in &self.shadow_visible_coords_scratch {
             if let Some(loaded) = self.loaded.get(coord) {
-                self.shadow_visible_handles.push(loaded.gpu_handle);
+                self.shadow_visible_handles.push((loaded.gpu_handle, chunk_origin(*coord)));
             }
         }
 
@@ -495,7 +468,15 @@ impl ChunkManager {
                 continue;
             }
 
-            let gpu_handle = renderer.alloc_chunk(queue, &result.mesh, chunk_origin(result.coord));
+            let gpu_handle = renderer.alloc_chunk(queue, &result.mesh);
+
+            if result.is_empty {
+                renderer.clear_chunk_meta(queue, result.pool_slot);
+            } else {
+                let min = chunk_origin(result.coord);
+                let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+                renderer.update_chunk_meta(queue, result.pool_slot, min, max, &gpu_handle);
+            }
 
             self.pool[result.pool_slot] = Some(result.chunk);
             self.loaded.insert(
@@ -510,12 +491,13 @@ impl ChunkManager {
         }
     }
 
-    fn unload_chunk(&mut self, coord: ChunkCoord, renderer: &mut ChunkRenderer) {
+    fn unload_chunk(&mut self, coord: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         let Some(loaded) = self.loaded.remove(&coord) else {
             return;
         };
 
         renderer.free_chunk(&loaded.gpu_handle);
+        renderer.clear_chunk_meta(queue, loaded.pool_slot);
 
         if let Some(mut chunk) = self.pool[loaded.pool_slot].take() {
             chunk.clear();

@@ -14,7 +14,6 @@ use crate::engine::render::textures::TEXTURE_LAYER_STONE;
 use crate::game::input::{InputState, MoveCommand};
 use crate::game::math::camera::Camera;
 use crate::game::math::cascades::compute_cascades;
-use crate::game::math::frustum::Frustum;
 use crate::game::math::sun::Sun;
 use crate::game::physics::PlayerPhysics;
 use crate::game::world::godrays::GodrayField;
@@ -213,7 +212,6 @@ impl ApplicationHandler for App {
                     if self.fps_ema <= 0.0 { instant_fps } else { self.fps_ema * 0.9 + instant_fps * 0.1 };
 
                 let view_proj = self.camera.view_projection(aspect);
-                let frustum = Frustum::from_view_projection(view_proj);
 
                 let gpu = self.gpu.as_mut().expect("GPU-Kontext verschwunden");
                 gpu.update_camera(view_proj, self.camera.position, self.camera.forward());
@@ -277,7 +275,6 @@ impl ApplicationHandler for App {
 
                 self.chunk_manager.update(
                     self.camera.position,
-                    &frustum,
                     &cascades,
                     self.config.shadow_cascade_count,
                     &queue,
@@ -309,11 +306,9 @@ impl ApplicationHandler for App {
                 }
                 let _ = write!(
                     self.hud_text,
-                    "\nCHUNKS: {} / {} VISIBLE\nDRAW CALLS: {} / FACES: {}\nPOS: {:.1} / {:.1} / {:.1}\nMODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)",
+                    "\nCHUNKS: {}\nDRAW CALLS (GPU-CULLED): {}\nPOS: {:.1} / {:.1} / {:.1}\nMODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)",
                     self.chunk_manager.loaded_chunk_count(),
-                    self.chunk_manager.visible_chunk_count(),
                     gpu.renderer.draw_call_count(),
-                    gpu.renderer.total_face_count(),
                     self.camera.position.x,
                     self.camera.position.y,
                     self.camera.position.z
@@ -330,13 +325,13 @@ impl ApplicationHandler for App {
                         None => "N/A".to_string(),
                     };
                     log::info!(
-                        "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Modus: {} | Aktive Chunks: {} | Sichtbare Chunks: {} | Position: ({:.1}, {:.1}, {:.1})",
+                        "FPS: {:.0} | Frame: {:.2}ms | VRAM: {} | Modus: {} | Aktive Chunks: {} | GPU-Draws: {} | Position: ({:.1}, {:.1}, {:.1})",
                         self.fps_ema,
                         dt * 1000.0,
                         vram_text,
                         mode_text,
                         self.chunk_manager.loaded_chunk_count(),
-                        self.chunk_manager.visible_chunk_count(),
+                        gpu.renderer.draw_call_count(),
                         self.camera.position.x,
                         self.camera.position.y,
                         self.camera.position.z

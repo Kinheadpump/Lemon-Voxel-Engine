@@ -9,6 +9,7 @@ use super::blur::SsaoBlurPass;
 use super::godray::GodrayPass;
 use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
+use super::hzb::HzbPass;
 use super::pipeline;
 use super::renderer::ChunkRenderer;
 use super::shadow::ShadowPass;
@@ -24,6 +25,7 @@ pub struct GpuContext {
     pub window: Arc<Window>,
     chunk_pipeline: pipeline::ChunkPipeline,
     pub renderer: ChunkRenderer,
+    hzb: HzbPass,
     msaa_color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resolve_color_view: wgpu::TextureView,
@@ -84,7 +86,8 @@ impl GpuContext {
         // spart gegenueber Uniform-Buffern + Bind-Group-Wechseln pro Kaskade unnoetigen Overhead.
         let mut required_features = wgpu::Features::INDIRECT_FIRST_INSTANCE
             | wgpu::Features::SHADER_DRAW_INDEX
-            | wgpu::Features::IMMEDIATES;
+            | wgpu::Features::IMMEDIATES
+            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         if adapter_features.contains(super::gpu_timer::REQUIRED_FEATURES) {
             required_features |= super::gpu_timer::REQUIRED_FEATURES;
         }
@@ -137,12 +140,15 @@ impl GpuContext {
             engine_config.shadow_depth_bias_slope_scale,
         );
         let chunk_pipeline = pipeline::create(&device, &queue, config.format, msaa_samples);
-        let renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config, &shadow_pass);
+        let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config, &shadow_pass);
         let msaa_color_view =
             pipeline::create_msaa_color_view(&device, config.width, config.height, msaa_samples, config.format);
         let depth_view = pipeline::create_depth_view(&device, config.width, config.height, msaa_samples);
         let resolve_color_view = pipeline::create_resolve_color_view(&device, config.width, config.height, config.format);
         let ao_view = pipeline::create_ao_view(&device, config.width, config.height);
+
+        let hzb = HzbPass::new(&device, config.width, config.height, &depth_view, msaa_active, msaa_samples);
+        renderer.rebuild_cull_bind_group(&device, &hzb);
 
         let mut ssao = SsaoPass::new(&device);
         let mut blur = SsaoBlurPass::new(&device, config.format);
@@ -182,6 +188,7 @@ impl GpuContext {
             window,
             chunk_pipeline,
             renderer,
+            hzb,
             msaa_color_view,
             depth_view,
             resolve_color_view,
@@ -324,6 +331,8 @@ impl GpuContext {
         }
         self.skybox.rebuild_bind_group(&self.device, &self.depth_view);
         self.godray.rebuild_render_bind_group(&self.device, &self.depth_view);
+        self.hzb.resize(&self.device, width, height, &self.depth_view);
+        self.renderer.rebuild_cull_bind_group(&self.device, &self.hzb);
     }
 
     pub fn render(&mut self) {
@@ -356,6 +365,13 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame_encoder"),
             });
+
+        // HZB-Aufbau aus dem noch nicht geleerten Depth-Buffer des VORHERIGEN Frames, dann
+        // GPU-Driven Frustum+Occlusion-Culling fuer DIESES Frame (s. `hzb.rs`/`cull.wgsl`) - beide
+        // MUESSEN vor dem Opaque-Pass laufen, der `depth_view` gleich ueberschreibt.
+        self.hzb.generate(&mut encoder);
+        self.renderer.dispatch_cull(&mut encoder, &self.queue, self.last_view_proj, &self.hzb);
+        self.renderer.record_stats_copy(&mut encoder);
 
         self.shadow_pass.render_cascades(
             &mut encoder,
@@ -525,6 +541,7 @@ impl GpuContext {
         if let Some(gpu_timer) = self.gpu_timer.as_mut() {
             gpu_timer.after_submit(&self.device);
         }
+        self.renderer.after_submit(&self.device);
 
         self.queue.present(frame);
     }
