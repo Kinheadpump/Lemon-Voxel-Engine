@@ -177,9 +177,15 @@ impl Default for EngineConfig {
             max_faces_per_direction: 3_000_000,
             max_draws_per_direction: 4300,
 
-            max_chunk_dispatches_per_frame: 64,
-            max_chunk_uploads_per_frame: 64,
-            max_chunk_unloads_per_frame: 128,
+            // Vor dem Binary-Greedy-Meshing-Umbau war das Meshing selbst der Flaschenhals; jetzt
+            // ist der Upload-/Dispatch-Takt (64/Frame) die haertere Bremse (bei ~18 FPS waehrend
+            // des Ladens ergab das rechnerisch exakt die beobachtete ~1100-1300 Chunks/s
+            // Laderate). Verdoppelt, weil Upload/Dispatch selbst billig sind (paar Buffer-Writes
+            // bzw. ein Rayon-Spawn) - das eigentliche Meshing laeuft ohnehin asynchron auf
+            // Worker-Threads und begrenzt hier nicht mehr.
+            max_chunk_dispatches_per_frame: 128,
+            max_chunk_uploads_per_frame: 128,
+            max_chunk_unloads_per_frame: 192,
         }
     }
 }
