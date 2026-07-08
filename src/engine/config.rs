@@ -88,13 +88,11 @@ pub struct EngineConfig {
     pub terrain_cliff_mask_frequency: f32,
     pub terrain_sea_compression_range: f32,
     pub terrain_sea_compression_exponent: f32,
-    /// Rasterabstand (in Bloecken) der sparse ausgewerteten Heightmap innerhalb eines Chunks -
-    /// dazwischen wird bilinear interpoliert. Muss `CHUNK_SIZE` (32) teilen, sonst Fallback auf 1.
-    pub terrain_height_sample_stride: i32,
     pub terrain_cave_frequency: f32,
     /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) werden zu Hoehlen.
     pub terrain_cave_threshold: f32,
-    /// Wie `terrain_height_sample_stride`, aber fuer das 3D-Hoehlenraster - Mindestwert 2.
+    /// Rasterabstand (in Bloecken) des sparse ausgewerteten 3D-Hoehlendichterasters - dazwischen
+    /// wird trilinear interpoliert. Muss `CHUNK_SIZE` (32) teilen, Mindestwert 2.
     pub terrain_cave_sample_stride: i32,
     pub terrain_dirt_layer_depth: i32,
     pub terrain_noise_origin_offset: f32,
@@ -178,7 +176,6 @@ impl Default for EngineConfig {
             terrain_cliff_mask_frequency: 0.008,
             terrain_sea_compression_range: 20.0,
             terrain_sea_compression_exponent: 2.2,
-            terrain_height_sample_stride: 4,
             terrain_cave_frequency: 0.05,
             terrain_cave_threshold: 0.6,
             terrain_cave_sample_stride: 4,
@@ -251,8 +248,15 @@ impl EngineConfig {
 
 /// Serde-serialisierbares Spiegelbild von [`EngineConfig`] mit editorfreundlichen Einheiten
 /// (FOV in Grad, Farbe als RGB-Array). Trennt das Datei-Format von der Laufzeit-Repraesentation.
+///
+/// BEWUSST ohne `deny_unknown_fields`: Ein einzelnes umbenanntes/entferntes Feld (z.B. bei einem
+/// Terrain-Schema-Wechsel) wuerde sonst den GESAMTEN Parse-Vorgang abbrechen und `load_or_create`
+/// faellt dann auf komplette Defaults zurueck - das setzt still ALLE anderen, unveraendert
+/// gebliebenen Einstellungen (Render-Distanz, Maus-Sensitivitaet, ...) zurueck, nicht nur die
+/// tatsaechlich verschobenen Felder. Unbekannte Felder in einer alten `config.toml` werden jetzt
+/// einfach ignoriert, alle anderen Felder bleiben erhalten.
 #[derive(Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct ConfigFile {
     movement_speed: f32,
     sprint_multiplier: f32,
@@ -303,7 +307,6 @@ struct ConfigFile {
     terrain_cliff_mask_frequency: f32,
     terrain_sea_compression_range: f32,
     terrain_sea_compression_exponent: f32,
-    terrain_height_sample_stride: i32,
     terrain_cave_frequency: f32,
     terrain_cave_threshold: f32,
     terrain_cave_sample_stride: i32,
@@ -389,7 +392,6 @@ impl From<EngineConfig> for ConfigFile {
             terrain_cliff_mask_frequency: c.terrain_cliff_mask_frequency,
             terrain_sea_compression_range: c.terrain_sea_compression_range,
             terrain_sea_compression_exponent: c.terrain_sea_compression_exponent,
-            terrain_height_sample_stride: c.terrain_height_sample_stride,
             terrain_cave_frequency: c.terrain_cave_frequency,
             terrain_cave_threshold: c.terrain_cave_threshold,
             terrain_cave_sample_stride: c.terrain_cave_sample_stride,
@@ -471,7 +473,6 @@ impl From<ConfigFile> for EngineConfig {
             terrain_cliff_mask_frequency: f.terrain_cliff_mask_frequency,
             terrain_sea_compression_range: f.terrain_sea_compression_range.max(1.0),
             terrain_sea_compression_exponent: f.terrain_sea_compression_exponent.max(1.0),
-            terrain_height_sample_stride: f.terrain_height_sample_stride.clamp(1, 32),
             terrain_cave_frequency: f.terrain_cave_frequency,
             terrain_cave_threshold: f.terrain_cave_threshold,
             terrain_cave_sample_stride: f.terrain_cave_sample_stride.clamp(2, 16),

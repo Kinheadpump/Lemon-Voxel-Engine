@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use bevy_math::{Vec2, Vec3};
 use noiz::Noise;
 use noiz::prelude::*;
@@ -6,7 +8,7 @@ use crate::engine::config::EngineConfig;
 
 use super::blocks;
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::terrain_grid::{CaveGrid, HeightGrid};
+use super::terrain_grid::CaveGrid;
 
 /// Fixe Meereshoehe - keine Konfigurationsoption, sondern eine architektonische Festlegung: alle
 /// Shaping-Funktionen (See-Kompression, Straende) sind relativ zu `y=0` formuliert.
@@ -33,6 +35,35 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Ob `local` auf der aeussersten Schicht eines Chunks liegt (Face-Ebene, die an einen Nachbar-Chunk
+/// grenzt). Das `CaveGrid`-Dichteraster wird dort IMMER exakt statt interpoliert ausgewertet, damit
+/// es mit der exakten `is_solid`-Fallback-Vorhersage uebereinstimmt, die ein noch nicht geladener
+/// Nachbar-Chunk fuer diese Voxel verwenden wuerde.
+#[inline(always)]
+fn is_chunk_edge(local: i32) -> bool {
+    local == 0 || local == CHUNK_SIZE - 1
+}
+
+/// Direkt-gemapptes Memo fuer `TerrainGenerator::height_at` - Potenz von 2, damit der Slot-Index
+/// eine reine Bitmaske statt eines Modulo ist. Der Mesher haelt pro Rand-Spalte 2 gleichzeitig
+/// "heisse" (world_x,world_z)-Paare (unterer/oberer Nachbar) ueber jeweils 32 Iterationen der
+/// anderen Achse aktiv (s. Kommentar an `height_at`) - 128 Slots geben dafuer ausreichend
+/// Kollisions-Spielraum, ohne relevanten Speicher-/Cache-Footprint (128*12B = 1.5 KiB).
+const HEIGHT_CACHE_SLOTS: usize = 128;
+
+#[inline(always)]
+fn height_cache_slot(world_x: i32, world_z: i32) -> usize {
+    let hash = (world_x as u32).wrapping_mul(0x9E37_79B1) ^ (world_z as u32).wrapping_mul(0x85EB_CA6B);
+    (hash as usize) & (HEIGHT_CACHE_SLOTS - 1)
+}
+
+thread_local! {
+    /// Thread-lokal, weil `TerrainGenerator` per `Arc` ueber Rayon-Worker geteilt wird (kein
+    /// gemeinsames `RefCell`-Feld an einem per `Sync` geteilten Typ moeglich).
+    static HEIGHT_CACHE: RefCell<[(i32, i32, i32); HEIGHT_CACHE_SLOTS]> =
+        const { RefCell::new([(i32::MIN, i32::MIN, 0); HEIGHT_CACHE_SLOTS]) };
+}
+
 /// Multi-Stage-Terraingenerator: 2D-Rauschen fuer Hoehe/Klippen/Straende, 3D-Rauschen nur fuer
 /// Hoehlen (und dort nur unterhalb der bereits bekannten Oberflaeche) - siehe Kommentare an den
 /// einzelnen Feldern fuer die Rolle jeder Rauschschicht.
@@ -52,7 +83,6 @@ pub struct TerrainGenerator {
     cliff_mask_frequency: f32,
     sea_compression_range: f32,
     sea_compression_exponent: f32,
-    height_sample_stride: i32,
     /// 3D-Perlin fuer "Cheese Caves" (Cutoff-Hoehlen).
     cave: Noise<common_noise::Perlin>,
     cave_frequency: f32,
@@ -94,7 +124,6 @@ impl TerrainGenerator {
             cliff_mask_frequency: config.terrain_cliff_mask_frequency,
             sea_compression_range: config.terrain_sea_compression_range.max(1.0),
             sea_compression_exponent: config.terrain_sea_compression_exponent,
-            height_sample_stride: config.terrain_height_sample_stride,
             cave,
             cave_frequency: config.terrain_cave_frequency,
             cave_threshold: config.terrain_cave_threshold,
@@ -113,10 +142,28 @@ impl TerrainGenerator {
         noise.sample(point)
     }
 
-    /// Exakte (nicht interpolierte) Oberflaechenhoehe - einzige Quelle der Wahrheit, genutzt fuer
-    /// Chunk-Rand-/Nachbar-Abfragen und als Basis fuer das sparse interpolierte Innere eines Chunks.
+    /// Exakte Oberflaechenhoehe - einzige Quelle der Wahrheit, genutzt fuer Chunk-Rand-/Nachbar-
+    /// Abfragen UND als per-Spalte-Wert innerhalb von `generate_chunk`.
+    ///
+    /// Gecached ueber `HEIGHT_CACHE`: der Mesher fragt seinen Boundary-Fallback pro Rand-SPALTE ab
+    /// (s. `compute_exposure` in mesher.rs), aber die X-/Z-Richtungs-Checks iterieren dabei ueber die
+    /// jeweils andere Achse mit - fragen denselben (world_x, world_z) bis zu 32x hintereinander (mit
+    /// dem jeweils anderen Rand-Nachbarn verschraenkt) ab, obwohl die Hoehe gar nicht von Y abhaengt.
+    /// Ohne Cache kostet jeder dieser Aufrufe erneut 4 Rauschproben (~200ns) - bei bis zu 6144
+    /// Fallback-Aufrufen/Chunk machte allein das den Mesher deutlich langsamer als das <1ms-Ziel. Der
+    /// Mesher selbst bleibt dabei bewusst ahnungslos ueber diese Terrain-Interna (kein Sonderfall im
+    /// generischen Meshing-Code).
     pub fn height_at(&self, world_x: i32, world_z: i32) -> i32 {
-        self.raw_height_at(world_x, world_z).round() as i32
+        let slot = height_cache_slot(world_x, world_z);
+        HEIGHT_CACHE.with_borrow_mut(|cache| {
+            let (cached_x, cached_z, cached_height) = cache[slot];
+            if cached_x == world_x && cached_z == world_z {
+                return cached_height;
+            }
+            let height = self.raw_height_at(world_x, world_z).round() as i32;
+            cache[slot] = (world_x, world_z, height);
+            height
+        })
     }
 
     fn raw_height_at(&self, world_x: i32, world_z: i32) -> f32 {
@@ -166,6 +213,15 @@ impl TerrainGenerator {
         world_y <= self.height_at(world_x, world_z) && !self.is_cave(world_x, world_y, world_z)
     }
 
+    /// Die Hoehenkarte wird IMMER exakt (nicht interpoliert) berechnet - anders als das
+    /// `CaveGrid`-Dichteraster unten kann sie nicht sparse+interpoliert sein: Hoehe haengt nicht von
+    /// Y ab, also gehoert JEDE Saeule gleichzeitig zur Ober- UND Unterkante des Chunks (dort grenzt
+    /// sie an einen vertikalen Nachbarn, der im asynchronen Generierungs-Pfad IMMER ueber den
+    /// exakten `is_solid`/`height_at`-Fallback vorhergesagt wird, nie ueber echte Nachbar-Chunk-
+    /// Daten - s. `ChunkManager::dispatch_pending`). Ein interpoliertes Innen/exaktes-Rand-Schema wie
+    /// beim Hoehlenraster wuerde hier auf die volle 32x32-Flaeche entarten - keine Ersparnis, aber
+    /// die Fehlerquelle fuer dauerhafte Luecken an jeder Ober-/Unterkante. `raw_height_at` selbst ist
+    /// mit 4 Rauschproben guenstig genug, dass Interpolation hier keinen messbaren Vorteil brachte.
     pub fn generate_chunk(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
         chunk.clear();
 
@@ -173,15 +229,11 @@ impl TerrainGenerator {
         let chunk_origin_y = chunk_y * CHUNK_SIZE;
         let chunk_origin_z = chunk_z * CHUNK_SIZE;
 
-        let height_grid = HeightGrid::fill(self.height_sample_stride, |local_x, local_z| {
-            self.raw_height_at(chunk_origin_x + local_x, chunk_origin_z + local_z)
-        });
-
         let mut local_height = [0i32; (CHUNK_SIZE * CHUNK_SIZE) as usize];
         let mut chunk_max_height = i32::MIN;
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
-                let h = height_grid.sample(local_x, local_z).round() as i32;
+                let h = self.height_at(chunk_origin_x + local_x, chunk_origin_z + local_z);
                 local_height[(local_z * CHUNK_SIZE + local_x) as usize] = h;
                 chunk_max_height = chunk_max_height.max(h);
             }
@@ -228,14 +280,63 @@ impl TerrainGenerator {
                     }
 
                     let depth_from_surface = height - world_y;
-                    let is_carved =
-                        depth_from_surface >= MIN_CAVE_DEPTH && cave_grid.sample(local_x, local_y, local_z) > self.cave_threshold;
-                    if is_carved {
-                        continue;
+                    if depth_from_surface >= MIN_CAVE_DEPTH {
+                        let cave_value = if is_chunk_edge(local_x) || is_chunk_edge(local_y) || is_chunk_edge(local_z) {
+                            self.cave_density(chunk_origin_x + local_x, world_y, chunk_origin_z + local_z)
+                        } else {
+                            cave_grid.sample(local_x, local_y, local_z)
+                        };
+                        if cave_value > self.cave_threshold {
+                            continue;
+                        }
                     }
 
                     let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, is_beach);
                     chunk.set_block(local_x, local_y, local_z, block_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::config::EngineConfig;
+
+    /// Der Mesher faellt an Chunk-Grenzen zu einem noch nicht geladenen Nachbarn auf
+    /// `TerrainGenerator::is_solid` zurueck. Diese Vorhersage MUSS mit dem uebereinstimmen, was der
+    /// Nachbar-Chunk tatsaechlich generiert, sobald er laedt - sonst entstehen dauerhafte
+    /// Luecken/Ueberlappungen an der Naht (niemand re-mesht den bereits geladenen Chunk). Prueft das
+    /// an mehreren Chunk-Grenzen inkl. vertikaler Stapelung (Hoehlen-Y-Schicht).
+    #[test]
+    fn is_solid_prediction_matches_neighbor_generation_at_chunk_borders() {
+        let generator = TerrainGenerator::new(&EngineConfig::default());
+
+        for &(chunk_x, chunk_y, chunk_z) in &[(0, 0, 0), (3, -2, -5), (-4, 1, 2), (7, 0, -1)] {
+            let mut chunk = Chunk::empty();
+            generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
+
+            let origin_x = chunk_x * CHUNK_SIZE;
+            let origin_y = chunk_y * CHUNK_SIZE;
+            let origin_z = chunk_z * CHUNK_SIZE;
+
+            for local_y in 0..CHUNK_SIZE {
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        if !is_chunk_edge(local_x) && !is_chunk_edge(local_y) && !is_chunk_edge(local_z) {
+                            continue;
+                        }
+                        let world = (origin_x + local_x, origin_y + local_y, origin_z + local_z);
+                        let predicted = generator.is_solid(world.0, world.1, world.2);
+                        let actual = chunk.get_block(local_x, local_y, local_z) != 0;
+                        assert_eq!(
+                            predicted, actual,
+                            "Rand-Voxel {world:?} in Chunk ({chunk_x},{chunk_y},{chunk_z}) lokal \
+                             ({local_x},{local_y},{local_z}): is_solid-Vorhersage={predicted}, \
+                             tatsaechlich generiert={actual}"
+                        );
+                    }
                 }
             }
         }
