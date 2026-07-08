@@ -53,8 +53,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let day_sky = mix(params.horizon_day.rgb, params.zenith_day.rgb, horizon_to_zenith);
     var sky_color = mix(params.night.rgb, day_sky, day_t);
 
-    let sun_glow = pow(max(dot(ray_dir, sun_dir), 0.0), 256.0) * day_t;
-    sky_color += sun_glow * vec3<f32>(1.0, 0.9, 0.7);
+    // Sonnen-Scheibe + weicher Streuungs-Halo, beide reine ALU (kein zusaetzlicher Draw-Call/
+    // Textur) - bewegt sich automatisch mit `sun_dir`, das schon Tageszeit-gesteuert ist.
+    let sun_angle = dot(ray_dir, sun_dir);
+    let sun_halo = pow(max(sun_angle, 0.0), 256.0) * day_t;
+    sky_color += sun_halo * vec3<f32>(1.0, 0.9, 0.7);
+    let sun_disc = smoothstep(0.9997, 0.9999, sun_angle) * step(0.0, sun_dir.y);
+    sky_color += sun_disc * vec3<f32>(1.0, 0.97, 0.9);
+
+    // Mond exakt gegenueber der Sonne (einfaches Modell ohne eigene Umlaufbahn) - dadurch
+    // erscheint er automatisch genau dann ueber dem Horizont, wenn die Sonne darunter ist.
+    let moon_dir = -sun_dir;
+    let moon_angle = dot(ray_dir, moon_dir);
+    let moon_disc = smoothstep(0.998, 0.9995, moon_angle) * step(0.0, moon_dir.y);
+    let moon_halo = pow(max(moon_angle, 0.0), 512.0) * step(0.0, moon_dir.y) * 0.3;
+    sky_color += (moon_disc + moon_halo) * vec3<f32>(0.85, 0.88, 0.95);
 
     return vec4<f32>(sky_color, 1.0);
 }

@@ -80,14 +80,21 @@ struct DirectionArena {
     chunk_data_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// Bind-Group gegen das Shadow-Pipeline-Layout, adressiert dieselben `faces_buffer`/
-    /// `chunk_data_buffer` wie oben - der Schatten-Pass zeichnet dieselbe Geometrie, nur mit
-    /// Licht- statt Kamera-Projektion (siehe `ShadowPass::render_cascades`).
+    /// Bind-Group gegen das Shadow-Pipeline-Layout - adressiert dieselben `faces_buffer` wie oben
+    /// (die Geometrie selbst ist fuer Opaque- und Schatten-Pass identisch), aber EIGENE
+    /// `shadow_chunk_data_buffer`/`shadow_indirect_buffer` unten: die Schatten-sichtbare Chunk-Menge
+    /// (Licht-Kugel-Kullung, siehe `ChunkManager::update_shadow_visibility`) unterscheidet sich von
+    /// der kamera-sichtbaren und muss deshalb ein eigenes Indirect-Batch pflegen.
     shadow_bind_group: wgpu::BindGroup,
+    shadow_chunk_data_buffer: wgpu::Buffer,
+    shadow_indirect_buffer: wgpu::Buffer,
     allocator: SubAllocator,
     indirect_scratch: Vec<DrawIndirectArgs>,
     chunk_data_scratch: Vec<[f32; 4]>,
     draw_count: u32,
+    shadow_indirect_scratch: Vec<DrawIndirectArgs>,
+    shadow_chunk_data_scratch: Vec<[f32; 4]>,
+    shadow_draw_count: u32,
 }
 
 pub struct ChunkRenderer {
@@ -182,6 +189,20 @@ impl ChunkRenderer {
             mapped_at_creation: false,
         });
 
+        let shadow_chunk_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk_data_per_shadow_draw"),
+            size: config.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let shadow_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk_shadow_indirect_batch"),
+            size: (config.max_draws_per_direction * std::mem::size_of::<DrawIndirectArgs>()) as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("chunk_direction_bind_group"),
             layout: &pipeline.bind_group_layout,
@@ -216,7 +237,7 @@ impl ChunkRenderer {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: shadow_pass.direction_buffer(dir).as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: faces_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: chunk_data_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: shadow_chunk_data_buffer.as_entire_binding() },
             ],
         });
 
@@ -226,10 +247,15 @@ impl ChunkRenderer {
             indirect_buffer,
             bind_group,
             shadow_bind_group,
+            shadow_chunk_data_buffer,
+            shadow_indirect_buffer,
             allocator: SubAllocator::new(config.max_faces_per_direction as u32),
             indirect_scratch: Vec::with_capacity(config.max_draws_per_direction),
             chunk_data_scratch: Vec::with_capacity(config.max_draws_per_direction),
             draw_count: 0,
+            shadow_indirect_scratch: Vec::with_capacity(config.max_draws_per_direction),
+            shadow_chunk_data_scratch: Vec::with_capacity(config.max_draws_per_direction),
+            shadow_draw_count: 0,
         }
     }
 
@@ -268,17 +294,18 @@ impl ChunkRenderer {
         queue.write_buffer(&self.lighting_buffer, 0, bytemuck::bytes_of(&lighting_data));
     }
 
-    /// Liefert pro Richtung die aktuell sichtbare Geometrie fuer den Schatten-Pass. Nutzt bewusst
-    /// dieselbe Kamera-Sichtbarkeitsmenge wie der Opaque-Pass statt einer eigenen
-    /// Licht-Frustum-Kullung pro Kaskade - das haelt den CPU-Anteil bei O(1) zusaetzlicher Arbeit
-    /// (keine zweite Culling-Passe), auf Kosten von etwas ueberschuessiger Schatten-Geometrie an
-    /// den Raendern der Kamera-Render-Distanz. Kann spaeter empirisch durch echte
-    /// Per-Kaskaden-Kullung ersetzt werden, falls das gemessen ein Problem ist.
+    /// Liefert pro Richtung die fuer den Schatten-Pass sichtbare Geometrie (Licht-Kugel-Kullung
+    /// gegen ALLE geladenen Chunks, s. `ChunkManager::update_shadow_visibility` - NICHT die
+    /// Kamera-Sichtbarkeitsmenge). Frueher wurde hier dieselbe Menge wie fuer den Opaque-Pass
+    /// zurueckgegeben: da Kamera-Frustum-Sichtbarkeit sich bei reiner Kopfdrehung staendig aendert,
+    /// aber die Schatten-Kaskaden eine davon unabhaengige, staendig um die Kamera liegende
+    /// Kugel abdecken, poppte Schatten-Geometrie bei jeder Drehung rein/raus - Schatten "sprangen"
+    /// oder tauchten an Stellen auf, die eben noch nicht beschattet waren.
     pub fn shadow_draw_data(&self) -> [ShadowDrawData<'_>; 6] {
         std::array::from_fn(|dir| ShadowDrawData {
             bind_group: &self.directions[dir].shadow_bind_group,
-            indirect_buffer: &self.directions[dir].indirect_buffer,
-            draw_count: self.directions[dir].draw_count,
+            indirect_buffer: &self.directions[dir].shadow_indirect_buffer,
+            draw_count: self.directions[dir].shadow_draw_count,
         })
     }
 
@@ -358,6 +385,39 @@ impl ChunkRenderer {
 
                 let chunk_data_bytes: &[u8] = bytemuck::cast_slice(&arena.chunk_data_scratch);
                 queue.write_buffer(&arena.chunk_data_buffer, 0, chunk_data_bytes);
+            }
+        }
+    }
+
+    /// Baut den Indirect-Draw-Batch fuer die schatten-sichtbaren Chunks (Licht-Kugel-Kullung, s.
+    /// `shadow_draw_data`-Kommentar) neu auf - vollstaendig analog zu `set_visible`, aber in ein
+    /// eigenes Buffer-Paar pro Richtung, damit Opaque- und Schatten-Pass im selben Frame
+    /// unterschiedliche Chunk-Mengen zeichnen koennen.
+    pub fn set_shadow_visible(&mut self, queue: &wgpu::Queue, visible: &[ChunkGpuHandle]) {
+        for (dir, arena) in self.directions.iter_mut().enumerate() {
+            arena.shadow_indirect_scratch.clear();
+            arena.shadow_chunk_data_scratch.clear();
+            for handle in visible {
+                let slot = handle.slots[dir];
+                if slot.count == 0 || arena.shadow_indirect_scratch.len() >= self.max_draws_per_direction {
+                    continue;
+                }
+                arena.shadow_indirect_scratch.push(DrawIndirectArgs {
+                    vertex_count: 6,
+                    instance_count: slot.count,
+                    first_vertex: 0,
+                    first_instance: slot.offset,
+                });
+                arena.shadow_chunk_data_scratch.push([handle.origin[0], handle.origin[1], handle.origin[2], 0.0]);
+            }
+
+            arena.shadow_draw_count = arena.shadow_indirect_scratch.len() as u32;
+            if arena.shadow_draw_count > 0 {
+                let indirect_bytes: &[u8] = bytemuck::cast_slice(&arena.shadow_indirect_scratch);
+                queue.write_buffer(&arena.shadow_indirect_buffer, 0, indirect_bytes);
+
+                let chunk_data_bytes: &[u8] = bytemuck::cast_slice(&arena.shadow_chunk_data_scratch);
+                queue.write_buffer(&arena.shadow_chunk_data_buffer, 0, chunk_data_bytes);
             }
         }
     }

@@ -275,7 +275,14 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                self.chunk_manager.update(self.camera.position, &frustum, &queue, &mut gpu.renderer);
+                self.chunk_manager.update(
+                    self.camera.position,
+                    &frustum,
+                    &cascades,
+                    self.config.shadow_cascade_count,
+                    &queue,
+                    &mut gpu.renderer,
+                );
 
                 let mode_text = if self.physics.flying {
                     "FLYING"

@@ -4,15 +4,18 @@ use crate::engine::config::EngineConfig;
 
 use super::generator::TerrainGenerator;
 
-/// Eine Godray-Billboard-Instanz, wie sie im SSBO liegt (siehe `render/godray.wgsl`). `intensity`
-/// wird ausschliesslich vom Compute-Pass geschrieben/gelesen (In-Place-Temporal-Blend) - die
-/// CPU-Seite setzt sie bei einer Neu-Platzierung nur einmalig auf 0 und ruehrt sie danach nicht an.
+/// Eine Godray-Billboard-Instanz, wie sie im SSBO liegt (siehe `render/godray_compute.wgsl` und
+/// `render/godray_render.wgsl`). `intensity` wird ausschliesslich vom Compute-Pass geschrieben/
+/// gelesen (In-Place-Temporal-Blend) - die CPU-Seite setzt sie bei einer Neu-Platzierung nur
+/// einmalig auf 0 und ruehrt sie danach nicht an.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GodrayInstanceData {
-    /// xyz = Basis-Position (auf der Terrainoberflaeche + Hoehenversatz), w = Intensity.
+    /// xyz = Basis-Position (direkt AUF der Terrainoberflaeche, nicht frei schwebend - der
+    /// Kantenerkennungs-Punkt liegt `sample_height` darueber), w = Intensity.
     pub position_intensity: [f32; 4],
-    /// x = Billboard-Breite (dient GLEICHZEITIG als Sample-Radius der Kantenerkennung), y = Hoehe.
+    /// x = Sample-Radius/Billboard-Breite, y = sichtbare Strahllaenge entlang der Lichtrichtung,
+    /// z = Hoehe des Kantenerkennungs-Punkts ueber der Basis, w = ungenutzt.
     pub size: [f32; 4],
 }
 
@@ -22,9 +25,9 @@ pub struct GodrayInstanceData {
 pub struct GodrayField {
     count: u32,
     grid_spacing: f32,
-    height_offset: f32,
+    sample_height: f32,
     width: f32,
-    beam_height: f32,
+    beam_length: f32,
     last_center: Option<Vec3>,
     regen_threshold: f32,
     instances: Vec<GodrayInstanceData>,
@@ -36,9 +39,9 @@ impl GodrayField {
         Self {
             count: config.godray_count,
             grid_spacing: config.godray_grid_spacing,
-            height_offset: config.godray_height_offset,
+            sample_height: config.godray_sample_height,
             width: config.godray_width,
-            beam_height: config.godray_beam_height,
+            beam_length: config.godray_beam_length,
             last_center: None,
             regen_threshold: config.godray_grid_spacing * grid_dim as f32 * 0.5,
             instances: Vec::with_capacity(config.godray_count as usize),
@@ -82,12 +85,15 @@ impl GodrayField {
 
                 let world_x = camera_position.x + gx as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
                 let world_z = camera_position.z + gz as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
+                // Direkt AUF der Oberflaeche (nur minimaler Epsilon-Versatz gegen Z-Fighting) statt
+                // frei schwebend - der Kantenerkennungs-Punkt (`sample_height` darueber) soll mit
+                // der tatsaechlichen Voxel-Silhouette an dieser Stelle interagieren koennen.
                 let surface_y = generator.height_at(world_x.floor() as i32, world_z.floor() as i32) as f32;
-                let base_y = surface_y + 1.0 + self.height_offset;
+                let base_y = surface_y + 1.05;
 
                 self.instances.push(GodrayInstanceData {
                     position_intensity: [world_x, base_y, world_z, 0.0],
-                    size: [self.width, self.beam_height, 0.0, 0.0],
+                    size: [self.width, self.beam_length, self.sample_height, 0.0],
                 });
             }
         }

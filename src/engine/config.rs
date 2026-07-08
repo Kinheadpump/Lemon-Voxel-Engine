@@ -66,12 +66,16 @@ pub struct EngineConfig {
     pub godray_count: u32,
     /// Gitterabstand der Godray-Kandidaten-Positionen in Weltblöcken.
     pub godray_grid_spacing: f32,
-    /// Hoehe der Godray-Basis ueber der Terrainoberflaeche an ihrer Gitterposition.
-    pub godray_height_offset: f32,
-    /// Billboard-Breite - dient GLEICHZEITIG als Sample-Radius der Kantenerkennung im Compute-Pass
-    /// (die Erkennungsbreite soll optisch zur sichtbaren Strahlbreite passen).
+    /// Hoehe des Kantenerkennungs-Punkts ueber der Terrainoberflaeche - bewusst klein (nah an der
+    /// Oberflaeche), damit die Sample-Kugel tatsaechlich mit benachbarten Voxel-Hoehenunterschieden
+    /// (Bergkaemme, Hoehleneingaenge) interagiert statt frei in der Luft zu schweben, wo es fast nie
+    /// einen Licht/Schatten-Uebergang gibt.
+    pub godray_sample_height: f32,
+    /// Sample-Radius der Kantenerkennung UND sichtbare Billboard-Breite, in Weltblöcken.
     pub godray_width: f32,
-    pub godray_beam_height: f32,
+    /// Sichtbare Strahllaenge entlang der tatsaechlichen Lichtrichtung (nicht mehr fix vertikal) -
+    /// dadurch zeigen die Strahlen wirklich zur Sonne statt immer im selben Winkel zu stehen.
+    pub godray_beam_length: f32,
     /// Mischfaktor pro Frame zwischen alter und neu berechneter Intensity (0 = einfriert, 1 = kein
     /// Glaetten). Klein halten, sonst flackert es bei Kamerabewegung trotz Temporal-Blend.
     pub godray_temporal_blend: f32,
@@ -129,7 +133,7 @@ impl Default for EngineConfig {
             terminal_velocity: 80.0,
             start_flying: true,
 
-            sun_cycle_seconds: 240.0,
+            sun_cycle_seconds: 1200.0,
             sun_initial_time_of_day: 0.28,
             ambient_light: 0.2,
             sun_intensity: 1.0,
@@ -147,9 +151,9 @@ impl Default for EngineConfig {
 
             godray_count: 512,
             godray_grid_spacing: 6.0,
-            godray_height_offset: 4.0,
-            godray_width: 1.5,
-            godray_beam_height: 14.0,
+            godray_sample_height: 1.5,
+            godray_width: 3.5,
+            godray_beam_length: 12.0,
             godray_temporal_blend: 0.12,
 
             terrain_seed: 1337,
@@ -258,9 +262,9 @@ struct ConfigFile {
 
     godray_count: u32,
     godray_grid_spacing: f32,
-    godray_height_offset: f32,
+    godray_sample_height: f32,
     godray_width: f32,
-    godray_beam_height: f32,
+    godray_beam_length: f32,
     godray_temporal_blend: f32,
 
     terrain_seed: u32,
@@ -336,9 +340,9 @@ impl From<EngineConfig> for ConfigFile {
 
             godray_count: c.godray_count,
             godray_grid_spacing: c.godray_grid_spacing,
-            godray_height_offset: c.godray_height_offset,
+            godray_sample_height: c.godray_sample_height,
             godray_width: c.godray_width,
-            godray_beam_height: c.godray_beam_height,
+            godray_beam_length: c.godray_beam_length,
             godray_temporal_blend: c.godray_temporal_blend,
 
             terrain_seed: c.terrain_seed,
@@ -410,9 +414,9 @@ impl From<ConfigFile> for EngineConfig {
 
             godray_count: f.godray_count.clamp(1, 8192),
             godray_grid_spacing: f.godray_grid_spacing.max(0.5),
-            godray_height_offset: f.godray_height_offset,
+            godray_sample_height: f.godray_sample_height,
             godray_width: f.godray_width.max(0.01),
-            godray_beam_height: f.godray_beam_height.max(0.1),
+            godray_beam_length: f.godray_beam_length.max(0.1),
             godray_temporal_blend: f.godray_temporal_blend.clamp(0.001, 1.0),
 
             terrain_seed: f.terrain_seed,

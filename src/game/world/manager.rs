@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::{DirectionalMesh, mesh_chunk};
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
+use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 use crate::game::math::frustum::Frustum;
 
 use super::chunk::{CHUNK_SIZE, Chunk};
@@ -45,6 +46,11 @@ struct GenerationResult {
 
 fn chunk_origin(coord: ChunkCoord) -> glam::Vec3 {
     glam::Vec3::new((coord.0 * CHUNK_SIZE) as f32, (coord.1 * CHUNK_SIZE) as f32, (coord.2 * CHUNK_SIZE) as f32)
+}
+
+fn sphere_intersects_aabb(center: glam::Vec3, radius: f32, min: glam::Vec3, max: glam::Vec3) -> bool {
+    let closest = center.clamp(min, max);
+    center.distance_squared(closest) <= radius * radius
 }
 
 /// Zerlegt eine Weltkoordinate in Chunk-Koordinate + lokale Blockkoordinate. `div_euclid`/
@@ -109,6 +115,8 @@ pub struct ChunkManager {
     pending_scratch: Vec<ChunkCoord>,
     pending_set: HashSet<ChunkCoord>,
     visible_coords_scratch: Vec<ChunkCoord>,
+    shadow_visible_coords_scratch: Vec<ChunkCoord>,
+    shadow_visible_handles: Vec<ChunkGpuHandle>,
     /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations`/`drain_unloads` - siehe
     /// Kommentar an `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/
     /// uploaded/entlaedt ein grosser Backlog (Welt-Start, schnelles Fliegen, vertikales Fallen)
@@ -145,6 +153,8 @@ impl ChunkManager {
             pending_scratch: Vec::new(),
             pending_set: HashSet::new(),
             visible_coords_scratch: Vec::new(),
+            shadow_visible_coords_scratch: Vec::new(),
+            shadow_visible_handles: Vec::new(),
             max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: config.max_chunk_uploads_per_frame,
             max_chunk_unloads_per_frame: config.max_chunk_unloads_per_frame,
@@ -251,10 +261,13 @@ impl ChunkManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         camera_position: glam::Vec3,
         frustum: &Frustum,
+        cascades: &[Cascade; MAX_SHADOW_CASCADES],
+        cascade_count: u32,
         queue: &wgpu::Queue,
         renderer: &mut ChunkRenderer,
     ) {
@@ -274,6 +287,7 @@ impl ChunkManager {
         self.drain_unloads(renderer);
         self.dispatch_pending();
         self.update_visibility(frustum, queue, renderer);
+        self.update_shadow_visibility(cascades, cascade_count, queue, renderer);
     }
 
     /// Baut Soll-Menge neu auf und reiht neu aus dem Fenster gefallene Chunks in die (ueber mehrere
@@ -399,6 +413,41 @@ impl ChunkManager {
         self.visible_count = self.visible_handles.len();
 
         renderer.set_visible(queue, &self.visible_handles);
+    }
+
+    /// Schatten-Sichtbarkeit ueber Licht-Kugel- statt Kamera-Frustum-Kullung: ein Chunk gilt als
+    /// schatten-relevant, wenn seine AABB IRGENDEINE aktive Kaskaden-Kugel schneidet - unabhaengig
+    /// davon, ob er gerade im Kamera-Frustum liegt. Das entkoppelt die Schatten-Geometrie von der
+    /// Blickrichtung: reines Umschauen (ohne Bewegung) aendert die Kaskaden-Kugeln kaum, also bleibt
+    /// auch die Schatten-Geometrie stabil - vorher fuehrte dieselbe Menge wie beim Opaque-Pass dazu,
+    /// dass Schatten-Geometrie bei jeder Drehung rein/raus poppte ("Schatten springen").
+    fn update_shadow_visibility(
+        &mut self,
+        cascades: &[Cascade; MAX_SHADOW_CASCADES],
+        cascade_count: u32,
+        queue: &wgpu::Queue,
+        renderer: &mut ChunkRenderer,
+    ) {
+        let active = &cascades[..cascade_count as usize];
+
+        self.shadow_visible_coords_scratch.clear();
+        self.shadow_visible_coords_scratch.par_extend(self.loaded.par_iter().filter_map(|(coord, loaded)| {
+            if loaded.is_empty {
+                return None;
+            }
+            let min = chunk_origin(*coord);
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            active.iter().any(|c| sphere_intersects_aabb(c.center, c.radius, min, max)).then_some(*coord)
+        }));
+
+        self.shadow_visible_handles.clear();
+        for coord in &self.shadow_visible_coords_scratch {
+            if let Some(loaded) = self.loaded.get(coord) {
+                self.shadow_visible_handles.push(loaded.gpu_handle);
+            }
+        }
+
+        renderer.set_shadow_visible(queue, &self.shadow_visible_handles);
     }
 
     /// Soft-Cancellation: Ein auf dem Rayon-Thread fertiggestellter Chunk wird verworfen, wenn die

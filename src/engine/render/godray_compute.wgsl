@@ -77,7 +77,11 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let ray = rays[index];
-    let tip = ray.position_intensity.xyz + vec3<f32>(0.0, ray.size.y, 0.0);
+    // `size.z` = Hoehe des Kantenerkennungs-Punkts ueber der (auf der Oberflaeche liegenden) Basis -
+    // bewusst klein, damit die Samples tatsaechlich mit benachbarten Voxel-Hoehenunterschieden
+    // interagieren statt in freier Luft immer 16/16 beleuchtet zu sein. `size.y` ist die sichtbare
+    // Strahllaenge (nur fuer den Render-Pass relevant, siehe godray_render.wgsl).
+    let tip = ray.position_intensity.xyz + vec3<f32>(0.0, ray.size.z, 0.0);
     let radius = ray.size.x * 0.5;
 
     var lit_count = 0u;

@@ -15,11 +15,16 @@ pub struct Cascade {
     /// ist - im Fragment-Shader direkt mit `dot(camera_forward, world_pos - camera_pos)`
     /// vergleichbar, ohne die Hauptkamera-Tiefe (Reverse-Z) rekonstruieren zu muessen.
     pub split_far: f32,
+    /// Umschliessende Kugel des Kamera-Frustum-Ausschnitts dieser Kaskade, in Weltkoordinaten -
+    /// fuer die CPU-seitige Schatten-Sichtbarkeitspruefung in `ChunkManager` (Sphere-vs-AABB gegen
+    /// alle geladenen Chunks, NICHT gegen das Kamera-Frustum - siehe dortigen Kommentar).
+    pub center: Vec3,
+    pub radius: f32,
 }
 
 impl Default for Cascade {
     fn default() -> Self {
-        Self { view_proj: Mat4::IDENTITY, split_far: f32::MAX }
+        Self { view_proj: Mat4::IDENTITY, split_far: f32::MAX, center: Vec3::ZERO, radius: 0.0 }
     }
 }
 
@@ -111,7 +116,7 @@ pub fn compute_cascades(
             radius * 4.0,
         );
 
-        cascades[i] = Cascade { view_proj: light_proj * light_view, split_far };
+        cascades[i] = Cascade { view_proj: light_proj * light_view, split_far, center: snapped_center, radius };
         split_near = split_far;
     }
 
