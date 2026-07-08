@@ -57,6 +57,23 @@ fn pos_from_layer_uv(dir: usize, layer: i32, u: i32, v: i32) -> (i32, i32, i32) 
     }
 }
 
+/// Fuer welche Richtungen `pos_from_layer_uv` `v` (statt `u`) auf die X-Achse des flachen
+/// `x + y*32 + z*1024`-Arrays abbildet - X ist die einzige Achse mit Stride 1 (echt
+/// zusammenhaengender Speicher). Per Profiling gefunden (`profile_mesh_chunk_phases`-Test):
+/// DIR_POS_X und DIR_NEG_Y hatten `v` auf die Z-Achse (Stride 1024 = 2 KiB-Sprung PRO VOXEL)
+/// gemappt, DIR_POS_Z auf Y (Stride 32) - beides fern von sequenziellem Zugriff. Scannen wir
+/// stattdessen fuer diese Richtungen `u` als innere statt `v` als innere Schleifenvariable, landet
+/// die schnellstlaufende Schleife immer auf der guenstigsten verfuegbaren Achse (X wo moeglich,
+/// sonst Y statt Z) - reine Iterationsreihenfolge, keine Verhaltensaenderung.
+const SWAP_UV_LOOP_ORDER: [bool; 6] = [
+    false, // DIR_NEG_X: v->Y (Stride 32) ist bereits die beste erreichbare Achse (X ist hier "layer", fix)
+    true,  // DIR_POS_X: u->Y (Stride 32) statt v->Z (Stride 1024)
+    true,  // DIR_NEG_Y: u->X (Stride 1) statt v->Z (Stride 1024)
+    false, // DIR_POS_Y: v->X (Stride 1) ist bereits optimal
+    false, // DIR_NEG_Z: v->X (Stride 1) ist bereits optimal
+    true,  // DIR_POS_Z: u->X (Stride 1) statt v->Y (Stride 32)
+];
+
 /// Liest einen Nachbarblock. Liegt die Position innerhalb des lokalen Chunks, wird das lokale
 /// Array genutzt. Liegt sie ausserhalb (immer exakt 1 Schritt in GENAU der `dir`-Achse, da `x,y,z`
 /// hier stets aus `pos_from_layer_uv` + einem Einheitsversatz stammen), wird zuerst die lokal
@@ -106,9 +123,11 @@ fn build_face_mask<F: Fn(i32, i32, i32) -> bool>(
     );
 
     let (ox, oy, oz) = NEIGHBOR_OFFSETS[dir];
+    let swap = SWAP_UV_LOOP_ORDER[dir];
 
-    for u in 0..CHUNK_SIZE {
-        for v in 0..CHUNK_SIZE {
+    for a in 0..CHUNK_SIZE {
+        for b in 0..CHUNK_SIZE {
+            let (u, v) = if swap { (b, a) } else { (a, b) };
             let (x, y, z) = pos_from_layer_uv(dir, layer, u, v);
             let block_id = chunk.get_block(x, y, z);
             if block_id == 0 {
@@ -281,5 +300,78 @@ mod tests {
             chunk.set_block(i, i, i, 1);
             let _ = mesh_chunk(&chunk, 0, 0, 0, [None; 6], no_world_neighbors);
         }
+    }
+
+    /// Diagnose-Benchmark, KEIN Korrektheitstest - zerlegt die Gesamt-Meshing-Zeit in die beiden
+    /// Phasen (Rand-Voxel-Scan vs. Greedy-Merge+Encode), um zu bestimmen, wo die ~1.3ms/Chunk aus
+    /// dem `examples/mesh_bench.rs`-Ergebnis tatsaechlich hingehen. Manuell ausfuehren mit:
+    /// `cargo test --release --lib -- --ignored --nocapture profile_mesh_chunk_phases`
+    #[test]
+    #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
+    fn profile_mesh_chunk_phases() {
+        use std::time::{Duration, Instant};
+
+        use crate::engine::config::EngineConfig;
+        use crate::game::world::generator::TerrainGenerator;
+
+        let config = EngineConfig::default();
+        let generator = TerrainGenerator::new(&config);
+        let mut chunk = Chunk::empty();
+        generator.generate_chunk(4, 0, 4, &mut chunk);
+        assert!(!chunk.is_empty());
+
+        let neighbor_solid = |x: i32, y: i32, z: i32| generator.is_solid(x, y, z);
+        const ITERATIONS: usize = 2000;
+
+        let run = || {
+            let mut mask_time = Duration::ZERO;
+            let mut merge_time = Duration::ZERO;
+            let mut mesh = DirectionalMesh::default();
+
+            MASK_SCRATCH.with_borrow_mut(|mask| {
+                for dir in 0..6 {
+                    for layer in 0..CHUNK_SIZE {
+                        let t0 = Instant::now();
+                        build_face_mask(&chunk, None, 4, 0, 4, dir, layer, &neighbor_solid, mask);
+                        mask_time += t0.elapsed();
+
+                        let t1 = Instant::now();
+                        merge_mask_into_faces(mask, dir, layer, &mut mesh.faces[dir]);
+                        merge_time += t1.elapsed();
+                    }
+                }
+            });
+
+            for faces in &mut mesh.faces {
+                faces.clear();
+            }
+
+            (mask_time, merge_time)
+        };
+
+        for _ in 0..50 {
+            std::hint::black_box(run());
+        }
+
+        let mut mask_total = Duration::ZERO;
+        let mut merge_total = Duration::ZERO;
+        for _ in 0..ITERATIONS {
+            let (m, g) = run();
+            mask_total += m;
+            merge_total += g;
+        }
+
+        let mask_us = mask_total.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        let merge_us = merge_total.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        let total_us = mask_us + merge_us;
+        println!(
+            "Rand-Voxel-Scan (build_face_mask):    {mask_us:8.2} us/Chunk ({:5.1}%)",
+            mask_us / total_us * 100.0
+        );
+        println!(
+            "Greedy-Merge+Encode (merge_mask_into_faces): {merge_us:8.2} us/Chunk ({:5.1}%)",
+            merge_us / total_us * 100.0
+        );
+        println!("Summe (nur Zeitmessung, ohne Instant::now()-Overhead): {total_us:8.2} us/Chunk");
     }
 }
