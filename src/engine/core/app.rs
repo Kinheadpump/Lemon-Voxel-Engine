@@ -17,6 +17,7 @@ use crate::game::math::cascades::compute_cascades;
 use crate::game::math::frustum::Frustum;
 use crate::game::math::sun::Sun;
 use crate::game::physics::PlayerPhysics;
+use crate::game::world::godrays::GodrayField;
 use crate::game::world::manager::{ChunkManager, INTERACTION_REACH};
 
 /// Block-Typ, der beim Platzieren verwendet wird - "einfache" Interaktion ohne Inventar/Auswahl.
@@ -30,6 +31,7 @@ pub struct App {
     input: InputState,
     physics: PlayerPhysics,
     chunk_manager: ChunkManager,
+    godray_field: GodrayField,
     last_frame: Instant,
     last_stats_log: Instant,
     fps_ema: f32,
@@ -51,6 +53,7 @@ impl App {
             input: InputState::default(),
             physics: PlayerPhysics::new(config.start_flying, &config),
             chunk_manager: ChunkManager::new(&config),
+            godray_field: GodrayField::new(&config),
             last_frame: Instant::now(),
             last_stats_log: Instant::now(),
             fps_ema: 0.0,
@@ -231,6 +234,12 @@ impl ApplicationHandler for App {
                 let sun_height = direction_to_sun.y.max(0.0);
                 let sun_color = glam::Vec3::new(1.0, 0.85 + 0.15 * sun_height, 0.7 + 0.3 * sun_height);
                 gpu.update_lighting(cascades, direction_to_sun, sun_color, self.config.sun_intensity, self.config.ambient_light);
+
+                if let Some(instances) =
+                    self.godray_field.update(self.camera.position, self.chunk_manager.generator())
+                {
+                    gpu.upload_godrays(instances);
+                }
 
                 let queue = gpu.queue().clone();
 

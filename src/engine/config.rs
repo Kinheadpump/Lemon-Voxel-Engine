@@ -62,6 +62,20 @@ pub struct EngineConfig {
     pub sky_horizon_day_color: [f32; 3],
     pub sky_night_color: [f32; 3],
 
+    /// Maximale Anzahl gleichzeitiger Godray-Billboards (SSBO-Kapazitaet, feste Groesse).
+    pub godray_count: u32,
+    /// Gitterabstand der Godray-Kandidaten-Positionen in Weltblöcken.
+    pub godray_grid_spacing: f32,
+    /// Hoehe der Godray-Basis ueber der Terrainoberflaeche an ihrer Gitterposition.
+    pub godray_height_offset: f32,
+    /// Billboard-Breite - dient GLEICHZEITIG als Sample-Radius der Kantenerkennung im Compute-Pass
+    /// (die Erkennungsbreite soll optisch zur sichtbaren Strahlbreite passen).
+    pub godray_width: f32,
+    pub godray_beam_height: f32,
+    /// Mischfaktor pro Frame zwischen alter und neu berechneter Intensity (0 = einfriert, 1 = kein
+    /// Glaetten). Klein halten, sonst flackert es bei Kamerabewegung trotz Temporal-Blend.
+    pub godray_temporal_blend: f32,
+
     pub terrain_seed: u32,
     pub terrain_noise_frequency: f32,
     pub terrain_base_height: f32,
@@ -130,6 +144,13 @@ impl Default for EngineConfig {
             sky_zenith_day_color: [0.25, 0.55, 0.95],
             sky_horizon_day_color: [0.75, 0.85, 0.95],
             sky_night_color: [0.01, 0.015, 0.03],
+
+            godray_count: 512,
+            godray_grid_spacing: 6.0,
+            godray_height_offset: 4.0,
+            godray_width: 1.5,
+            godray_beam_height: 14.0,
+            godray_temporal_blend: 0.12,
 
             terrain_seed: 1337,
             terrain_noise_frequency: 0.02,
@@ -235,6 +256,13 @@ struct ConfigFile {
     sky_horizon_day_color: [f32; 3],
     sky_night_color: [f32; 3],
 
+    godray_count: u32,
+    godray_grid_spacing: f32,
+    godray_height_offset: f32,
+    godray_width: f32,
+    godray_beam_height: f32,
+    godray_temporal_blend: f32,
+
     terrain_seed: u32,
     terrain_noise_frequency: f32,
     terrain_base_height: f32,
@@ -306,6 +334,13 @@ impl From<EngineConfig> for ConfigFile {
             sky_horizon_day_color: c.sky_horizon_day_color,
             sky_night_color: c.sky_night_color,
 
+            godray_count: c.godray_count,
+            godray_grid_spacing: c.godray_grid_spacing,
+            godray_height_offset: c.godray_height_offset,
+            godray_width: c.godray_width,
+            godray_beam_height: c.godray_beam_height,
+            godray_temporal_blend: c.godray_temporal_blend,
+
             terrain_seed: c.terrain_seed,
             terrain_noise_frequency: c.terrain_noise_frequency,
             terrain_base_height: c.terrain_base_height,
@@ -372,6 +407,13 @@ impl From<ConfigFile> for EngineConfig {
             sky_zenith_day_color: f.sky_zenith_day_color,
             sky_horizon_day_color: f.sky_horizon_day_color,
             sky_night_color: f.sky_night_color,
+
+            godray_count: f.godray_count.clamp(1, 8192),
+            godray_grid_spacing: f.godray_grid_spacing.max(0.5),
+            godray_height_offset: f.godray_height_offset,
+            godray_width: f.godray_width.max(0.01),
+            godray_beam_height: f.godray_beam_height.max(0.1),
+            godray_temporal_blend: f.godray_temporal_blend.clamp(0.001, 1.0),
 
             terrain_seed: f.terrain_seed,
             terrain_noise_frequency: f.terrain_noise_frequency,

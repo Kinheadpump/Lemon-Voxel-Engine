@@ -1,5 +1,6 @@
 pub mod blur;
 pub mod context;
+pub mod godray;
 pub mod gpu_timer;
 pub mod hud;
 pub mod pipeline;

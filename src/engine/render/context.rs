@@ -6,6 +6,7 @@ use crate::engine::config::EngineConfig;
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 
 use super::blur::SsaoBlurPass;
+use super::godray::GodrayPass;
 use super::gpu_timer::GpuTimer;
 use super::hud::HudRenderer;
 use super::pipeline;
@@ -13,6 +14,7 @@ use super::renderer::ChunkRenderer;
 use super::shadow::ShadowPass;
 use super::skybox::SkyboxPass;
 use super::ssao::SsaoPass;
+use crate::game::world::godrays::GodrayInstanceData;
 
 pub struct GpuContext {
     surface: wgpu::Surface<'static>,
@@ -34,6 +36,8 @@ pub struct GpuContext {
     ssao_blur_depth_threshold: f32,
     shadow_pass: ShadowPass,
     skybox: SkyboxPass,
+    godray: GodrayPass,
+    godray_temporal_blend: f32,
     /// Vom letzten `update_lighting`-Aufruf gemerkt, damit `render()` dieselben Kaskaden-Matrizen
     /// zum Befuellen der Shadow-Map-Ebenen nutzt, die auch im Lighting-Uniform des Opaque-Passes
     /// stehen (sonst liefen Shadow-Rendering und Sampling auseinander).
@@ -42,6 +46,7 @@ pub struct GpuContext {
     shadow_map_resolution: u32,
     last_view_proj: glam::Mat4,
     last_camera_pos: glam::Vec3,
+    last_camera_forward: glam::Vec3,
     msaa_samples: u32,
     /// SSAO liest die Tiefe ueber eine `texture_depth_multisampled_2d`-Bindung; bei MSAA=1 ist die
     /// Depth-Textur nicht multisampled, sodass die SSAO-Bindgroup gar nicht erst gebaut werden darf.
@@ -158,6 +163,10 @@ impl GpuContext {
         );
         skybox.rebuild_bind_group(&device, &depth_view);
 
+        let mut godray =
+            GodrayPass::new(&device, config.format, msaa_active, engine_config.godray_count, &shadow_pass);
+        godray.rebuild_render_bind_group(&device, &depth_view);
+
         let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
         let gpu_timer = GpuTimer::try_new(&device, &queue);
 
@@ -185,11 +194,14 @@ impl GpuContext {
             ssao_blur_depth_threshold: engine_config.ssao_blur_depth_threshold,
             shadow_pass,
             skybox,
+            godray,
+            godray_temporal_blend: engine_config.godray_temporal_blend,
             cascades: [Cascade::default(); MAX_SHADOW_CASCADES],
             cascade_count: engine_config.shadow_cascade_count,
             shadow_map_resolution: engine_config.shadow_map_resolution,
             last_view_proj: initial_view_proj,
             last_camera_pos: glam::Vec3::ZERO,
+            last_camera_forward: glam::Vec3::Z,
             msaa_samples,
             msaa_active,
             ssao_enabled: engine_config.ssao_enabled,
@@ -210,6 +222,7 @@ impl GpuContext {
         self.renderer.update_camera(&self.queue, view_proj, camera_pos, camera_forward);
         self.last_view_proj = view_proj;
         self.last_camera_pos = camera_pos;
+        self.last_camera_forward = camera_forward;
     }
 
     /// Aktualisiert Sonnen-/Kaskaden-Uniforms (Opaque-Pass + Skybox) UND merkt sich die
@@ -234,7 +247,25 @@ impl GpuContext {
             ambient,
         );
         self.skybox.update_uniforms(&self.queue, self.last_view_proj, self.last_camera_pos, direction_to_sun);
+        self.godray.update_uniforms(
+            &self.queue,
+            self.last_view_proj,
+            &cascades,
+            self.cascade_count,
+            self.last_camera_pos,
+            self.last_camera_forward,
+            direction_to_sun,
+            sun_color,
+            sun_intensity,
+            self.godray_temporal_blend,
+        );
         self.cascades = cascades;
+    }
+
+    /// Volle Neu-Platzierung der Godray-Kandidaten (siehe `GodrayField::update` - nur bei
+    /// ausreichender Kamerabewegung aufgerufen, kein Pro-Frame-Upload).
+    pub fn upload_godrays(&self, instances: &[GodrayInstanceData]) {
+        self.godray.upload_instances(&self.queue, instances);
     }
 
     pub fn update_ssao(&self, projection: glam::Mat4) {
@@ -292,6 +323,7 @@ impl GpuContext {
             self.blur.rebuild_bind_group(&self.device, &self.ao_view, &self.depth_view, &self.resolve_color_view);
         }
         self.skybox.rebuild_bind_group(&self.device, &self.depth_view);
+        self.godray.rebuild_render_bind_group(&self.device, &self.depth_view);
     }
 
     pub fn render(&mut self) {
@@ -332,9 +364,9 @@ impl GpuContext {
             &self.renderer.shadow_draw_data(),
         );
 
-        // Reserviert fuer einen zukuenftigen Compute-Pass (volumetrische Effekte/Godrays): laeuft
-        // hier, NACH dem Shadow-Pass (kann dessen Tiefendaten fuer Sonnenstrahlen nutzen) und VOR
-        // dem Opaque-Pass, ohne die Pass-Reihenfolge darunter/darueber aendern zu muessen.
+        // Compute-Pass fuer Godrays: nutzt die soeben gefuellten Shadow-Cascade-Tiefendaten fuer die
+        // Kantenerkennung, laeuft NACH dem Shadow-Pass und VOR dem Opaque-Pass.
+        self.godray.dispatch(&mut encoder);
 
         {
             let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
@@ -445,6 +477,29 @@ impl GpuContext {
             });
 
             self.blur.render(&mut blur_pass);
+        }
+
+        {
+            // Godrays laufen ERST nach Skybox UND SSAO/Blur (nicht direkt nach dem Opaque-Pass, wie
+            // eine woertliche Lesart der Pass-Reihenfolge nahelegen wuerde): additive Farbe mit
+            // depth_write=false wuerde von Skybox's unbedingtem Overwrite (`blend: None`) auf allen
+            // Hintergrund-Pixeln sofort wieder geloescht, und SSAO/Blur wuerde den Glow faelschlich
+            // wie Geometrie-AO abdunkeln. Additiv NACH dem finalen Farb-Composite ist hier korrekt.
+            let mut godray_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("godray_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &swapchain_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.godray.render(&mut godray_pass);
         }
 
         {
