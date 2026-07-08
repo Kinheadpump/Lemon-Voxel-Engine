@@ -355,6 +355,16 @@ pub fn mesh_chunk<F: Fn(i32, i32, i32) -> bool>(
         );
 
         for dir in 0..6 {
+            if any_exposed[dir] == 0 {
+                continue;
+            }
+
+            // Popcount ueber die Exposure-Spalten = exakte Face-Anzahl VOR dem Greedy-Merge, also
+            // eine garantierte Obergrenze des Outputs - EINE Allokation exakt passender Groesse
+            // statt wiederholtem Verdoppeln (und Kopieren) durch `Vec::push`-Wachstum.
+            let exposed_face_upper_bound: u32 = exposure[dir].iter().flatten().map(|col| col.count_ones()).sum();
+            mesh.faces[dir].reserve(exposed_face_upper_bound as usize);
+
             for layer in 0..CHUNK_SIZE {
                 // Ganze Ebenen ohne ein einziges exponiertes Face ueberspringen (haeufig bei
                 // durchgehend massiven oder komplett umschlossenen Chunks) - spart den vollen

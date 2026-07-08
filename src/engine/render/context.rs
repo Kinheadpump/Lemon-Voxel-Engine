@@ -221,6 +221,12 @@ impl GpuContext {
         &self.queue
     }
 
+    /// Split-Borrow fuer den Chunk-Update-Pfad: Queue (shared) und Renderer (mutable) gleichzeitig,
+    /// ohne dass der Aufrufer die Queue clonen muss, um den Borrow-Konflikt aufzuloesen.
+    pub fn queue_and_renderer(&mut self) -> (&wgpu::Queue, &mut ChunkRenderer) {
+        (&self.queue, &mut self.renderer)
+    }
+
     pub fn aspect(&self) -> f32 {
         self.config.width as f32 / self.config.height as f32
     }

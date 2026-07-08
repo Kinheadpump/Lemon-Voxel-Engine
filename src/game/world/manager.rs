@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use glam::IVec3;
-use rayon::prelude::*;
 
 use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk};
@@ -22,6 +22,36 @@ pub const INTERACTION_REACH: f32 = 6.0;
 /// Hoehenbereich gezwungen zu sein.
 type ChunkCoord = (i32, i32, i32);
 
+/// FxHash-artiger multiplikativer Hasher fuer ChunkCoord-Keys. Der SipHash-Default von
+/// `std::collections::HashMap` ist DoS-resistent, aber fuer interne (nicht angreifbare)
+/// Koordinaten-Keys unnoetig teuer - `loaded`/`pending_set`/`in_flight` werden im Streaming-Pfad
+/// zehntausendfach pro Ladefenster-Rebuild und pro `is_solid_at`-Voxelabfrage (Physik/Raycast)
+/// getroffen.
+#[derive(Default)]
+struct CoordHasher(u64);
+
+impl Hasher for CoordHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(value as u32)).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type CoordMap<V> = HashMap<ChunkCoord, V, BuildHasherDefault<CoordHasher>>;
+type CoordSet = HashSet<ChunkCoord, BuildHasherDefault<CoordHasher>>;
+
 struct LoadedChunk {
     pool_slot: usize,
     gpu_handle: ChunkGpuHandle,
@@ -35,10 +65,15 @@ struct LoadedChunk {
     queued_for_unload: bool,
 }
 
+/// `chunk` ist geboxt, damit ueber den gesamten asynchronen Pfad (Pool-Take -> rayon-Closure ->
+/// mpsc-Send -> Pool-Rueckgabe) nur ein 8-Byte-Pointer wandert. Mit Inline-`Chunk` wurde der volle
+/// 64-KiB-Block VIERMAL pro Chunk kopiert und die geboxte rayon-Closure sowie der mpsc-Node wurden
+/// zu 64-KiB-Heap-Allokationen auf dem Main-Thread - bei 128 Dispatches+Uploads/Frame ~24 MB
+/// Alloc-/Memcpy-Traffic pro Frame waehrend des Streamens (Frame-Stutter).
 struct GenerationResult {
     coord: ChunkCoord,
     pool_slot: usize,
-    chunk: Chunk,
+    chunk: Box<Chunk>,
     mesh: DirectionalMesh,
     is_empty: bool,
 }
@@ -65,54 +100,50 @@ fn chunk_and_local(world_x: i32, world_y: i32, world_z: i32) -> (ChunkCoord, IVe
     (coord, local)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn positive_world_coords_convert_correctly() {
-        let (coord, local) = chunk_and_local(33, 5, 65);
-        assert_eq!(coord, (1, 0, 2));
-        assert_eq!(local, IVec3::new(1, 5, 1));
-    }
-
-    #[test]
-    fn negative_world_coords_floor_towards_negative_infinity() {
-        let (coord, local) = chunk_and_local(-1, -1, -33);
-        assert_eq!(coord, (-1, -1, -2));
-        assert_eq!(local, IVec3::new(31, 31, 31));
-    }
-
-    #[test]
-    fn chunk_origin_matches_chunk_coord_times_size() {
-        assert_eq!(chunk_origin((1, -1, 2)), glam::Vec3::new(32.0, -32.0, 64.0));
-    }
+/// Skaliert den per-Kaskade tolerierten Kugel-Versatz mit dem Kaskadenradius: die ferne Kaskade
+/// wandert bei reiner Kamerarotation deutlich weiter als die nahe (ihr Zentrum liegt weit entlang
+/// der Blickrichtung) - ein fixer kleiner Slack wuerde dort trotzdem jeden Frame einen Rebuild
+/// ausloesen. Die Kugeln werden beim Sichtbarkeitstest um diesen Slack AUFGEBLAEHT, wodurch die
+/// gecachte Menge eine korrekte OBERMENGE der exakten bleibt, solange sich kein Zentrum weiter als
+/// den Slack bewegt hat (Dreiecksungleichung) - erst dann wird neu aufgebaut.
+fn shadow_cascade_slack(radius: f32) -> f32 {
+    (radius * 0.2).clamp(8.0, 64.0)
 }
 
 pub struct ChunkManager {
-    pool: Vec<Option<Chunk>>,
+    /// Geboxte Chunks (s. `GenerationResult`) - `take()`/Zurueckstecken bewegt nur den Pointer.
+    pool: Vec<Option<Box<Chunk>>>,
     pool_free_list: Vec<usize>,
-    loaded: HashMap<ChunkCoord, LoadedChunk>,
-    in_flight: HashSet<ChunkCoord>,
+    loaded: CoordMap<LoadedChunk>,
+    in_flight: CoordSet,
     generator: Arc<TerrainGenerator>,
     result_tx: Sender<GenerationResult>,
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
     vertical_render_distance_chunks: i32,
-    /// Chunk-Koordinate der Kamera im letzten Frame, in dem das Ladefenster neu aufgebaut wurde.
-    /// Der komplette Soll/Entlade-Scan (O(Ladevolumen)) muss nur laufen, wenn sich diese
-    /// Mittelpunkt-Koordinate tatsaechlich aendert - im Stillstand (oder bei reiner Kamerarotation)
-    /// entstehen sonst pro Frame tausende ueberfluessige HashSet-Operationen.
+    /// Fenster-Zentrum (Kamera-Chunk-Koordinate) des letzten Rebuilds. Ob eine Koordinate zum
+    /// Ladefenster gehoert, ist ein O(1)-Arithmetik-Praedikat gegen dieses Zentrum
+    /// (`Self::in_window`) - es existiert bewusst KEINE materialisierte "Soll-Menge" mehr: das
+    /// fruehere `HashSet` mit O(Ladevolumen) Inserts pro Fenster-Rebuild (38k Hashes bei
+    /// render_distance=32, jedes Mal beim Ueberqueren einer Chunk-Grenze) war die Haupt-Stutter-
+    /// Quelle beim Bewegen.
     last_center: Option<ChunkCoord>,
-    desired_scratch: HashSet<ChunkCoord>,
     unload_scratch: Vec<ChunkCoord>,
-    /// Noch nicht dispatchte, aber gewuenschte Chunks (neu ins Ladefenster gerutscht oder wegen
-    /// Pool-Erschoepfung zurueckgestellt). Wird pro Frame nur um tatsaechlich neue Arbeit erweitert
-    /// bzw. abgearbeitet - kein Full-Rescan des gesamten Ladevolumens mehr pro Frame.
+    /// Noch nicht dispatchte, aber gewuenschte Chunks - absteigend nach Distanz zum Fenster-Zentrum
+    /// sortiert, sodass `pop()` (Dispatch-Reihenfolge) immer den NAECHSTGELEGENEN Chunk zuerst
+    /// liefert. Vorher war die Reihenfolge HashSet-Iterationszufall - sichtbar als "Chunks laden an
+    /// zufaelligen Stellen zuerst".
     pending_scratch: Vec<ChunkCoord>,
-    pending_set: HashSet<ChunkCoord>,
-    shadow_visible_coords_scratch: Vec<ChunkCoord>,
+    pending_set: CoordSet,
     shadow_visible_handles: Vec<(ChunkGpuHandle, glam::Vec3)>,
+    /// Kaskaden-Kugeln (Zentrum, Radius) zum Zeitpunkt des letzten Schatten-Sichtbarkeits-Rebuilds
+    /// plus Dirty-Flag: der fruehere Voll-Scan ueber ALLE geladenen Chunks lief jeden Frame (O(N)
+    /// par_iter + kompletter Indirect-Buffer-Reupload), obwohl sich die Menge zwischen zwei Frames
+    /// fast nie aendert. Jetzt laeuft er nur noch, wenn Chunks geladen/entladen/editiert wurden oder
+    /// sich eine Kaskaden-Kugel weiter als ihren Slack bewegt hat (s. `shadow_cascade_slack`).
+    shadow_last_cascades: [(glam::Vec3, f32); MAX_SHADOW_CASCADES],
+    shadow_last_cascade_count: u32,
+    shadow_set_dirty: bool,
     /// Frame-Budgets fuer `dispatch_pending`/`apply_completed_generations`/`drain_unloads` - siehe
     /// Kommentar an `EngineConfig::max_chunk_dispatches_per_frame`. Ohne diese Grenzen dispatcht/
     /// uploaded/entlaedt ein grosser Backlog (Welt-Start, schnelles Fliegen, vertikales Fallen)
@@ -122,68 +153,34 @@ pub struct ChunkManager {
     max_chunk_unloads_per_frame: usize,
 }
 
-/// Sicherheitsobergrenze fuer den aus der Render-Distanz AUTOMATISCH abgeleiteten Pool - verhindert,
-/// dass eine extreme Kombination aus horizontaler UND vertikaler Render-Distanz (z.B. beide auf 32)
-/// beim Start unbemerkt mehrere GB RAM alloziert. 65536 Chunks * 64 KiB = 4 GiB, deckt jede in der
-/// Praxis sinnvolle Kombination ab. Ein EXPLIZIT in `config.toml` gesetzter `chunk_pool_size`-Wert
-/// wird davon nicht begrenzt - nur die implizite Ableitung.
-const CHUNK_POOL_SAFETY_CAP: usize = 65_536;
-
-/// `(2*render_distance_chunks+1)^2 * (2*vertical_render_distance_chunks+1)` - die Anzahl Chunks, die
-/// gleichzeitig innerhalb des Ladefensters liegen koennen.
-fn required_chunk_pool_size(render_distance_chunks: i32, vertical_render_distance_chunks: i32) -> usize {
-    let horizontal_span = 2 * render_distance_chunks as i64 + 1;
-    let vertical_span = 2 * vertical_render_distance_chunks as i64 + 1;
-    (horizontal_span * horizontal_span * vertical_span) as usize
-}
-
 impl ChunkManager {
-    /// Der Pool muss `required_chunk_pool_size` Chunks abdecken, sonst werden Chunks am Rand der
-    /// Render-Distanz still NICHT geladen - und zwar nicht etwa gleichmaessig "kuerzer", sondern an
-    /// spatial ARBITRAEREN Stellen: `rebuild_load_window` iteriert die gewuenschte Menge ueber ein
-    /// `HashSet`, dessen Iterationsreihenfolge nichts mit raeumlicher Naehe zu tun hat - bei
-    /// Pool-Erschoepfung "gewinnen" zufaellige statt die naechstgelegenen Chunks. `chunk_pool_size`
-    /// aus der Config ist dabei ein MINDESTWERT (z.B. fuer Editier-Spielraum), keine Obergrenze -
-    /// der Pool wird immer mindestens auf die konfigurierte Render-Distanz hochskaliert. Jeder Chunk
-    /// belegt 64 KiB RAM.
+    /// `config.chunk_pool_size` ist bereits in `EngineConfig` auf das Ladevolumen der Render-Distanz
+    /// normalisiert (s. `EngineConfig::normalized`) - Renderer-Buffer (`chunk_meta_buffer` etc.) und
+    /// Pool arbeiten dadurch garantiert mit derselben Slot-Anzahl. Jeder Chunk belegt 64 KiB RAM.
     pub fn new(config: &EngineConfig) -> Self {
-        let required = required_chunk_pool_size(config.render_distance_chunks, config.vertical_render_distance_chunks);
-        let pool_size = config.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
-        if required > CHUNK_POOL_SAFETY_CAP {
-            log::warn!(
-                "Render-Distanz {}x{} (horizontal x vertikal) bräuchte {} Chunk-Pool-Slots, das \
-                 überschreitet die Sicherheitsobergrenze von {} ({} MiB) - Chunks am Rand der \
-                 Render-Distanz werden nicht geladen. Render-Distanz reduzieren oder \
-                 chunk_pool_size explizit in config.toml über die Obergrenze hinaus setzen.",
-                config.render_distance_chunks,
-                config.vertical_render_distance_chunks,
-                required,
-                CHUNK_POOL_SAFETY_CAP,
-                CHUNK_POOL_SAFETY_CAP * 64 / 1024,
-            );
-        }
-
-        let pool = (0..pool_size).map(|_| Some(Chunk::empty())).collect();
+        let pool_size = config.chunk_pool_size;
+        let pool = (0..pool_size).map(|_| Some(Box::new(Chunk::empty()))).collect();
         let pool_free_list = (0..pool_size).collect();
         let (result_tx, result_rx) = channel();
 
         Self {
             pool,
             pool_free_list,
-            loaded: HashMap::new(),
-            in_flight: HashSet::new(),
+            loaded: CoordMap::default(),
+            in_flight: CoordSet::default(),
             generator: Arc::new(TerrainGenerator::new(config)),
             result_tx,
             result_rx,
             render_distance_chunks: config.render_distance_chunks,
             vertical_render_distance_chunks: config.vertical_render_distance_chunks,
             last_center: None,
-            desired_scratch: HashSet::new(),
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
-            pending_set: HashSet::new(),
-            shadow_visible_coords_scratch: Vec::new(),
+            pending_set: CoordSet::default(),
             shadow_visible_handles: Vec::new(),
+            shadow_last_cascades: [(glam::Vec3::ZERO, 0.0); MAX_SHADOW_CASCADES],
+            shadow_last_cascade_count: 0,
+            shadow_set_dirty: true,
             max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: config.max_chunk_uploads_per_frame,
             max_chunk_unloads_per_frame: config.max_chunk_unloads_per_frame,
@@ -198,15 +195,22 @@ impl ChunkManager {
         &self.generator
     }
 
+    #[inline(always)]
+    fn in_window(&self, coord: ChunkCoord, center: ChunkCoord) -> bool {
+        (coord.0 - center.0).abs() <= self.render_distance_chunks
+            && (coord.1 - center.1).abs() <= self.vertical_render_distance_chunks
+            && (coord.2 - center.2).abs() <= self.render_distance_chunks
+    }
+
     /// Voxel-Festigkeit unter Beruecksichtigung geladener/editierter Chunk-Daten. Ist der Chunk an
     /// dieser Position nicht geladen, wird auf die rein prozedurale Vorhersage zurueckgefallen -
     /// das reicht fuer Physik/Raycast, da beide ohnehin nur innerhalb der Render-Distanz abfragen.
     pub fn is_solid_at(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let (coord, local) = chunk_and_local(world_x, world_y, world_z);
-        if let Some(loaded) = self.loaded.get(&coord) {
-            if let Some(chunk) = &self.pool[loaded.pool_slot] {
-                return chunk.get_block(local.x, local.y, local.z) != 0;
-            }
+        if let Some(loaded) = self.loaded.get(&coord)
+            && let Some(chunk) = self.pool[loaded.pool_slot].as_deref()
+        {
+            return chunk.get_block(local.x, local.y, local.z) != 0;
         }
         self.generator.is_solid(world_x, world_y, world_z)
     }
@@ -231,7 +235,7 @@ impl ChunkManager {
         let Some(pool_slot) = self.loaded.get(&coord).map(|loaded| loaded.pool_slot) else {
             return false;
         };
-        let Some(chunk) = self.pool[pool_slot].as_mut() else {
+        let Some(chunk) = self.pool[pool_slot].as_deref_mut() else {
             return false;
         };
         chunk.set_block(local.x, local.y, local.z, block_id);
@@ -263,13 +267,12 @@ impl ChunkManager {
     /// synchronen Remesh-Pfad (Block-Editierung) sinnvoll/moeglich: hier lebt `&self` lange genug,
     /// dass die Referenzen den kompletten `mesh_chunk`-Aufruf ueberleben. Der asynchrone
     /// Rayon-Dispatch-Pfad (`dispatch_pending`) kann das NICHT nutzen - die Referenzen wuerden die
-    /// Thread-Grenze nicht ueberleben, und ein Kopieren ganzer 32-KiB-Nachbar-Chunks in die
-    /// Spawn-Closure waere teurer als die HashMap-Lookups, die es einsparen soll.
+    /// Thread-Grenze nicht ueberleben.
     fn neighbor_chunk_refs(&self, coord: ChunkCoord) -> [Option<&Chunk>; 6] {
         std::array::from_fn(|dir| {
             let (ox, oy, oz) = NEIGHBOR_OFFSETS[dir];
             let neighbor_coord = (coord.0 + ox, coord.1 + oy, coord.2 + oz);
-            self.loaded.get(&neighbor_coord).and_then(|loaded| self.pool[loaded.pool_slot].as_ref())
+            self.loaded.get(&neighbor_coord).and_then(|loaded| self.pool[loaded.pool_slot].as_deref())
         })
     }
 
@@ -280,7 +283,7 @@ impl ChunkManager {
         let pool_slot = loaded.pool_slot;
         let old_handle = loaded.gpu_handle;
 
-        let Some(chunk) = self.pool[pool_slot].as_ref() else {
+        let Some(chunk) = self.pool[pool_slot].as_deref() else {
             return;
         };
         let is_empty = chunk.is_empty();
@@ -308,6 +311,7 @@ impl ChunkManager {
             loaded.gpu_handle = new_handle;
             loaded.is_empty = is_empty;
         }
+        self.shadow_set_dirty = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,28 +336,26 @@ impl ChunkManager {
             self.last_center = Some(center);
         }
 
-        self.drain_unloads(queue, renderer);
+        self.drain_unloads(center, queue, renderer);
         self.dispatch_pending();
         self.update_shadow_visibility(cascades, cascade_count, queue, renderer);
     }
 
-    /// Baut Soll-Menge neu auf und reiht neu aus dem Fenster gefallene Chunks in die (ueber mehrere
-    /// Frames gedeckelt abgearbeitete) Entlade-Warteschlange ein - nur noetig, wenn der Kamera-
-    /// Mittelpunkt tatsaechlich einen neuen Chunk betreten hat. Die eigentlichen Entladungen laufen
-    /// gedeckelt in `drain_unloads`, weil ein Chunk-Grenz-Uebergang (v.a. vertikal beim Fallen) eine
-    /// ganze Chunk-Ebene auf einmal aus dem Fenster schiebt.
+    /// Fenster-Rebuild beim Betreten eines neuen Kamera-Chunks. Neu zu ladende Chunks werden
+    /// INKREMENTELL bestimmt: nur Koordinaten, die im neuen, aber nicht im alten Fenster liegen
+    /// (beim typischen Ein-Chunk-Schritt eine einzelne Randebene statt des vollen Ladevolumens).
+    /// Der Skip-Test gegen das alte Fenster ist reine Arithmetik - im Gegensatz zum frueheren
+    /// HashSet-Aufbau fallen fuer die (bei render_distance=32 rund 38k) unveraenderten Koordinaten
+    /// weder Hashes noch Inserts an. Der Entlade-Scan bleibt O(geladene Chunks), aber ebenfalls mit
+    /// reinem Arithmetik-Praedikat.
     fn rebuild_load_window(&mut self, center: ChunkCoord) {
-        self.desired_scratch.clear();
-        for dz in -self.render_distance_chunks..=self.render_distance_chunks {
-            for dx in -self.render_distance_chunks..=self.render_distance_chunks {
-                for dy in -self.vertical_render_distance_chunks..=self.vertical_render_distance_chunks {
-                    self.desired_scratch.insert((center.0 + dx, center.1 + dy, center.2 + dz));
-                }
-            }
-        }
+        let old_center = self.last_center;
 
         for (coord, loaded) in self.loaded.iter_mut() {
-            if !loaded.queued_for_unload && !self.desired_scratch.contains(coord) {
+            let outside = (coord.0 - center.0).abs() > self.render_distance_chunks
+                || (coord.1 - center.1).abs() > self.vertical_render_distance_chunks
+                || (coord.2 - center.2).abs() > self.render_distance_chunks;
+            if outside && !loaded.queued_for_unload {
                 loaded.queued_for_unload = true;
                 self.unload_scratch.push(*coord);
             }
@@ -362,29 +364,52 @@ impl ChunkManager {
         // Chunks, die aus dem Fenster gewandert sind, bevor sie je dispatcht wurden, muessen aus
         // der Pending-Liste verschwinden - sonst wuerde spaeter fuer eine laengst irrelevante
         // Position noch ein Generierungs-Job gestartet.
-        let desired = &self.desired_scratch;
-        self.pending_set.retain(|coord| desired.contains(coord));
-        self.pending_scratch.retain(|coord| self.pending_set.contains(coord));
+        let r = self.render_distance_chunks;
+        let rv = self.vertical_render_distance_chunks;
+        self.pending_set.retain(|&(x, y, z)| {
+            (x - center.0).abs() <= r && (y - center.1).abs() <= rv && (z - center.2).abs() <= r
+        });
+        let pending_set = &self.pending_set;
+        self.pending_scratch.retain(|coord| pending_set.contains(coord));
 
-        for &coord in &self.desired_scratch {
-            if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
-                continue;
-            }
-            if self.pending_set.insert(coord) {
-                self.pending_scratch.push(coord);
+        for dz in -r..=r {
+            for dx in -r..=r {
+                for dy in -rv..=rv {
+                    let coord = (center.0 + dx, center.1 + dy, center.2 + dz);
+                    if let Some(old) = old_center
+                        && self.in_window(coord, old)
+                    {
+                        continue;
+                    }
+                    if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
+                        continue;
+                    }
+                    if self.pending_set.insert(coord) {
+                        self.pending_scratch.push(coord);
+                    }
+                }
             }
         }
+
+        // Absteigend nach Distanz sortieren, damit `pop()` in `dispatch_pending` nearest-first
+        // arbeitet. Nach dem initialen Voll-Scan ist das einmalig O(Volumen log Volumen), bei
+        // inkrementellen Rebuilds nur noch ueber die kleine Rest+Randebenen-Menge.
+        self.pending_scratch.sort_unstable_by_key(|&(x, y, z)| {
+            let dx = (x - center.0) as i64;
+            let dy = (y - center.1) as i64;
+            let dz = (z - center.2) as i64;
+            -(dx * dx + dy * dy + dz * dz)
+        });
     }
 
-    /// Arbeitet bis zu `max_chunk_unloads_per_frame` Eintraege der Entlade-Warteschlange ab. Jede
-    /// `free_chunk`-Freigabe ist O(Freelist); ohne diesen Deckel wuerde das Entladen einer ganzen
-    /// Chunk-Ebene (Tausende) in einem Frame rucken. Ein zwischenzeitlich wieder ins Fenster
-    /// gewanderter Chunk wird nicht entladen, sondern nur wieder freigegeben.
-    fn drain_unloads(&mut self, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
+    /// Arbeitet bis zu `max_chunk_unloads_per_frame` Eintraege der Entlade-Warteschlange ab. Ein
+    /// zwischenzeitlich wieder ins Fenster gewanderter Chunk wird nicht entladen, sondern nur wieder
+    /// freigegeben.
+    fn drain_unloads(&mut self, center: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         for _ in 0..self.max_chunk_unloads_per_frame {
             let Some(coord) = self.unload_scratch.pop() else { break };
 
-            if self.desired_scratch.contains(&coord) {
+            if self.in_window(coord, center) {
                 if let Some(loaded) = self.loaded.get_mut(&coord) {
                     loaded.queued_for_unload = false;
                 }
@@ -395,10 +420,9 @@ impl ChunkManager {
         }
     }
 
-    /// Dispatcht bis zu `max_chunk_dispatches_per_frame` ausstehende Chunks. Gedeckelt, damit ein
-    /// grosser Backlog (Welt-Start, schnelles Fliegen ueber die Render-Distanz) nicht in einem
-    /// einzigen Frame tausende Rayon-Tasks spawnt (jede Closure verschiebt einen vollen 32-KiB-
-    /// Chunk per Move-Capture) - das verteilt die Dispatch-Kosten stattdessen ueber mehrere Frames.
+    /// Dispatcht bis zu `max_chunk_dispatches_per_frame` ausstehende Chunks (nearest-first, s.
+    /// `pending_scratch`-Sortierung). Gedeckelt, damit ein grosser Backlog nicht in einem einzigen
+    /// Frame tausende Rayon-Tasks spawnt - das verteilt die Dispatch-Kosten ueber mehrere Frames.
     fn dispatch_pending(&mut self) {
         for _ in 0..self.max_chunk_dispatches_per_frame {
             let Some(coord) = self.pending_scratch.pop() else { break };
@@ -445,11 +469,11 @@ impl ChunkManager {
     }
 
     /// Schatten-Sichtbarkeit ueber Licht-Kugel- statt Kamera-Frustum-Kullung: ein Chunk gilt als
-    /// schatten-relevant, wenn seine AABB IRGENDEINE aktive Kaskaden-Kugel schneidet - unabhaengig
-    /// davon, ob er gerade im Kamera-Frustum liegt. Das entkoppelt die Schatten-Geometrie von der
-    /// Blickrichtung: reines Umschauen (ohne Bewegung) aendert die Kaskaden-Kugeln kaum, also bleibt
-    /// auch die Schatten-Geometrie stabil - vorher fuehrte dieselbe Menge wie beim Opaque-Pass dazu,
-    /// dass Schatten-Geometrie bei jeder Drehung rein/raus poppte ("Schatten springen").
+    /// schatten-relevant, wenn seine AABB IRGENDEINE aktive (um ihren Slack aufgeblaehte)
+    /// Kaskaden-Kugel schneidet. Der Voll-Scan + Indirect-Buffer-Reupload laeuft NUR, wenn sich die
+    /// Chunk-Menge geaendert hat oder eine Kaskaden-Kugel weiter als ihren Slack gewandert ist -
+    /// dazwischen bleibt die zuletzt hochgeladene (dank Aufblaehung garantiert vollstaendige)
+    /// Obermenge einfach stehen, der Main-Thread fasst pro Frame keinen einzigen Chunk an.
     fn update_shadow_visibility(
         &mut self,
         cascades: &[Cascade; MAX_SHADOW_CASCADES],
@@ -459,24 +483,38 @@ impl ChunkManager {
     ) {
         let active = &cascades[..cascade_count as usize];
 
-        self.shadow_visible_coords_scratch.clear();
-        self.shadow_visible_coords_scratch.par_extend(self.loaded.par_iter().filter_map(|(coord, loaded)| {
+        let cascades_stable = cascade_count == self.shadow_last_cascade_count
+            && active.iter().enumerate().all(|(i, c)| {
+                let (last_center, last_radius) = self.shadow_last_cascades[i];
+                let slack = shadow_cascade_slack(last_radius);
+                (c.radius - last_radius).abs() < 1.0 && c.center.distance_squared(last_center) < slack * slack
+            });
+        if cascades_stable && !self.shadow_set_dirty {
+            return;
+        }
+
+        self.shadow_visible_handles.clear();
+        for (coord, loaded) in self.loaded.iter() {
             if loaded.is_empty {
-                return None;
+                continue;
             }
             let min = chunk_origin(*coord);
             let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
-            active.iter().any(|c| sphere_intersects_aabb(c.center, c.radius, min, max)).then_some(*coord)
-        }));
-
-        self.shadow_visible_handles.clear();
-        for coord in &self.shadow_visible_coords_scratch {
-            if let Some(loaded) = self.loaded.get(coord) {
-                self.shadow_visible_handles.push((loaded.gpu_handle, chunk_origin(*coord)));
+            let relevant = active
+                .iter()
+                .any(|c| sphere_intersects_aabb(c.center, c.radius + shadow_cascade_slack(c.radius), min, max));
+            if relevant {
+                self.shadow_visible_handles.push((loaded.gpu_handle, min));
             }
         }
 
         renderer.set_shadow_visible(queue, &self.shadow_visible_handles);
+
+        for (i, c) in active.iter().enumerate() {
+            self.shadow_last_cascades[i] = (c.center, c.radius);
+        }
+        self.shadow_last_cascade_count = cascade_count;
+        self.shadow_set_dirty = false;
     }
 
     /// Soft-Cancellation: Ein auf dem Rayon-Thread fertiggestellter Chunk wird verworfen, wenn die
@@ -484,21 +522,14 @@ impl ChunkManager {
     /// nicht mehr innerhalb der Render-Distanz liegt - so entsteht kein unnoetiger GPU-Upload fuer
     /// Chunks, die im selben Frame wieder entladen wuerden.
     ///
-    /// Gedeckelt auf `max_chunk_uploads_per_frame`: ohne Limit drainte diese Schleife bei einem
-    /// grossen Backlog (z.B. 21k fertige Chunks kurz nach dem Welt-Start) alle wartenden Ergebnisse
-    /// in einem einzigen Frame - jedes davon mit `alloc_chunk`-Bufferschreibvorgaengen ueber 6
-    /// Richtungs-Arenen. Das war die Ursache der Mehrsekunden-Freezes; nicht abgeholte Ergebnisse
-    /// bleiben einfach im Channel und werden im naechsten Frame weiterverarbeitet.
+    /// Gedeckelt auf `max_chunk_uploads_per_frame` - nicht abgeholte Ergebnisse bleiben im Channel
+    /// und werden im naechsten Frame weiterverarbeitet.
     fn apply_completed_generations(&mut self, center: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         for _ in 0..self.max_chunk_uploads_per_frame {
             let Ok(result) = self.result_rx.try_recv() else { break };
             self.in_flight.remove(&result.coord);
 
-            let still_in_range = (result.coord.0 - center.0).abs() <= self.render_distance_chunks
-                && (result.coord.1 - center.1).abs() <= self.vertical_render_distance_chunks
-                && (result.coord.2 - center.2).abs() <= self.render_distance_chunks;
-
-            if !still_in_range {
+            if !self.in_window(result.coord, center) {
                 self.pool[result.pool_slot] = Some(result.chunk);
                 self.pool_free_list.push(result.pool_slot);
                 continue;
@@ -524,6 +555,9 @@ impl ChunkManager {
                     queued_for_unload: false,
                 },
             );
+            if !result.is_empty {
+                self.shadow_set_dirty = true;
+            }
         }
     }
 
@@ -535,10 +569,53 @@ impl ChunkManager {
         renderer.free_chunk(&loaded.gpu_handle);
         renderer.clear_chunk_meta(queue, loaded.pool_slot);
 
-        if let Some(mut chunk) = self.pool[loaded.pool_slot].take() {
-            chunk.clear();
-            self.pool[loaded.pool_slot] = Some(chunk);
-        }
+        // Kein `chunk.clear()` hier: `generate_chunk` beginnt selbst mit `clear()`, und zwischen
+        // Freigabe und Neuvergabe liest niemand den Pool-Slot (`is_solid_at` prueft `loaded`
+        // zuerst) - das memset (64 KiB * bis zu 192 Unloads/Frame = 12 MB) war reine Verschwendung.
         self.pool_free_list.push(loaded.pool_slot);
+        if !loaded.is_empty {
+            self.shadow_set_dirty = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_world_coords_convert_correctly() {
+        let (coord, local) = chunk_and_local(33, 5, 65);
+        assert_eq!(coord, (1, 0, 2));
+        assert_eq!(local, IVec3::new(1, 5, 1));
+    }
+
+    #[test]
+    fn negative_world_coords_floor_towards_negative_infinity() {
+        let (coord, local) = chunk_and_local(-1, -1, -33);
+        assert_eq!(coord, (-1, -1, -2));
+        assert_eq!(local, IVec3::new(31, 31, 31));
+    }
+
+    #[test]
+    fn chunk_origin_matches_chunk_coord_times_size() {
+        assert_eq!(chunk_origin((1, -1, 2)), glam::Vec3::new(32.0, -32.0, 64.0));
+    }
+
+    #[test]
+    fn coord_hasher_distributes_neighboring_coords() {
+        let mut seen = std::collections::HashSet::new();
+        for x in -8..8 {
+            for y in -8..8 {
+                for z in -8..8 {
+                    let mut hasher = CoordHasher::default();
+                    hasher.write_i32(x);
+                    hasher.write_i32(y);
+                    hasher.write_i32(z);
+                    seen.insert(hasher.finish());
+                }
+            }
+        }
+        assert_eq!(seen.len(), 16 * 16 * 16, "CoordHasher kollidiert auf benachbarten Koordinaten");
     }
 }

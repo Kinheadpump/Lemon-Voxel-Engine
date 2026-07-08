@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wgpu::util::{BufferInitDescriptor, DeviceExt, DrawIndirectArgs};
 
@@ -61,24 +62,33 @@ impl SubAllocator {
         None
     }
 
+    /// In-Place-Koaleszenz nur mit den beiden direkten Nachbarn der (sortierten) Einfuegeposition -
+    /// mehr kann ein einzelner freigegebener Block nie verschmelzen. Die fruehere Variante baute
+    /// die komplette Free-List pro Freigabe in einen FRISCH allozierten Vec um: bis zu 6 Heap-
+    /// Allokationen pro entladenem Chunk, ~1150/Frame beim gedeckelten Entladen einer Chunk-Ebene.
     fn free_region(&mut self, offset: u32, size: u32) {
         if size == 0 {
             return;
         }
         let insert = self.free.partition_point(|&(o, _)| o < offset);
-        self.free.insert(insert, (offset, size));
+        let merges_prev = insert > 0 && {
+            let (prev_offset, prev_size) = self.free[insert - 1];
+            prev_offset + prev_size == offset
+        };
+        let merges_next = insert < self.free.len() && offset + size == self.free[insert].0;
 
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.free.len());
-        for &(offset, size) in &self.free {
-            if let Some(last) = merged.last_mut() {
-                if last.0 + last.1 == offset {
-                    last.1 += size;
-                    continue;
-                }
+        match (merges_prev, merges_next) {
+            (true, true) => {
+                self.free[insert - 1].1 += size + self.free[insert].1;
+                self.free.remove(insert);
             }
-            merged.push((offset, size));
+            (true, false) => self.free[insert - 1].1 += size,
+            (false, true) => {
+                self.free[insert].0 = offset;
+                self.free[insert].1 += size;
+            }
+            (false, false) => self.free.insert(insert, (offset, size)),
         }
-        self.free = merged;
     }
 }
 
@@ -105,7 +115,9 @@ struct DirectionArena {
 
 struct StatsSlot {
     buffer: wgpu::Buffer,
-    ready: Arc<Mutex<bool>>,
+    /// `AtomicBool` statt `Mutex<bool>`: wird vom wgpu-Callback-Thread gesetzt und vom Main-Thread
+    /// pro Frame gepollt - ein einzelnes Flag braucht keinen Lock (Main-Thread darf nie blockieren).
+    ready: Arc<AtomicBool>,
     busy: bool,
 }
 
@@ -265,7 +277,7 @@ impl ChunkRenderer {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
-            ready: Arc::new(Mutex::new(false)),
+            ready: Arc::new(AtomicBool::new(false)),
             busy: false,
         });
 
@@ -628,7 +640,7 @@ impl ChunkRenderer {
             let ready = Arc::clone(&slot.ready);
             slot.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
                 if result.is_ok() {
-                    *ready.lock().unwrap() = true;
+                    ready.store(true, Ordering::Release);
                 }
             });
         }
@@ -636,8 +648,7 @@ impl ChunkRenderer {
         device.poll(wgpu::PollType::Poll).ok();
 
         for slot in &mut self.stats_slots {
-            let is_ready = *slot.ready.lock().unwrap();
-            if !is_ready {
+            if !slot.ready.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -648,7 +659,7 @@ impl ChunkRenderer {
                 counters
             };
             slot.buffer.unmap();
-            *slot.ready.lock().unwrap() = false;
+            slot.ready.store(false, Ordering::Release);
             slot.busy = false;
 
             self.last_draw_count = counters.iter().sum();
@@ -674,5 +685,55 @@ impl ChunkRenderer {
     /// Rueckstand (asynchroner Readback, s. `after_submit`) - fuers HUD.
     pub fn draw_call_count(&self) -> u32 {
         self.last_draw_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubAllocator;
+
+    #[test]
+    fn suballocator_reuses_freed_region() {
+        let mut alloc = SubAllocator::new(100);
+        let a = alloc.alloc(40).unwrap();
+        let b = alloc.alloc(40).unwrap();
+        assert_ne!(a, b);
+        alloc.free_region(a, 40);
+        assert_eq!(alloc.alloc(40).unwrap(), a);
+    }
+
+    #[test]
+    fn suballocator_merges_with_previous_and_next_neighbor() {
+        let mut alloc = SubAllocator::new(100);
+        let a = alloc.alloc(30).unwrap();
+        let b = alloc.alloc(30).unwrap();
+        let c = alloc.alloc(30).unwrap();
+        assert_eq!((a, b, c), (0, 30, 60));
+
+        // Freigabe-Reihenfolge a, c, dann b: b muss mit BEIDEN Nachbarn und dem Rest-Freiblock zu
+        // einem einzigen 100er-Block verschmelzen.
+        alloc.free_region(a, 30);
+        alloc.free_region(c, 30);
+        alloc.free_region(b, 30);
+        assert_eq!(alloc.free.len(), 1);
+        assert_eq!(alloc.free[0], (0, 100));
+    }
+
+    #[test]
+    fn suballocator_exhaustion_returns_none_and_recovers() {
+        let mut alloc = SubAllocator::new(10);
+        let a = alloc.alloc(10).unwrap();
+        assert!(alloc.alloc(1).is_none());
+        alloc.free_region(a, 10);
+        assert_eq!(alloc.alloc(10), Some(0));
+    }
+
+    #[test]
+    fn suballocator_zero_size_is_noop() {
+        let mut alloc = SubAllocator::new(10);
+        assert_eq!(alloc.alloc(0), Some(0));
+        alloc.free_region(5, 0);
+        assert_eq!(alloc.free.len(), 1);
+        assert_eq!(alloc.free[0], (0, 10));
     }
 }

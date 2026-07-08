@@ -239,47 +239,42 @@ impl ApplicationHandler for App {
                     gpu.upload_godrays(instances);
                 }
 
-                let queue = gpu.queue().clone();
+                {
+                    let (queue, renderer) = gpu.queue_and_renderer();
 
-                if self.input.take_mine_requested() {
-                    if let Some(hit) =
-                        self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
-                    {
-                        self.chunk_manager.set_block(
-                            hit.block.x,
-                            hit.block.y,
-                            hit.block.z,
-                            0,
-                            &queue,
-                            &mut gpu.renderer,
-                        );
-                    }
-                }
-                if self.input.take_place_requested() {
-                    if let Some(hit) =
-                        self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
-                    {
-                        let target = hit.block + hit.normal;
-                        if !self.physics.occupies_block(self.camera.position, target) {
-                            self.chunk_manager.set_block(
-                                target.x,
-                                target.y,
-                                target.z,
-                                PLACE_BLOCK_ID,
-                                &queue,
-                                &mut gpu.renderer,
-                            );
+                    if self.input.take_mine_requested() {
+                        if let Some(hit) =
+                            self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                        {
+                            self.chunk_manager.set_block(hit.block.x, hit.block.y, hit.block.z, 0, queue, renderer);
                         }
                     }
-                }
+                    if self.input.take_place_requested() {
+                        if let Some(hit) =
+                            self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                        {
+                            let target = hit.block + hit.normal;
+                            if !self.physics.occupies_block(self.camera.position, target) {
+                                self.chunk_manager.set_block(
+                                    target.x,
+                                    target.y,
+                                    target.z,
+                                    PLACE_BLOCK_ID,
+                                    queue,
+                                    renderer,
+                                );
+                            }
+                        }
+                    }
 
-                self.chunk_manager.update(
-                    self.camera.position,
-                    &cascades,
-                    self.config.shadow_cascade_count,
-                    &queue,
-                    &mut gpu.renderer,
-                );
+                    self.chunk_manager.update(
+                        self.camera.position,
+                        &cascades,
+                        self.config.shadow_cascade_count,
+                        queue,
+                        renderer,
+                    );
+                }
 
                 let mode_text = if self.physics.flying {
                     "FLYING"

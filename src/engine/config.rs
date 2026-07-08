@@ -205,7 +205,51 @@ impl Default for EngineConfig {
     }
 }
 
+/// Sicherheitsobergrenze fuer den aus der Render-Distanz abgeleiteten Chunk-Pool - verhindert, dass
+/// eine extreme Kombination aus horizontaler UND vertikaler Render-Distanz beim Start unbemerkt
+/// mehrere GB RAM alloziert. 65536 Chunks * 64 KiB = 4 GiB.
+pub const CHUNK_POOL_SAFETY_CAP: usize = 65_536;
+
+/// `(2*render_distance+1)^2 * (2*vertical_render_distance+1)` - die Anzahl Chunks, die gleichzeitig
+/// innerhalb des Ladefensters liegen koennen.
+fn required_chunk_pool_size(render_distance_chunks: i32, vertical_render_distance_chunks: i32) -> usize {
+    let horizontal_span = 2 * render_distance_chunks as i64 + 1;
+    let vertical_span = 2 * vertical_render_distance_chunks as i64 + 1;
+    (horizontal_span * horizontal_span * vertical_span) as usize
+}
+
 impl EngineConfig {
+    /// Leitet die voneinander abhaengigen Kapazitaeten EINMAL zentral ab - ALLE Konsumenten
+    /// (`ChunkManager`-Pool, `ChunkRenderer`-Buffer wie `chunk_meta_buffer`/Indirect/ChunkData,
+    /// Cull-Dispatch-Grenze) lesen danach dieselben normalisierten Werte. Vorher skalierte der
+    /// `ChunkManager` seinen Pool intern hoch, waehrend die Renderer-Buffer auf dem rohen
+    /// Config-Wert blieben - `update_chunk_meta` schrieb dann bei hoher Render-Distanz hinter das
+    /// Buffer-Ende (Pool-Slot-Index >= Buffer-Kapazitaet).
+    ///
+    /// - `chunk_pool_size`: mindestens das Ladevolumen der Render-Distanz (Config-Wert ist
+    ///   Untergrenze, nie Obergrenze), gedeckelt auf `CHUNK_POOL_SAFETY_CAP`.
+    /// - `max_draws_per_direction`: mindestens `chunk_pool_size` - der GPU-Cull-Pass kompaktiert
+    ///   bis zu ALLE Pool-Slots in die Indirect-Buffer; ein kleinerer Wert liess bei hoher
+    ///   Render-Distanz sichtbare Chunks kommentarlos aus dem Draw fallen ("kuenstlich limitierte
+    ///   Sichtweite"). Kostet 2*16 Byte pro Slot ueber 6 Richtungen - vernachlaessigbar.
+    fn normalized(mut self) -> Self {
+        let required = required_chunk_pool_size(self.render_distance_chunks, self.vertical_render_distance_chunks);
+        if required > CHUNK_POOL_SAFETY_CAP {
+            log::warn!(
+                "Render-Distanz {}x{} braeuchte {} Chunk-Pool-Slots, gedeckelt auf {} ({} GiB RAM) - \
+                 Chunks am Rand der Render-Distanz werden nicht geladen",
+                self.render_distance_chunks,
+                self.vertical_render_distance_chunks,
+                required,
+                CHUNK_POOL_SAFETY_CAP,
+                CHUNK_POOL_SAFETY_CAP * 64 / 1024 / 1024,
+            );
+        }
+        self.chunk_pool_size = self.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
+        self.max_draws_per_direction = self.max_draws_per_direction.max(self.chunk_pool_size);
+        self
+    }
+
     /// Laedt die Konfiguration aus `config.toml`. Existiert die Datei nicht, wird sie mit den
     /// Default-Werten erzeugt, damit der Nutzer eine editierbare Vorlage erhaelt. Bei Parse-Fehlern
     /// wird geloggt und auf Defaults zurueckgefallen, statt abzustuerzen.
@@ -220,7 +264,7 @@ impl EngineConfig {
                 }
                 Err(error) => {
                     log::error!("Konfiguration {} fehlerhaft ({error}) - nutze Defaults", path.display());
-                    Self::default()
+                    Self::default().normalized()
                 }
             },
             Err(_) => {
@@ -236,7 +280,7 @@ impl EngineConfig {
                     }
                     Err(error) => log::warn!("Konnte Konfiguration nicht serialisieren: {error}"),
                 }
-                default
+                default.normalized()
             }
         }
     }
@@ -487,5 +531,6 @@ impl From<ConfigFile> for EngineConfig {
             max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),
             max_chunk_unloads_per_frame: f.max_chunk_unloads_per_frame.max(1),
         }
+        .normalized()
     }
 }
