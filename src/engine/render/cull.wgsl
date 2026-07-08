@@ -14,7 +14,18 @@ struct CullUniform {
     view_proj: mat4x4<f32>,
     screen_size: vec4<f32>,
     counts: vec4<u32>,
+    camera_pos: vec4<f32>,
 };
+
+/// Kamera-nahe Chunks (eigener Chunk + direkte Nachbarn) ueberspringen den HZB-Occlusion-Test
+/// komplett - s. Kommentar an `CullUniformData::camera_pos`. Weltblock-Einheiten; deckt bewusst
+/// mehr als nur die eigene Chunk-AABB ab, da die relevante Gefahr (Kamera dicht an/in Geometrie)
+/// nicht an Chunk-Grenzen halt macht.
+const OCCLUSION_TEST_SKIP_RADIUS: f32 = 48.0;
+
+fn closest_point_on_aabb(point: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec3<f32> {
+    return clamp(point, box_min, box_max);
+}
 
 struct DrawIndirectArgs {
     vertex_count: u32,
@@ -140,7 +151,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if frustum_culled(box_min, box_max) {
         return;
     }
-    if occlusion_culled(box_min, box_max) {
+
+    let closest = closest_point_on_aabb(cull.camera_pos.xyz, box_min, box_max);
+    let near_camera = distance(closest, cull.camera_pos.xyz) < OCCLUSION_TEST_SKIP_RADIUS;
+    if !near_camera && occlusion_culled(box_min, box_max) {
         return;
     }
 

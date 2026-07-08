@@ -9,6 +9,14 @@ pub struct CullUniformData {
     /// kombinierten ChunkData-Buffers pro Richtung (auf `min_storage_buffer_offset_alignment`
     /// aufgerundet, s. `renderer.rs` - deshalb ein EIGENER Stride statt `x`).
     pub counts: [u32; 4],
+    /// xyz = aktuelle Kamera-Position, w ungenutzt. Der HZB stammt aus dem VORHERIGEN Frame, der
+    /// Occlusion-Test projiziert Chunk-AABBs aber mit der Kamera-Matrix DIESES Frames dagegen (s.
+    /// Kommentar an `occlusion_culled` in cull.wgsl) - bei schneller Kamerarotation oder wenn die
+    /// Kamera nah an/in Geometrie steckt (z.B. in einer Hoehle), kann der Bildschirm letztes Frame
+    /// fast vollstaendig mit naher Tiefe gefuellt gewesen sein, was diesen Frame faelschlich ALLES
+    /// als verdeckt einstuft. `camera_pos` erlaubt dem Shader, den Occlusion-Test fuer kamera-nahe
+    /// Chunks zu ueberspringen (nur noch Frustum-Test, immer exakt) statt ihm blind zu vertrauen.
+    pub camera_pos: [f32; 4],
 }
 
 /// Ein Eintrag pro Chunk-Pool-Slot - Index in `chunk_meta_buffer` IST der `pool_slot` aus

@@ -91,9 +91,6 @@ pub struct EngineConfig {
     pub terrain_cave_frequency: f32,
     /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) werden zu Hoehlen.
     pub terrain_cave_threshold: f32,
-    /// Rasterabstand (in Bloecken) des sparse ausgewerteten 3D-Hoehlendichterasters - dazwischen
-    /// wird trilinear interpoliert. Muss `CHUNK_SIZE` (32) teilen, Mindestwert 2.
-    pub terrain_cave_sample_stride: i32,
     pub terrain_dirt_layer_depth: i32,
     pub terrain_noise_origin_offset: f32,
 
@@ -178,7 +175,6 @@ impl Default for EngineConfig {
             terrain_sea_compression_exponent: 2.2,
             terrain_cave_frequency: 0.05,
             terrain_cave_threshold: 0.6,
-            terrain_cave_sample_stride: 4,
             terrain_dirt_layer_depth: 3,
             terrain_noise_origin_offset: 10_000.0,
 
@@ -309,7 +305,6 @@ struct ConfigFile {
     terrain_sea_compression_exponent: f32,
     terrain_cave_frequency: f32,
     terrain_cave_threshold: f32,
-    terrain_cave_sample_stride: i32,
     terrain_dirt_layer_depth: i32,
     terrain_noise_origin_offset: f32,
 
@@ -394,7 +389,6 @@ impl From<EngineConfig> for ConfigFile {
             terrain_sea_compression_exponent: c.terrain_sea_compression_exponent,
             terrain_cave_frequency: c.terrain_cave_frequency,
             terrain_cave_threshold: c.terrain_cave_threshold,
-            terrain_cave_sample_stride: c.terrain_cave_sample_stride,
             terrain_dirt_layer_depth: c.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: c.terrain_noise_origin_offset,
 
@@ -475,7 +469,6 @@ impl From<ConfigFile> for EngineConfig {
             terrain_sea_compression_exponent: f.terrain_sea_compression_exponent.max(1.0),
             terrain_cave_frequency: f.terrain_cave_frequency,
             terrain_cave_threshold: f.terrain_cave_threshold,
-            terrain_cave_sample_stride: f.terrain_cave_sample_stride.clamp(2, 16),
             terrain_dirt_layer_depth: f.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: f.terrain_noise_origin_offset,
 

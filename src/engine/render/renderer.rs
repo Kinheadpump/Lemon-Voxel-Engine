@@ -237,6 +237,7 @@ impl ChunkRenderer {
                 view_proj: initial_view_proj.to_cols_array_2d(),
                 screen_size: [1.0, 1.0, 0.0, 0.0],
                 counts: [max_draws_per_direction as u32, chunk_pool_size as u32, 1, chunk_data_dir_stride_elems],
+                camera_pos: [0.0, 0.0, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -573,7 +574,14 @@ impl ChunkRenderer {
     /// Ersetzt die vormals CPU-seitige `par_iter`-Frustum-Kullung des Opaque-Passes vollstaendig -
     /// die kompaktierten Indirect-Argumente landen direkt in `combined_indirect_buffer`, ohne dass
     /// die CPU die sichtbare Menge je zu Gesicht bekommt.
-    pub fn dispatch_cull(&mut self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, view_proj: glam::Mat4, hzb: &HzbPass) {
+    pub fn dispatch_cull(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        view_proj: glam::Mat4,
+        camera_pos: glam::Vec3,
+        hzb: &HzbPass,
+    ) {
         let Some(bind_group) = &self.cull_bind_group else {
             return;
         };
@@ -588,6 +596,7 @@ impl ChunkRenderer {
                 hzb.mip_count(),
                 self.chunk_data_dir_stride_elems,
             ],
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
         };
         queue.write_buffer(&self.cull_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 

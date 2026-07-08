@@ -370,7 +370,7 @@ impl GpuContext {
         // GPU-Driven Frustum+Occlusion-Culling fuer DIESES Frame (s. `hzb.rs`/`cull.wgsl`) - beide
         // MUESSEN vor dem Opaque-Pass laufen, der `depth_view` gleich ueberschreibt.
         self.hzb.generate(&mut encoder);
-        self.renderer.dispatch_cull(&mut encoder, &self.queue, self.last_view_proj, &self.hzb);
+        self.renderer.dispatch_cull(&mut encoder, &self.queue, self.last_view_proj, self.last_camera_pos, &self.hzb);
         self.renderer.record_stats_copy(&mut encoder);
 
         self.shadow_pass.render_cascades(

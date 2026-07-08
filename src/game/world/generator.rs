@@ -8,7 +8,6 @@ use crate::engine::config::EngineConfig;
 
 use super::blocks;
 use super::chunk::{CHUNK_SIZE, Chunk};
-use super::terrain_grid::CaveGrid;
 
 /// Fixe Meereshoehe - keine Konfigurationsoption, sondern eine architektonische Festlegung: alle
 /// Shaping-Funktionen (See-Kompression, Straende) sind relativ zu `y=0` formuliert.
@@ -33,15 +32,6 @@ fn signed_pow(value: f32, exponent: f32) -> f32 {
 #[inline(always)]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
-}
-
-/// Ob `local` auf der aeussersten Schicht eines Chunks liegt (Face-Ebene, die an einen Nachbar-Chunk
-/// grenzt). Das `CaveGrid`-Dichteraster wird dort IMMER exakt statt interpoliert ausgewertet, damit
-/// es mit der exakten `is_solid`-Fallback-Vorhersage uebereinstimmt, die ein noch nicht geladener
-/// Nachbar-Chunk fuer diese Voxel verwenden wuerde.
-#[inline(always)]
-fn is_chunk_edge(local: i32) -> bool {
-    local == 0 || local == CHUNK_SIZE - 1
 }
 
 /// Direkt-gemapptes Memo fuer `TerrainGenerator::height_at` - Potenz von 2, damit der Slot-Index
@@ -87,7 +77,6 @@ pub struct TerrainGenerator {
     cave: Noise<common_noise::Perlin>,
     cave_frequency: f32,
     cave_threshold: f32,
-    cave_sample_stride: i32,
     dirt_layer_depth: i32,
     /// Die Ursprungszelle des `noiz`-Gradientenrauschens (Welt-Koordinaten nahe (0,0)) ist
     /// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
@@ -127,7 +116,6 @@ impl TerrainGenerator {
             cave,
             cave_frequency: config.terrain_cave_frequency,
             cave_threshold: config.terrain_cave_threshold,
-            cave_sample_stride: config.terrain_cave_sample_stride,
             dirt_layer_depth: config.terrain_dirt_layer_depth,
             noise_origin_offset: config.terrain_noise_origin_offset,
         }
@@ -213,15 +201,20 @@ impl TerrainGenerator {
         world_y <= self.height_at(world_x, world_z) && !self.is_cave(world_x, world_y, world_z)
     }
 
-    /// Die Hoehenkarte wird IMMER exakt (nicht interpoliert) berechnet - anders als das
-    /// `CaveGrid`-Dichteraster unten kann sie nicht sparse+interpoliert sein: Hoehe haengt nicht von
-    /// Y ab, also gehoert JEDE Saeule gleichzeitig zur Ober- UND Unterkante des Chunks (dort grenzt
-    /// sie an einen vertikalen Nachbarn, der im asynchronen Generierungs-Pfad IMMER ueber den
-    /// exakten `is_solid`/`height_at`-Fallback vorhergesagt wird, nie ueber echte Nachbar-Chunk-
-    /// Daten - s. `ChunkManager::dispatch_pending`). Ein interpoliertes Innen/exaktes-Rand-Schema wie
-    /// beim Hoehlenraster wuerde hier auf die volle 32x32-Flaeche entarten - keine Ersparnis, aber
-    /// die Fehlerquelle fuer dauerhafte Luecken an jeder Ober-/Unterkante. `raw_height_at` selbst ist
-    /// mit 4 Rauschproben guenstig genug, dass Interpolation hier keinen messbaren Vorteil brachte.
+    /// Hoehenkarte UND Hoehlendichte werden IMMER exakt (nicht interpoliert) berechnet. Grund fuer
+    /// die Hoehe: sie haengt nicht von Y ab, also gehoert JEDE Saeule gleichzeitig zur Ober- UND
+    /// Unterkante des Chunks - ein interpoliertes Innen/exaktes-Rand-Schema wuerde auf die volle
+    /// 32x32-Flaeche entarten. Grund fuer die Hoehlendichte: anders als bei der Heightmap reicht ein
+    /// exakter RAND nicht aus. Waehrend ein Chunk noch generiert wird, beantwortet
+    /// `ChunkManager::is_solid_at` Kollisionsabfragen (Physik, Raycast) fuer ihn ueber den exakten
+    /// `is_solid`-Fallback - bewegt sich der Spieler durch diesen Bereich, WAEHREND der Chunk laedt
+    /// (bei schneller Bewegung der Normalfall), und der Chunk generiert danach interpoliert vom
+    /// exakten Fallback abweichende Werte, materialisiert ploetzlich Fels an einer Position, die dem
+    /// Spieler eben noch als Luft galt (oder umgekehrt) - "im Boden stecken bleiben"/inkonsistente
+    /// Kollision. Die Iso-Flaeche eines Schwellwert-Cutoffs (Hoehlenwand) ist dabei die
+    /// wahrscheinlichste Stelle, an der ein Spieler ueberhaupt steht. `cave_density` ist mit einer
+    /// Rauschprobe (~25ns) guenstig genug, dass Interpolation auch hier keinen messbaren Vorteil
+    /// brachte, der das Risiko rechtfertigt.
     pub fn generate_chunk(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
         chunk.clear();
 
@@ -240,14 +233,10 @@ impl TerrainGenerator {
         }
 
         // Chunk liegt vollstaendig ueber der Terrainoberflaeche - reine Luft, `chunk.clear()` oben
-        // reicht bereits. Spart das gesamte 3D-Hoehlenraster (teuerster Teil der Generierung).
+        // reicht bereits. Spart die komplette Hoehlen-Auswertung.
         if chunk_origin_y > chunk_max_height {
             return;
         }
-
-        let cave_grid = CaveGrid::fill(self.cave_sample_stride, chunk_origin_y, |local_x, world_y, local_z| {
-            self.cave_density(chunk_origin_x + local_x, world_y, chunk_origin_z + local_z)
-        });
 
         let height_lookup = |local_x: i32, local_z: i32| -> i32 {
             if (0..CHUNK_SIZE).contains(&local_x) && (0..CHUNK_SIZE).contains(&local_z) {
@@ -280,15 +269,10 @@ impl TerrainGenerator {
                     }
 
                     let depth_from_surface = height - world_y;
-                    if depth_from_surface >= MIN_CAVE_DEPTH {
-                        let cave_value = if is_chunk_edge(local_x) || is_chunk_edge(local_y) || is_chunk_edge(local_z) {
-                            self.cave_density(chunk_origin_x + local_x, world_y, chunk_origin_z + local_z)
-                        } else {
-                            cave_grid.sample(local_x, local_y, local_z)
-                        };
-                        if cave_value > self.cave_threshold {
-                            continue;
-                        }
+                    if depth_from_surface >= MIN_CAVE_DEPTH
+                        && self.cave_density(chunk_origin_x + local_x, world_y, chunk_origin_z + local_z) > self.cave_threshold
+                    {
+                        continue;
                     }
 
                     let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, is_beach);
@@ -304,13 +288,17 @@ mod tests {
     use super::*;
     use crate::engine::config::EngineConfig;
 
-    /// Der Mesher faellt an Chunk-Grenzen zu einem noch nicht geladenen Nachbarn auf
-    /// `TerrainGenerator::is_solid` zurueck. Diese Vorhersage MUSS mit dem uebereinstimmen, was der
-    /// Nachbar-Chunk tatsaechlich generiert, sobald er laedt - sonst entstehen dauerhafte
-    /// Luecken/Ueberlappungen an der Naht (niemand re-mesht den bereits geladenen Chunk). Prueft das
-    /// an mehreren Chunk-Grenzen inkl. vertikaler Stapelung (Hoehlen-Y-Schicht).
+    /// `TerrainGenerator::is_solid` ist die Vorhersage, auf die sowohl der Mesher (Nachbar-Check an
+    /// noch nicht geladenen Chunks) als auch `ChunkManager::is_solid_at` (Physik/Raycast waehrend
+    /// ein Chunk noch generiert) zurueckfallen. Hoehe UND Hoehlendichte werden in `generate_chunk`
+    /// bewusst nirgends interpoliert, genau damit diese Vorhersage IMMER exakt mit dem
+    /// uebereinstimmt, was tatsaechlich generiert wird - sonst entstehen dauerhafte Luecken an
+    /// Chunk-Naehten (niemand re-mesht spaeter) bzw. bewegt sich ein Spieler waehrend des Ladens
+    /// durch eine Stelle, an der sich die Vorhersage nachtraeglich als falsch herausstellt, bleibt er
+    /// im nachtraeglich materialisierten Fels stecken. Prueft deshalb ALLE 32768 Voxel (nicht nur den
+    /// Rand) ueber mehrere Chunk-Koordinaten inkl. vertikaler Stapelung.
     #[test]
-    fn is_solid_prediction_matches_neighbor_generation_at_chunk_borders() {
+    fn is_solid_prediction_matches_generated_blocks_everywhere() {
         let generator = TerrainGenerator::new(&EngineConfig::default());
 
         for &(chunk_x, chunk_y, chunk_z) in &[(0, 0, 0), (3, -2, -5), (-4, 1, 2), (7, 0, -1)] {
@@ -324,15 +312,12 @@ mod tests {
             for local_y in 0..CHUNK_SIZE {
                 for local_z in 0..CHUNK_SIZE {
                     for local_x in 0..CHUNK_SIZE {
-                        if !is_chunk_edge(local_x) && !is_chunk_edge(local_y) && !is_chunk_edge(local_z) {
-                            continue;
-                        }
                         let world = (origin_x + local_x, origin_y + local_y, origin_z + local_z);
                         let predicted = generator.is_solid(world.0, world.1, world.2);
                         let actual = chunk.get_block(local_x, local_y, local_z) != 0;
                         assert_eq!(
                             predicted, actual,
-                            "Rand-Voxel {world:?} in Chunk ({chunk_x},{chunk_y},{chunk_z}) lokal \
+                            "Voxel {world:?} in Chunk ({chunk_x},{chunk_y},{chunk_z}) lokal \
                              ({local_x},{local_y},{local_z}): is_solid-Vorhersage={predicted}, \
                              tatsaechlich generiert={actual}"
                         );

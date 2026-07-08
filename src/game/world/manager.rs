@@ -122,13 +122,49 @@ pub struct ChunkManager {
     max_chunk_unloads_per_frame: usize,
 }
 
+/// Sicherheitsobergrenze fuer den aus der Render-Distanz AUTOMATISCH abgeleiteten Pool - verhindert,
+/// dass eine extreme Kombination aus horizontaler UND vertikaler Render-Distanz (z.B. beide auf 32)
+/// beim Start unbemerkt mehrere GB RAM alloziert. 65536 Chunks * 64 KiB = 4 GiB, deckt jede in der
+/// Praxis sinnvolle Kombination ab. Ein EXPLIZIT in `config.toml` gesetzter `chunk_pool_size`-Wert
+/// wird davon nicht begrenzt - nur die implizite Ableitung.
+const CHUNK_POOL_SAFETY_CAP: usize = 65_536;
+
+/// `(2*render_distance_chunks+1)^2 * (2*vertical_render_distance_chunks+1)` - die Anzahl Chunks, die
+/// gleichzeitig innerhalb des Ladefensters liegen koennen.
+fn required_chunk_pool_size(render_distance_chunks: i32, vertical_render_distance_chunks: i32) -> usize {
+    let horizontal_span = 2 * render_distance_chunks as i64 + 1;
+    let vertical_span = 2 * vertical_render_distance_chunks as i64 + 1;
+    (horizontal_span * horizontal_span * vertical_span) as usize
+}
+
 impl ChunkManager {
-    /// Der Pool muss `(2*render_distance_chunks+1)^2 * (2*vertical_render_distance_chunks+1)`
-    /// Chunks abdecken, sonst werden Chunks am Rand der Render-Distanz stillschweigend nicht
-    /// geladen (siehe `chunk_pool_size`-Kommentar in `EngineConfig`). Jeder Chunk belegt 64 KiB RAM.
+    /// Der Pool muss `required_chunk_pool_size` Chunks abdecken, sonst werden Chunks am Rand der
+    /// Render-Distanz still NICHT geladen - und zwar nicht etwa gleichmaessig "kuerzer", sondern an
+    /// spatial ARBITRAEREN Stellen: `rebuild_load_window` iteriert die gewuenschte Menge ueber ein
+    /// `HashSet`, dessen Iterationsreihenfolge nichts mit raeumlicher Naehe zu tun hat - bei
+    /// Pool-Erschoepfung "gewinnen" zufaellige statt die naechstgelegenen Chunks. `chunk_pool_size`
+    /// aus der Config ist dabei ein MINDESTWERT (z.B. fuer Editier-Spielraum), keine Obergrenze -
+    /// der Pool wird immer mindestens auf die konfigurierte Render-Distanz hochskaliert. Jeder Chunk
+    /// belegt 64 KiB RAM.
     pub fn new(config: &EngineConfig) -> Self {
-        let pool = (0..config.chunk_pool_size).map(|_| Some(Chunk::empty())).collect();
-        let pool_free_list = (0..config.chunk_pool_size).collect();
+        let required = required_chunk_pool_size(config.render_distance_chunks, config.vertical_render_distance_chunks);
+        let pool_size = config.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
+        if required > CHUNK_POOL_SAFETY_CAP {
+            log::warn!(
+                "Render-Distanz {}x{} (horizontal x vertikal) bräuchte {} Chunk-Pool-Slots, das \
+                 überschreitet die Sicherheitsobergrenze von {} ({} MiB) - Chunks am Rand der \
+                 Render-Distanz werden nicht geladen. Render-Distanz reduzieren oder \
+                 chunk_pool_size explizit in config.toml über die Obergrenze hinaus setzen.",
+                config.render_distance_chunks,
+                config.vertical_render_distance_chunks,
+                required,
+                CHUNK_POOL_SAFETY_CAP,
+                CHUNK_POOL_SAFETY_CAP * 64 / 1024,
+            );
+        }
+
+        let pool = (0..pool_size).map(|_| Some(Chunk::empty())).collect();
+        let pool_free_list = (0..pool_size).collect();
         let (result_tx, result_rx) = channel();
 
         Self {
