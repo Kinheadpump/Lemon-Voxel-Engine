@@ -74,7 +74,7 @@ async fn render_top_down_green_ratio() -> f32 {
     let generator = TerrainGenerator::new(&config);
     let mut chunk = Chunk::empty();
     generator.generate_chunk(0, 0, 0, &mut chunk);
-    let mesh = mesh_chunk(&chunk, 0, 0, 0, |wx, wy, wz| generator.is_solid(wx, wy, wz));
+    let mesh = mesh_chunk(&chunk, 0, 0, 0, [None; 6], |wx, wy, wz| generator.is_solid(wx, wy, wz));
     renderer.update_camera(&queue, view_proj, eye, glam::Vec3::new(0.0, -1.0, 0.0));
     let handle = renderer.alloc_chunk(&queue, &mesh, glam::Vec3::ZERO);
     renderer.set_visible(&queue, &[handle]);

@@ -6,7 +6,7 @@ use glam::IVec3;
 use rayon::prelude::*;
 
 use crate::engine::config::EngineConfig;
-use crate::engine::core::mesher::{DirectionalMesh, mesh_chunk};
+use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk};
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 use crate::game::math::frustum::Frustum;
@@ -233,6 +233,21 @@ impl ChunkManager {
         true
     }
 
+    /// Loest fuer alle 6 Richtungen die tatsaechlich geladenen Nachbar-Chunk-Referenzen auf - EINMAL
+    /// vor dem Meshing statt einer HashMap-Lookup pro Rand-Voxel (bis zu 6144 pro Chunk). Nur im
+    /// synchronen Remesh-Pfad (Block-Editierung) sinnvoll/moeglich: hier lebt `&self` lange genug,
+    /// dass die Referenzen den kompletten `mesh_chunk`-Aufruf ueberleben. Der asynchrone
+    /// Rayon-Dispatch-Pfad (`dispatch_pending`) kann das NICHT nutzen - die Referenzen wuerden die
+    /// Thread-Grenze nicht ueberleben, und ein Kopieren ganzer 32-KiB-Nachbar-Chunks in die
+    /// Spawn-Closure waere teurer als die HashMap-Lookups, die es einsparen soll.
+    fn neighbor_chunk_refs(&self, coord: ChunkCoord) -> [Option<&Chunk>; 6] {
+        std::array::from_fn(|dir| {
+            let (ox, oy, oz) = NEIGHBOR_OFFSETS[dir];
+            let neighbor_coord = (coord.0 + ox, coord.1 + oy, coord.2 + oz);
+            self.loaded.get(&neighbor_coord).and_then(|loaded| self.pool[loaded.pool_slot].as_ref())
+        })
+    }
+
     fn remesh_chunk(&mut self, coord: ChunkCoord, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
         let Some(loaded) = self.loaded.get(&coord) else {
             return;
@@ -247,7 +262,8 @@ impl ChunkManager {
         let mesh = if is_empty {
             DirectionalMesh::default()
         } else {
-            mesh_chunk(chunk, coord.0, coord.1, coord.2, |world_x, world_y, world_z| {
+            let neighbors = self.neighbor_chunk_refs(coord);
+            mesh_chunk(chunk, coord.0, coord.1, coord.2, neighbors, |world_x, world_y, world_z| {
                 self.is_solid_at(world_x, world_y, world_z)
             })
         };
@@ -383,7 +399,11 @@ impl ChunkManager {
                 let mesh = if is_empty {
                     DirectionalMesh::default()
                 } else {
-                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, |world_x, world_y, world_z| {
+                    // Keine Nachbar-Referenzen moeglich (anderer Thread, s. Kommentar an
+                    // `ChunkManager::neighbor_chunk_refs`) - faellt auf die prozedurale
+                    // Welt-Vorhersage zurueck, was fuer frisch generierte Chunks ohnehin meist
+                    // zutrifft (Nachbarn sind beim initialen Laden haeufig noch nicht fertig).
+                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, [None; 6], |world_x, world_y, world_z| {
                         generator.is_solid(world_x, world_y, world_z)
                     })
                 };

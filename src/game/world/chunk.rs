@@ -1,5 +1,8 @@
 pub const CHUNK_SIZE: i32 = 32;
 pub const CHUNK_VOLUME: usize = 32 * 32 * 32;
+/// log2(CHUNK_SIZE) - CHUNK_SIZE ist eine Zweierpotenz, die Flat-Array-Indizierung nutzt deshalb
+/// zwingend Bitshifts statt Multiplikation/Division/Modulo.
+const CHUNK_SHIFT: u32 = 5;
 
 pub struct Chunk {
     pub blocks: [u16; CHUNK_VOLUME],
@@ -23,15 +26,16 @@ impl Chunk {
 
     #[inline(always)]
     pub const fn index_from_pos(x: u32, y: u32, z: u32) -> usize {
-        (x + y * 32 + z * 1024) as usize
+        (x + (y << CHUNK_SHIFT) + (z << (CHUNK_SHIFT * 2))) as usize
     }
 
     #[inline(always)]
     pub const fn pos_from_index(index: usize) -> (u32, u32, u32) {
         let index = index as u32;
-        let x = index % 32;
-        let y = (index / 32) % 32;
-        let z = index / 1024;
+        let mask = (1u32 << CHUNK_SHIFT) - 1;
+        let x = index & mask;
+        let y = (index >> CHUNK_SHIFT) & mask;
+        let z = index >> (CHUNK_SHIFT * 2);
         (x, y, z)
     }
 
