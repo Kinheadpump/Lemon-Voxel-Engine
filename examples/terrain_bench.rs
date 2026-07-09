@@ -66,19 +66,25 @@ fn main() {
     let config = EngineConfig::default();
     let generator = TerrainGenerator::new(&config);
 
+    // (23, -10, -17) per `examples/tunnel_diagnostic.rs` als dichtestes bekanntes Tunnelgebiet
+    // identifiziert (11.5% Luft/Hoehlen) - realistischer Tunnel-Worst-Case statt reinem Zufallstreffer.
     println!("-- reine Generierung --");
     let surface_us = bench_generate("Oberflaeche (chunk_y=0)", &generator, 4, 0, 4);
     let underground_us = bench_generate("Tiefe (chunk_y=-5)", &generator, 4, -5, 4);
     let sky_us = bench_generate("Himmel (chunk_y=20)", &generator, 4, 20, 4);
+    let tunnel_us = bench_generate("Tunnelgebiet (chunk_y=-10)", &generator, 23, -10, -17);
 
     println!("-- Generierung + Meshing, IMMER mit is_solid-Fallback (realistischer Lade-Pfad) --");
     let surface_mesh_us = bench_generate_and_mesh("Oberflaeche+Mesh (chunk_y=0)", &generator, 4, 0, 4);
     let underground_mesh_us = bench_generate_and_mesh("Tiefe+Mesh (chunk_y=-5)", &generator, 4, -5, 4);
+    let tunnel_mesh_us = bench_generate_and_mesh("Tunnelgebiet+Mesh (chunk_y=-10)", &generator, 23, -10, -17);
 
     let target_met = surface_us < 2000.0
         && underground_us < 2000.0
         && sky_us < 2000.0
+        && tunnel_us < 2000.0
         && surface_mesh_us < 2000.0
-        && underground_mesh_us < 2000.0;
+        && underground_mesh_us < 2000.0
+        && tunnel_mesh_us < 2000.0;
     println!("Ziel <2ms/Chunk: {}", if target_met { "ERREICHT" } else { "VERFEHLT" });
 }

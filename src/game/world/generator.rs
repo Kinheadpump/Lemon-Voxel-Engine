@@ -1,13 +1,21 @@
 use std::cell::RefCell;
 
 use bevy_math::{Vec2, Vec3};
-use noiz::Noise;
+use noiz::cell_noise::WorleyDifference;
+use noiz::{Noise, NoiseFunction};
 use noiz::prelude::*;
 
 use crate::engine::config::EngineConfig;
 
 use super::blocks;
 use super::chunk::{CHUNK_SIZE, Chunk};
+
+/// `WorleyDifference` liefert die unorm-Differenz zwischen der 1. und 2. naechsten Zellpunkt-
+/// Distanz - nahe 0 heisst "genau auf der Voronoi-Zellgrenze". Zellgrenzen bilden ein
+/// zusammenhaengendes Graph-Netzwerk, das den gesamten Raum durchzieht (anders als Zellzentren, die
+/// nur isolierte Punkte sind) - genau das ergibt bei einem Schwellwert-Cutoff verbundene
+/// Tunnelroehren statt isolierter Blasen.
+type WorleyTunnel = PerCellPointDistances<Voronoi, EuclideanLength, WorleyDifference>;
 
 /// Fixe Meereshoehe - keine Konfigurationsoption, sondern eine architektonische Festlegung: alle
 /// Shaping-Funktionen (See-Kompression, Straende) sind relativ zu `y=0` formuliert.
@@ -34,24 +42,65 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Direkt-gemapptes Memo fuer `TerrainGenerator::height_at` - Potenz von 2, damit der Slot-Index
-/// eine reine Bitmaske statt eines Modulo ist. Der Mesher haelt pro Rand-Spalte 2 gleichzeitig
-/// "heisse" (world_x,world_z)-Paare (unterer/oberer Nachbar) ueber jeweils 32 Iterationen der
-/// anderen Achse aktiv (s. Kommentar an `height_at`) - 128 Slots geben dafuer ausreichend
-/// Kollisions-Spielraum, ohne relevanten Speicher-/Cache-Footprint (128*12B = 1.5 KiB).
-const HEIGHT_CACHE_SLOTS: usize = 128;
+/// Direkt-gemapptes Memo fuer 2D-Spalten-Werte (`height_at`, `is_tunnel_region`) - Potenz von 2,
+/// damit der Slot-Index eine reine Bitmaske statt eines Modulo ist. Der Mesher haelt pro Rand-Spalte
+/// 2 gleichzeitig "heisse" (world_x,world_z)-Paare (unterer/oberer Nachbar) ueber jeweils 32
+/// Iterationen der anderen Achse aktiv (s. Kommentar an `height_at`) - 128 Slots geben dafuer
+/// ausreichend Kollisions-Spielraum.
+const COLUMN_CACHE_SLOTS: usize = 128;
 
 #[inline(always)]
-fn height_cache_slot(world_x: i32, world_z: i32) -> usize {
+fn column_cache_slot(world_x: i32, world_z: i32) -> usize {
     let hash = (world_x as u32).wrapping_mul(0x9E37_79B1) ^ (world_z as u32).wrapping_mul(0x85EB_CA6B);
-    (hash as usize) & (HEIGHT_CACHE_SLOTS - 1)
+    (hash as usize) & (COLUMN_CACHE_SLOTS - 1)
 }
 
 thread_local! {
     /// Thread-lokal, weil `TerrainGenerator` per `Arc` ueber Rayon-Worker geteilt wird (kein
     /// gemeinsames `RefCell`-Feld an einem per `Sync` geteilten Typ moeglich).
-    static HEIGHT_CACHE: RefCell<[(i32, i32, i32); HEIGHT_CACHE_SLOTS]> =
-        const { RefCell::new([(i32::MIN, i32::MIN, 0); HEIGHT_CACHE_SLOTS]) };
+    static HEIGHT_CACHE: RefCell<[(i32, i32, i32); COLUMN_CACHE_SLOTS]> =
+        const { RefCell::new([(i32::MIN, i32::MIN, 0); COLUMN_CACHE_SLOTS]) };
+    /// Wie `HEIGHT_CACHE`, aber fuer `is_tunnel_region` - `generate_chunk` fragt pro Spalte einmal
+    /// (guenstiger Cache-Miss), der Mesher-Fallback-Hotpath dafuer bis zu 32x hintereinander pro
+    /// Rand-Spalte (s. `height_at`-Kommentar) - ohne Cache waere das eine zusaetzliche Rauschprobe
+    /// pro dieser Wiederholungen.
+    static TUNNEL_REGION_CACHE: RefCell<[(i32, i32, bool); COLUMN_CACHE_SLOTS]> =
+        const { RefCell::new([(i32::MIN, i32::MIN, false); COLUMN_CACHE_SLOTS]) };
+}
+
+/// Gitterabstand (Weltbloecke) des sparse ausgewerteten Tunnel-Dichterasters - s. `tunnel_grid_corner`.
+const TUNNEL_GRID_STRIDE: i32 = 4;
+/// 4096 Slots * 20 Byte = 80 KiB, trivial. Ein voller Chunk braucht bei Stride 4 im schlimmsten Fall
+/// 9^3=729 DISTINKTE Gitterpunkte - bei nur 1024 Slots kollidierte das Direct-Mapping laut
+/// Geburtstagsparadoxon so haeufig (~729 Eintraege auf 1024 Slots, Lastfaktor 0.71), dass Slots
+/// wiederholt eviktiert und dieselben Gitterpunkte mehrfach neu berechnet wurden - ein "Tiefe"-
+/// Testchunk kostete dadurch trotz Grid noch 8ms statt der erwarteten <1ms. Bei 4096 Slots
+/// (Lastfaktor 0.18) bleibt die Kollisionsrate niedrig.
+const TUNNEL_GRID_CACHE_SLOTS: usize = 4096;
+
+#[inline(always)]
+fn tunnel_grid_slot(gx: i32, gy: i32, gz: i32) -> usize {
+    let hash = (gx as u32).wrapping_mul(0x9E37_79B1)
+        ^ (gy as u32).wrapping_mul(0x85EB_CA6B)
+        ^ (gz as u32).wrapping_mul(0xC2B2_AE35);
+    (hash as usize) & (TUNNEL_GRID_CACHE_SLOTS - 1)
+}
+
+/// (gx, gy, gz, min(tunnel_a,tunnel_b), min(connector_a,connector_b)) an EINEM Gitterpunkt.
+type TunnelGridCacheSlot = (i32, i32, i32, f32, f32);
+
+thread_local! {
+    /// Alle `TUNNEL_GRID_STRIDE` Bloecke. 4 Worley-Rohproben pro Gitterpunkt statt pro Voxel - ein
+    /// voller Chunk (32768 Voxel) braucht bei einem direkten Pro-Voxel-Ansatz bis zu 131072
+    /// Worley-Proben (~280ns/Probe = >30ms), mit dem Raster nur 729*4=2916 (~800us) plus billige
+    /// trilineare Interpolation. `generate_chunk` (Bulk-Fuellung, riesige Wiederverwendung ueber
+    /// 32768 Voxel) UND `is_solid` (Einzel-Fallback-Abfrage) teilen sich DENSELBEN Cache und rufen
+    /// exakt dieselbe Interpolationsfunktion auf - beide Pfade liefern also IMMER identische
+    /// Ergebnisse (anders als beim fruehen Hoehen-/Hoehlendichte-Bug, wo Bulk- und Fallback-Pfad zwei
+    /// VERSCHIEDENE Formeln nutzten). Reine Performance-Optimierung, keine Genauigkeits-Abweichung
+    /// zwischen den Pfaden.
+    static TUNNEL_GRID_CACHE: RefCell<[TunnelGridCacheSlot; TUNNEL_GRID_CACHE_SLOTS]> =
+        const { RefCell::new([(i32::MIN, i32::MIN, i32::MIN, 0.0, 0.0); TUNNEL_GRID_CACHE_SLOTS]) };
 }
 
 /// Multi-Stage-Terraingenerator: 2D-Rauschen fuer Hoehe/Klippen/Straende, 3D-Rauschen nur fuer
@@ -77,6 +126,28 @@ pub struct TerrainGenerator {
     cave: Noise<common_noise::Perlin>,
     cave_frequency: f32,
     cave_threshold: f32,
+    /// Grobes 2D-Gate (1 Rauschprobe): nur "Hoehlen-aktive" Regionen zahlen ueberhaupt fuer das
+    /// teure Tunnelsystem - s. Kommentar an `is_tunnel_region`.
+    cave_region: Noise<common_noise::Perlin>,
+    cave_region_frequency: f32,
+    cave_region_threshold: f32,
+    /// Haupt-Tunnelsystem: 2 unabhaengige `WorleyTunnel`-Karten.
+    tunnel_a: Noise<WorleyTunnel>,
+    tunnel_b: Noise<WorleyTunnel>,
+    tunnel_frequency: f32,
+    tunnel_threshold: f32,
+    /// Wie viele Bloecke unterhalb `SEA_LEVEL` die Tunnel-Verbreiterung ihr Maximum erreicht.
+    tunnel_widen_depth_range: f32,
+    /// Faktor, um den `tunnel_threshold` in maximaler Tiefe multipliziert wird (breitere Hoehlen je
+    /// tiefer).
+    tunnel_widen_max_multiplier: f32,
+    /// Feineres Verbindungs-Tunnelsystem (hoehere Frequenz als das Hauptsystem) - schafft kleine
+    /// Querverbindungen zwischen Haupttunneln und, dank der hoeheren Zellgrenzen-Dichte, nebenbei
+    /// mehr Oberflaecheneingaenge.
+    connector_a: Noise<WorleyTunnel>,
+    connector_b: Noise<WorleyTunnel>,
+    connector_frequency: f32,
+    connector_threshold: f32,
     dirt_layer_depth: i32,
     /// Die Ursprungszelle des `noiz`-Gradientenrauschens (Welt-Koordinaten nahe (0,0)) ist
     /// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
@@ -101,6 +172,19 @@ impl TerrainGenerator {
         let mut cave = Noise::<common_noise::Perlin>::default();
         cave.set_seed(config.terrain_seed.wrapping_add(0x27D4_EB2F));
 
+        let mut cave_region = Noise::<common_noise::Perlin>::default();
+        cave_region.set_seed(config.terrain_seed.wrapping_add(0x1656_67B1));
+
+        let mut tunnel_a = Noise::<WorleyTunnel>::default();
+        tunnel_a.set_seed(config.terrain_seed.wrapping_add(0x9E3B_2265));
+        let mut tunnel_b = Noise::<WorleyTunnel>::default();
+        tunnel_b.set_seed(config.terrain_seed.wrapping_add(0xD35A_2D97));
+
+        let mut connector_a = Noise::<WorleyTunnel>::default();
+        connector_a.set_seed(config.terrain_seed.wrapping_add(0x4F51_1D37));
+        let mut connector_b = Noise::<WorleyTunnel>::default();
+        connector_b.set_seed(config.terrain_seed.wrapping_add(0x9749_2F09));
+
         Self {
             continental,
             continental_frequency: config.terrain_continental_frequency,
@@ -116,6 +200,19 @@ impl TerrainGenerator {
             cave,
             cave_frequency: config.terrain_cave_frequency,
             cave_threshold: config.terrain_cave_threshold,
+            cave_region,
+            cave_region_frequency: config.terrain_cave_region_frequency,
+            cave_region_threshold: config.terrain_cave_region_threshold,
+            tunnel_a,
+            tunnel_b,
+            tunnel_frequency: config.terrain_tunnel_frequency,
+            tunnel_threshold: config.terrain_tunnel_threshold,
+            tunnel_widen_depth_range: config.terrain_tunnel_widen_depth_range.max(1.0),
+            tunnel_widen_max_multiplier: config.terrain_tunnel_widen_max_multiplier,
+            connector_a,
+            connector_b,
+            connector_frequency: config.terrain_connector_frequency,
+            connector_threshold: config.terrain_connector_threshold,
             dirt_layer_depth: config.terrain_dirt_layer_depth,
             noise_origin_offset: config.terrain_noise_origin_offset,
         }
@@ -125,6 +222,23 @@ impl TerrainGenerator {
     fn sample2d(&self, noise: &Noise<common_noise::Perlin>, frequency: f32, world_x: i32, world_z: i32) -> f32 {
         let point = Vec2::new(
             world_x as f32 * frequency + self.noise_origin_offset,
+            world_z as f32 * frequency + self.noise_origin_offset,
+        );
+        noise.sample(point)
+    }
+
+    #[inline]
+    fn sample3d<N: NoiseFunction<Vec3, Output = f32>>(
+        &self,
+        noise: &Noise<N>,
+        frequency: f32,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+    ) -> f32 {
+        let point = Vec3::new(
+            world_x as f32 * frequency + self.noise_origin_offset,
+            world_y as f32 * frequency + self.noise_origin_offset,
             world_z as f32 * frequency + self.noise_origin_offset,
         );
         noise.sample(point)
@@ -142,7 +256,7 @@ impl TerrainGenerator {
     /// Mesher selbst bleibt dabei bewusst ahnungslos ueber diese Terrain-Interna (kein Sonderfall im
     /// generischen Meshing-Code).
     pub fn height_at(&self, world_x: i32, world_z: i32) -> i32 {
-        let slot = height_cache_slot(world_x, world_z);
+        let slot = column_cache_slot(world_x, world_z);
         HEIGHT_CACHE.with_borrow_mut(|cache| {
             let (cached_x, cached_z, cached_height) = cache[slot];
             if cached_x == world_x && cached_z == world_z {
@@ -182,39 +296,198 @@ impl TerrainGenerator {
     }
 
     fn cave_density(&self, world_x: i32, world_y: i32, world_z: i32) -> f32 {
-        let point = Vec3::new(
-            world_x as f32 * self.cave_frequency + self.noise_origin_offset,
-            world_y as f32 * self.cave_frequency + self.noise_origin_offset,
-            world_z as f32 * self.cave_frequency + self.noise_origin_offset,
-        );
-        self.cave.sample(point)
+        self.sample3d(&self.cave, self.cave_frequency, world_x, world_y, world_z)
     }
 
-    fn is_cave(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+    fn is_cheese_cave(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         self.cave_density(world_x, world_y, world_z) > self.cave_threshold
+    }
+
+    /// Grobes, sehr guenstiges 2D-Gate (1 Rauschprobe): nur in "Hoehlen-aktiven" Regionen wird das
+    /// Tunnelsystem (bis zu 4 Worley-Proben/Voxel) ueberhaupt ausgewertet. Reale Hoehlensysteme sind
+    /// regional konzentriert (Karstgebiete) statt gleichmaessig verteilt - dieses Gate bildet das
+    /// nach UND spart in den meisten Bereichen des Untergrunds die komplette Tunnel-Berechnung, statt
+    /// jeden Voxel im Spiel dafuer bezahlen zu lassen.
+    ///
+    /// Gecached ueber `TUNNEL_REGION_CACHE` - Y-unabhaengig wie `height_at`, mit identischem
+    /// Wiederholungsmuster im Mesher-Fallback-Hotpath (s. dortigen Kommentar).
+    fn is_tunnel_region(&self, world_x: i32, world_z: i32) -> bool {
+        let slot = column_cache_slot(world_x, world_z);
+        TUNNEL_REGION_CACHE.with_borrow_mut(|cache| {
+            let (cached_x, cached_z, cached_region) = cache[slot];
+            if cached_x == world_x && cached_z == world_z {
+                return cached_region;
+            }
+            let region =
+                self.sample2d(&self.cave_region, self.cave_region_frequency, world_x, world_z) > self.cave_region_threshold;
+            cache[slot] = (world_x, world_z, region);
+            region
+        })
+    }
+
+    /// Rohwerte EINES Tunnel-Gitterpunkts (`min(tunnel_a,tunnel_b)`, `min(connector_a,connector_b)`),
+    /// `TUNNEL_GRID_CACHE`-gecached - s. Kommentar dort. `gx`/`gy`/`gz` sind bereits durch
+    /// `TUNNEL_GRID_STRIDE` geteilte Gitterkoordinaten, keine Weltkoordinaten.
+    fn tunnel_grid_corner(&self, gx: i32, gy: i32, gz: i32) -> (f32, f32) {
+        let slot = tunnel_grid_slot(gx, gy, gz);
+        TUNNEL_GRID_CACHE.with_borrow_mut(|cache| {
+            let (cached_x, cached_y, cached_z, main_min, connector_min) = cache[slot];
+            if cached_x == gx && cached_y == gy && cached_z == gz {
+                return (main_min, connector_min);
+            }
+
+            let world_x = gx * TUNNEL_GRID_STRIDE;
+            let world_y = gy * TUNNEL_GRID_STRIDE;
+            let world_z = gz * TUNNEL_GRID_STRIDE;
+            let a = self.sample3d(&self.tunnel_a, self.tunnel_frequency, world_x, world_y, world_z);
+            let b = self.sample3d(&self.tunnel_b, self.tunnel_frequency, world_x, world_y, world_z);
+            let ca = self.sample3d(&self.connector_a, self.connector_frequency, world_x, world_y, world_z);
+            let cb = self.sample3d(&self.connector_b, self.connector_frequency, world_x, world_y, world_z);
+            let result = (a.min(b), ca.min(cb));
+            cache[slot] = (gx, gy, gz, result.0, result.1);
+            result
+        })
+    }
+
+    /// XZ-bilineare Interpolation der Tunnel-Traegerwerte auf EINER Gitter-Y-Ebene (`gy`, bereits
+    /// durch `TUNNEL_GRID_STRIDE` geteilt) - Baustein von `tunnel_fields_at` UND
+    /// `tunnel_column_layers`, damit beide Pfade garantiert dieselbe Formel nutzen.
+    fn tunnel_xz_layer(&self, gx0: i32, gz0: i32, tx: f32, tz: f32, gy: i32) -> (f32, f32) {
+        let lerp2 = |a: (f32, f32), b: (f32, f32), t: f32| (lerp(a.0, b.0, t), lerp(a.1, b.1, t));
+        let c00 = self.tunnel_grid_corner(gx0, gy, gz0);
+        let c10 = self.tunnel_grid_corner(gx0 + 1, gy, gz0);
+        let c01 = self.tunnel_grid_corner(gx0, gy, gz0 + 1);
+        let c11 = self.tunnel_grid_corner(gx0 + 1, gy, gz0 + 1);
+        lerp2(lerp2(c00, c10, tx), lerp2(c01, c11, tx), tz)
+    }
+
+    /// Trilineare Interpolation der Tunnel-Traegerwerte an einer beliebigen Weltposition - fuer
+    /// Einzelabfragen (`is_solid`-Fallback). Fuer die Bulk-Fuellung in `generate_chunk` s. stattdessen
+    /// `tunnel_column_layers`/`tunnel_from_layers`, die dieselbe XZ-Ebene ueber 32 Y-Voxel
+    /// wiederverwenden statt sie pro Voxel neu zu berechnen.
+    fn tunnel_fields_at(&self, world_x: i32, world_y: i32, world_z: i32) -> (f32, f32) {
+        let gx0 = world_x.div_euclid(TUNNEL_GRID_STRIDE);
+        let gz0 = world_z.div_euclid(TUNNEL_GRID_STRIDE);
+        let gy0 = world_y.div_euclid(TUNNEL_GRID_STRIDE);
+        let tx = world_x.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+        let ty = world_y.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+        let tz = world_z.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+
+        let bottom = self.tunnel_xz_layer(gx0, gz0, tx, tz, gy0);
+        let top = self.tunnel_xz_layer(gx0, gz0, tx, tz, gy0 + 1);
+        (lerp(bottom.0, top.0, ty), lerp(bottom.1, top.1, ty))
+    }
+
+    /// Ob `(main_min, connector_min)` bei `world_y` einen Tunnel ergeben - einzige Stelle, die die
+    /// Schwellwert-/Tiefenverbreiterungs-Formel kennt, genutzt von `is_tunnel` UND
+    /// `tunnel_from_layers` (garantiert identisches Ergebnis fuer beide Performance-Pfade).
+    fn tunnel_threshold_check(&self, world_y: i32, main_min: f32, connector_min: f32) -> bool {
+        let depth_factor = ((SEA_LEVEL - world_y) as f32 / self.tunnel_widen_depth_range).clamp(0.0, 1.0);
+        let widened_threshold = self.tunnel_threshold * (1.0 + self.tunnel_widen_max_multiplier * depth_factor);
+        main_min < widened_threshold || connector_min < self.connector_threshold
+    }
+
+    /// Haupt- + Verbindungstunnelnetz via Worley-Zellgrenzen (`WorleyDifference` nahe 0 = auf der
+    /// Grenze zwischen den 2 naechsten Zellpunkten = Tunnelwand - Zellgrenzen bilden im Gegensatz zu
+    /// isolierten Zellzentren ein zusammenhaengendes Netzwerk durch den ganzen Raum). 2 unabhaengige
+    /// Karten pro System ergeben ein verzweigteres, organischeres Netz als eine einzelne. Haupttunnel
+    /// werden mit der Tiefe breiter; die feineren, konstant duennen Verbindungstunnel schaffen dank
+    /// ihrer hoeheren Zellgrenzen-Dichte nebenbei mehr Querverbindungen und Oberflaecheneingaenge.
+    /// Nur aufgerufen, wenn `is_tunnel_region` bereits zugestimmt hat. Einzelabfrage-Pfad fuer
+    /// `is_solid` - s. Kommentar an `tunnel_fields_at`.
+    fn is_tunnel(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        let (main_min, connector_min) = self.tunnel_fields_at(world_x, world_y, world_z);
+        self.tunnel_threshold_check(world_y, main_min, connector_min)
+    }
+
+    /// Anzahl Tunnel-Gitter-Y-Ebenen, die eine volle Chunk-Spalte (`CHUNK_SIZE` Voxel) im
+    /// schlechtesten Fall (ungluecklichste Ausrichtung zum Gitter) beruehren kann:
+    /// `CHUNK_SIZE/TUNNEL_GRID_STRIDE + 2` aufgerundet.
+    const TUNNEL_COLUMN_MAX_LAYERS: usize = (CHUNK_SIZE / TUNNEL_GRID_STRIDE) as usize + 2;
+
+    /// Praeberechnet fuer eine FESTE Spalte (world_x, world_z) alle beruehrten Tunnel-Gitter-
+    /// Y-Ebenen XZ-bilinear vorinterpoliert. `generate_chunk` durchlaeuft pro Spalte `CHUNK_SIZE`
+    /// (32) Y-Voxel; ohne dieses Praecaching wuerde jeder einzelne Voxel `tunnel_fields_at` mit 8
+    /// frischen Gitter-Ecken-Lookups (Hash+RefCell+Array-Zugriff) aufrufen, obwohl `gx0`/`gz0` fuer
+    /// die GESAMTE Spalte konstant sind und sich `gy0` nur alle `TUNNEL_GRID_STRIDE` Y-Schritte
+    /// aendert - das allein kostete trotz `TUNNEL_GRID_CACHE` noch mehrere ms/Chunk (256 statt
+    /// hoechstens 40 Lookup-Operationen pro Spalte). Mathematisch identisch zu `tunnel_fields_at` je
+    /// Voxel (s. `tunnel_from_layers`), nur mit wiederverwendeten Zwischenergebnissen - keine
+    /// Genauigkeitsabweichung.
+    fn tunnel_column_layers(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        y_min: i32,
+        y_max: i32,
+    ) -> (i32, [(f32, f32); Self::TUNNEL_COLUMN_MAX_LAYERS]) {
+        let gx0 = world_x.div_euclid(TUNNEL_GRID_STRIDE);
+        let gz0 = world_z.div_euclid(TUNNEL_GRID_STRIDE);
+        let tx = world_x.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+        let tz = world_z.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+
+        let gy_min = y_min.div_euclid(TUNNEL_GRID_STRIDE);
+        let gy_max = y_max.div_euclid(TUNNEL_GRID_STRIDE) + 1;
+
+        let mut layers = [(0.0f32, 0.0f32); Self::TUNNEL_COLUMN_MAX_LAYERS];
+        for (i, layer) in layers.iter_mut().enumerate() {
+            let gy = gy_min + i as i32;
+            if gy > gy_max {
+                break;
+            }
+            *layer = self.tunnel_xz_layer(gx0, gz0, tx, tz, gy);
+        }
+        (gy_min, layers)
+    }
+
+    /// Interpoliert `world_y` aus den per `tunnel_column_layers` vorberechneten Y-Ebenen und prueft
+    /// die Schwelle - Bulk-Pfad-Gegenstueck zu `is_tunnel`, s. dortigen Kommentar zur garantierten
+    /// Ergebnisgleichheit.
+    fn tunnel_from_layers(
+        &self,
+        world_y: i32,
+        gy_min: i32,
+        layers: &[(f32, f32); Self::TUNNEL_COLUMN_MAX_LAYERS],
+    ) -> bool {
+        let gy0 = world_y.div_euclid(TUNNEL_GRID_STRIDE);
+        let ty = world_y.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
+        let bottom = layers[(gy0 - gy_min) as usize];
+        let top = layers[(gy0 - gy_min) as usize + 1];
+        let main_min = lerp(bottom.0, top.0, ty);
+        let connector_min = lerp(bottom.1, top.1, ty);
+        self.tunnel_threshold_check(world_y, main_min, connector_min)
+    }
+
+    /// Vereinigung aller Hoehlensysteme (Cheese Caves + regional gegatetes Tunnelnetz) UNTER dem
+    /// `MIN_CAVE_DEPTH`-Mindestabstand zur Oberflaeche - einzige Stelle, die diese Regel kennt.
+    /// `is_solid` UND `generate_chunk` rufen ausschliesslich diese Funktion fuer die Untergrund-
+    /// Aushoehlung auf, damit beide GARANTIERT uebereinstimmen (s. Kommentar an `generate_chunk`) -
+    /// eine fruehere, nur in `generate_chunk` inline geprueft Depth-Gate liess `is_solid` am
+    /// obersten Block einer Saeule gelegentlich abweichen (der Test unten deckt das jetzt ab).
+    fn is_carved(&self, world_x: i32, world_y: i32, world_z: i32, depth_from_surface: i32) -> bool {
+        depth_from_surface >= MIN_CAVE_DEPTH
+            && (self.is_cheese_cave(world_x, world_y, world_z)
+                || (self.is_tunnel_region(world_x, world_z) && self.is_tunnel(world_x, world_y, world_z)))
     }
 
     /// Fallback-Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener/editierter
     /// Chunk-Daten - genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten
     /// Chunks) UND von `ChunkManager::is_solid_at` fuer Regionen, die (noch) nicht geladen sind.
     pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
-        world_y <= self.height_at(world_x, world_z) && !self.is_cave(world_x, world_y, world_z)
+        let height = self.height_at(world_x, world_z);
+        world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
     }
 
-    /// Hoehenkarte UND Hoehlendichte werden IMMER exakt (nicht interpoliert) berechnet. Grund fuer
-    /// die Hoehe: sie haengt nicht von Y ab, also gehoert JEDE Saeule gleichzeitig zur Ober- UND
-    /// Unterkante des Chunks - ein interpoliertes Innen/exaktes-Rand-Schema wuerde auf die volle
-    /// 32x32-Flaeche entarten. Grund fuer die Hoehlendichte: anders als bei der Heightmap reicht ein
-    /// exakter RAND nicht aus. Waehrend ein Chunk noch generiert wird, beantwortet
-    /// `ChunkManager::is_solid_at` Kollisionsabfragen (Physik, Raycast) fuer ihn ueber den exakten
-    /// `is_solid`-Fallback - bewegt sich der Spieler durch diesen Bereich, WAEHREND der Chunk laedt
-    /// (bei schneller Bewegung der Normalfall), und der Chunk generiert danach interpoliert vom
-    /// exakten Fallback abweichende Werte, materialisiert ploetzlich Fels an einer Position, die dem
-    /// Spieler eben noch als Luft galt (oder umgekehrt) - "im Boden stecken bleiben"/inkonsistente
-    /// Kollision. Die Iso-Flaeche eines Schwellwert-Cutoffs (Hoehlenwand) ist dabei die
-    /// wahrscheinlichste Stelle, an der ein Spieler ueberhaupt steht. `cave_density` ist mit einer
-    /// Rauschprobe (~25ns) guenstig genug, dass Interpolation auch hier keinen messbaren Vorteil
-    /// brachte, der das Risiko rechtfertigt.
+    /// Hoehenkarte UND Cheese-Cave-Dichte werden IMMER exakt (nicht interpoliert) berechnet - beide
+    /// sind mit 1 bzw. 4 Rauschproben guenstig genug, dass Interpolation keinen messbaren Vorteil
+    /// braechte. Das Tunnelsystem dagegen (`is_tunnel`) IST interpoliert (sparse Worley-Gitter, s.
+    /// `TUNNEL_GRID_CACHE`) - 4 Worley-Proben/Voxel waeren bei 32768 Voxeln allein >30ms. Das ist hier
+    /// SICHER, weil `generate_chunk` und `is_solid` (ueber `is_carved`) exakt dieselbe interpolierte
+    /// Funktion `tunnel_fields_at` aufrufen statt zwei verschiedener Formeln - anders als beim
+    /// fruehen Hoehen-/Cheese-Cave-Bug (interpolierte Bulk-Fuellung vs. exakter Fallback, siehe
+    /// Kommentar an `TUNNEL_GRID_CACHE`), der dauerhafte Chunk-Naht-Luecken und "im Boden stecken
+    /// bleiben" verursachte, weil beide Pfade fuer denselben Voxel verschiedene Antworten gaben.
+    /// `is_tunnel_region` bleibt das zusaetzliche, sehr guenstige 2D-Gate davor.
     pub fn generate_chunk(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
         chunk.clear();
 
@@ -255,12 +528,24 @@ impl TerrainGenerator {
                     continue;
                 }
 
+                let world_x = chunk_origin_x + local_x;
+                let world_z = chunk_origin_z + local_z;
+
                 let slope = (height - height_lookup(local_x - 1, local_z))
                     .abs()
                     .max((height - height_lookup(local_x + 1, local_z)).abs())
                     .max((height - height_lookup(local_x, local_z - 1)).abs())
                     .max((height - height_lookup(local_x, local_z + 1)).abs());
                 let is_beach = (height - SEA_LEVEL).abs() <= beach_half_range;
+
+                // Einmal pro Spalte statt pro Voxel vorberechnet (s. Kommentar an
+                // `tunnel_column_layers`) - nur wenn `is_tunnel_region` ueberhaupt zustimmt. Deckt
+                // exakt den tatsaechlich durchlaufenen Y-Bereich dieser Saeule ab (durch `height`
+                // UND das Chunk-Ende gedeckelt, wie die innere Schleife unten).
+                let column_y_max = height.min(chunk_origin_y + CHUNK_SIZE - 1);
+                let tunnel_layers = self
+                    .is_tunnel_region(world_x, world_z)
+                    .then(|| self.tunnel_column_layers(world_x, world_z, chunk_origin_y, column_y_max));
 
                 for local_y in 0..CHUNK_SIZE {
                     let world_y = chunk_origin_y + local_y;
@@ -269,10 +554,13 @@ impl TerrainGenerator {
                     }
 
                     let depth_from_surface = height - world_y;
-                    if depth_from_surface >= MIN_CAVE_DEPTH
-                        && self.cave_density(chunk_origin_x + local_x, world_y, chunk_origin_z + local_z) > self.cave_threshold
-                    {
-                        continue;
+                    if depth_from_surface >= MIN_CAVE_DEPTH {
+                        let carved = self.is_cheese_cave(world_x, world_y, world_z)
+                            || tunnel_layers
+                                .is_some_and(|(gy_min, layers)| self.tunnel_from_layers(world_y, gy_min, &layers));
+                        if carved {
+                            continue;
+                        }
                     }
 
                     let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, is_beach);
@@ -290,18 +578,25 @@ mod tests {
 
     /// `TerrainGenerator::is_solid` ist die Vorhersage, auf die sowohl der Mesher (Nachbar-Check an
     /// noch nicht geladenen Chunks) als auch `ChunkManager::is_solid_at` (Physik/Raycast waehrend
-    /// ein Chunk noch generiert) zurueckfallen. Hoehe UND Hoehlendichte werden in `generate_chunk`
-    /// bewusst nirgends interpoliert, genau damit diese Vorhersage IMMER exakt mit dem
-    /// uebereinstimmt, was tatsaechlich generiert wird - sonst entstehen dauerhafte Luecken an
+    /// ein Chunk noch generiert) zurueckfallen. Hoehe UND jedes Hoehlensystem werden in
+    /// `generate_chunk` bewusst nirgends interpoliert, genau damit diese Vorhersage IMMER exakt mit
+    /// dem uebereinstimmt, was tatsaechlich generiert wird - sonst entstehen dauerhafte Luecken an
     /// Chunk-Naehten (niemand re-mesht spaeter) bzw. bewegt sich ein Spieler waehrend des Ladens
     /// durch eine Stelle, an der sich die Vorhersage nachtraeglich als falsch herausstellt, bleibt er
     /// im nachtraeglich materialisierten Fels stecken. Prueft deshalb ALLE 32768 Voxel (nicht nur den
-    /// Rand) ueber mehrere Chunk-Koordinaten inkl. vertikaler Stapelung.
+    /// Rand) ueber viele diverse Chunk-Koordinaten inkl. vertikaler Stapelung - eine fruehere Version
+    /// mit nur 4 Koordinaten hat den `MIN_CAVE_DEPTH`-Depth-Gate-Bug (s. `is_carved`-Kommentar) nicht
+    /// gefangen, weil er nur selten am obersten Block einer Saeule ausgeloest wird.
     #[test]
     fn is_solid_prediction_matches_generated_blocks_everywhere() {
         let generator = TerrainGenerator::new(&EngineConfig::default());
 
-        for &(chunk_x, chunk_y, chunk_z) in &[(0, 0, 0), (3, -2, -5), (-4, 1, 2), (7, 0, -1)] {
+        let coords: Vec<(i32, i32, i32)> = [(0, 0, 0), (3, -2, -5), (-4, 1, 2), (7, 0, -1)]
+            .into_iter()
+            .chain((0..12).map(|i| (i * 5 - 30, (i % 5) - 2, i * 7 - 40)))
+            .collect();
+
+        for &(chunk_x, chunk_y, chunk_z) in &coords {
             let mut chunk = Chunk::empty();
             generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
 
@@ -325,5 +620,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Diagnose-Tool, KEIN Korrektheitstest - misst die tatsaechliche Verteilung der Tunnel-
+    /// Traeger-Werte (`min(a,b)` beider Worley-Karten je System) an vielen zufaelligen Punkten, um
+    /// `terrain_tunnel_threshold`/`terrain_connector_threshold`/`terrain_cave_region_threshold`
+    /// empirisch zu kalibrieren, statt sie zu erraten. Manuell ausfuehren mit:
+    /// `cargo test --release --lib -- --ignored --nocapture calibrate_tunnel_thresholds`
+    #[test]
+    #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
+    fn calibrate_tunnel_thresholds() {
+        let generator = TerrainGenerator::new(&EngineConfig::default());
+        const N: usize = 200_000;
+
+        let percentile = |values: &mut [f32], p: f64| -> f32 {
+            values.sort_unstable_by(|a, b| a.total_cmp(b));
+            values[((values.len() as f64 - 1.0) * p) as usize]
+        };
+
+        let mut tunnel_min: Vec<f32> = (0..N)
+            .map(|i| {
+                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
+                let a = generator.sample3d(&generator.tunnel_a, generator.tunnel_frequency, x, y, z);
+                let b = generator.sample3d(&generator.tunnel_b, generator.tunnel_frequency, x, y, z);
+                a.min(b)
+            })
+            .collect();
+        println!(
+            "tunnel min(a,b): p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
+            percentile(&mut tunnel_min, 0.01),
+            percentile(&mut tunnel_min, 0.02),
+            percentile(&mut tunnel_min, 0.05),
+            percentile(&mut tunnel_min, 0.10),
+            percentile(&mut tunnel_min, 0.50),
+        );
+
+        let mut connector_min: Vec<f32> = (0..N)
+            .map(|i| {
+                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
+                let a = generator.sample3d(&generator.connector_a, generator.connector_frequency, x, y, z);
+                let b = generator.sample3d(&generator.connector_b, generator.connector_frequency, x, y, z);
+                a.min(b)
+            })
+            .collect();
+        println!(
+            "connector min(a,b): p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
+            percentile(&mut connector_min, 0.01),
+            percentile(&mut connector_min, 0.02),
+            percentile(&mut connector_min, 0.05),
+            percentile(&mut connector_min, 0.10),
+            percentile(&mut connector_min, 0.50),
+        );
+
+        let mut region: Vec<f32> = (0..N)
+            .map(|i| {
+                let (x, z) = (i as i32 * 37 - 700_000, i as i32 * 53 - 900_000);
+                generator.sample2d(&generator.cave_region, generator.cave_region_frequency, x, z)
+            })
+            .collect();
+        println!(
+            "cave_region: p50={:.4} p60={:.4} p70={:.4} p80={:.4} p90={:.4}",
+            percentile(&mut region, 0.50),
+            percentile(&mut region, 0.60),
+            percentile(&mut region, 0.70),
+            percentile(&mut region, 0.80),
+            percentile(&mut region, 0.90),
+        );
     }
 }
