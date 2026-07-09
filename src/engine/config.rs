@@ -83,9 +83,27 @@ pub struct EngineConfig {
     pub terrain_seed: u32,
     pub terrain_continental_frequency: f32,
     pub terrain_continental_amplitude: f32,
+    /// Amplitude des Berg-Boosts: `unorm(continental)^exponent * amplitude` - der Exponent (>1)
+    /// laesst Ebenen (kleine unorm-Werte) flach und nur die Kontinentalmaxima massiv hochschiessen.
+    pub terrain_mountain_amplitude: f32,
+    pub terrain_mountain_exponent: f32,
     pub terrain_regional_frequency: f32,
     pub terrain_regional_amplitude: f32,
+    /// fBm-Octave-Anzahl der Regional-Heightmap (4-5 fuer echtes Relief statt einer einzelnen,
+    /// glatten Perlin-Frequenz).
+    pub terrain_regional_octaves: u32,
+    /// Frequenz-Multiplikator pro fBm-Octave.
+    pub terrain_regional_lacunarity: f32,
+    /// Amplituden-Abfall pro fBm-Octave (Persistence/Gain).
+    pub terrain_regional_gain: f32,
     pub terrain_cliff_mask_frequency: f32,
+    /// Sehr niedrigfrequente Biom-Karten (Features ueber viele hundert Bloecke) - strikte
+    /// Schwellwerte darauf ergeben grosse, zusammenhaengende Biome ohne Einzelblock-Bleeding.
+    pub terrain_temperature_frequency: f32,
+    pub terrain_humidity_frequency: f32,
+    /// Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
+    pub terrain_desert_temperature_min: f32,
+    pub terrain_desert_humidity_max: f32,
     pub terrain_sea_compression_range: f32,
     pub terrain_sea_compression_exponent: f32,
     pub terrain_cave_frequency: f32,
@@ -182,9 +200,21 @@ impl Default for EngineConfig {
             // haelt Land/Ozean auf kontinentaler Ebene auseinander statt regional zu flackern.
             terrain_continental_frequency: 0.012 / 32.0,
             terrain_continental_amplitude: 40.0,
+            // unorm(cont)^4 * 130: Ebenen (unorm~0.5 -> +8) bleiben flach, Kontinentalmaxima
+            // (unorm~1) schiessen auf +130 - "flach bleibt flach, Berge massiv hoch".
+            terrain_mountain_amplitude: 130.0,
+            terrain_mountain_exponent: 4.0,
             terrain_regional_frequency: 0.012,
-            terrain_regional_amplitude: 18.0,
+            terrain_regional_amplitude: 22.0,
+            terrain_regional_octaves: 5,
+            terrain_regional_lacunarity: 2.0,
+            terrain_regional_gain: 0.5,
             terrain_cliff_mask_frequency: 0.008,
+            // Biom-Features ~650 Bloecke - grosse zusammenhaengende Wuesten/Graslaender.
+            terrain_temperature_frequency: 0.0015,
+            terrain_humidity_frequency: 0.0017,
+            terrain_desert_temperature_min: 0.25,
+            terrain_desert_humidity_max: -0.05,
             terrain_sea_compression_range: 20.0,
             terrain_sea_compression_exponent: 2.2,
             terrain_cave_frequency: 0.05,
@@ -195,19 +225,19 @@ impl Default for EngineConfig {
             // dicht UND spart die teure Worley-Auswertung im Rest des Untergrunds komplett.
             terrain_cave_region_frequency: 0.002,
             terrain_cave_region_threshold: 0.3,
-            // Zellgroesse ~35 Bloecke fuers Hauptnetz. `min(a,b)` zweier `WorleyDifference`-Karten
-            // ist NICHT uniform auf 0..1 verteilt, sondern um 0 konzentriert (empirisch: Median
-            // ~0.024!) - 0.0007 (~2. Perzentil) haelt Tunnel duenn statt den kompletten Zellraum
-            // auszuhoehlen. Ein naiv "klein wirkender" Wert wie 0.03 carved ueber 50% des Volumens.
+            // Feature-Groesse ~35 Bloecke fuers Hauptnetz. Schwellen empirisch gegen die
+            // tatsaechliche Verteilung von `max(|a|,|b|)` zweier 3D-Perlin-Karten kalibriert (s.
+            // `calibrate_tunnel_thresholds`: p2=0.069, p5=0.121) - 0.08 (~p2.5) ergibt duenne,
+            // wurmartige Roehren; die Tiefenverbreiterung (x2.5 in maximaler Tiefe) oeffnet sie
+            // unten zu begehbaren Kavernen (~p10).
             terrain_tunnel_frequency: 0.028,
-            terrain_tunnel_threshold: 0.0007,
+            terrain_tunnel_threshold: 0.08,
             terrain_tunnel_widen_depth_range: 150.0,
-            terrain_tunnel_widen_max_multiplier: 3.0,
-            // Kleinere Zellen (~17 Bloecke) fuers Verbindungsnetz - mehr Zellgrenzen = mehr Chancen
-            // auf Querverbindungen und Oberflaecheneingaenge. Duenner als das Hauptnetz (~1.
-            // Perzentil), da es nur kleine Querverbindungen schaffen soll.
+            terrain_tunnel_widen_max_multiplier: 1.5,
+            // Hoehere Frequenz (~17 Bloecke) fuers Verbindungsnetz - kuerzere, engere Wuermer als
+            // Querverbindungen und Oberflaecheneingaenge, bewusst duenner (~p1.5) als das Hauptnetz.
             terrain_connector_frequency: 0.06,
-            terrain_connector_threshold: 0.0004,
+            terrain_connector_threshold: 0.05,
             terrain_dirt_layer_depth: 3,
             terrain_noise_origin_offset: 10_000.0,
 
@@ -375,9 +405,18 @@ struct ConfigFile {
     terrain_seed: u32,
     terrain_continental_frequency: f32,
     terrain_continental_amplitude: f32,
+    terrain_mountain_amplitude: f32,
+    terrain_mountain_exponent: f32,
     terrain_regional_frequency: f32,
     terrain_regional_amplitude: f32,
+    terrain_regional_octaves: u32,
+    terrain_regional_lacunarity: f32,
+    terrain_regional_gain: f32,
     terrain_cliff_mask_frequency: f32,
+    terrain_temperature_frequency: f32,
+    terrain_humidity_frequency: f32,
+    terrain_desert_temperature_min: f32,
+    terrain_desert_humidity_max: f32,
     terrain_sea_compression_range: f32,
     terrain_sea_compression_exponent: f32,
     terrain_cave_frequency: f32,
@@ -467,9 +506,18 @@ impl From<EngineConfig> for ConfigFile {
             terrain_seed: c.terrain_seed,
             terrain_continental_frequency: c.terrain_continental_frequency,
             terrain_continental_amplitude: c.terrain_continental_amplitude,
+            terrain_mountain_amplitude: c.terrain_mountain_amplitude,
+            terrain_mountain_exponent: c.terrain_mountain_exponent,
             terrain_regional_frequency: c.terrain_regional_frequency,
             terrain_regional_amplitude: c.terrain_regional_amplitude,
+            terrain_regional_octaves: c.terrain_regional_octaves,
+            terrain_regional_lacunarity: c.terrain_regional_lacunarity,
+            terrain_regional_gain: c.terrain_regional_gain,
             terrain_cliff_mask_frequency: c.terrain_cliff_mask_frequency,
+            terrain_temperature_frequency: c.terrain_temperature_frequency,
+            terrain_humidity_frequency: c.terrain_humidity_frequency,
+            terrain_desert_temperature_min: c.terrain_desert_temperature_min,
+            terrain_desert_humidity_max: c.terrain_desert_humidity_max,
             terrain_sea_compression_range: c.terrain_sea_compression_range,
             terrain_sea_compression_exponent: c.terrain_sea_compression_exponent,
             terrain_cave_frequency: c.terrain_cave_frequency,
@@ -555,9 +603,18 @@ impl From<ConfigFile> for EngineConfig {
             terrain_seed: f.terrain_seed,
             terrain_continental_frequency: f.terrain_continental_frequency,
             terrain_continental_amplitude: f.terrain_continental_amplitude,
+            terrain_mountain_amplitude: f.terrain_mountain_amplitude.max(0.0),
+            terrain_mountain_exponent: f.terrain_mountain_exponent.max(1.0),
             terrain_regional_frequency: f.terrain_regional_frequency,
             terrain_regional_amplitude: f.terrain_regional_amplitude,
+            terrain_regional_octaves: f.terrain_regional_octaves.clamp(1, 8),
+            terrain_regional_lacunarity: f.terrain_regional_lacunarity.max(1.0),
+            terrain_regional_gain: f.terrain_regional_gain.clamp(0.0, 1.0),
             terrain_cliff_mask_frequency: f.terrain_cliff_mask_frequency,
+            terrain_temperature_frequency: f.terrain_temperature_frequency,
+            terrain_humidity_frequency: f.terrain_humidity_frequency,
+            terrain_desert_temperature_min: f.terrain_desert_temperature_min,
+            terrain_desert_humidity_max: f.terrain_desert_humidity_max,
             terrain_sea_compression_range: f.terrain_sea_compression_range.max(1.0),
             terrain_sea_compression_exponent: f.terrain_sea_compression_exponent.max(1.0),
             terrain_cave_frequency: f.terrain_cave_frequency,

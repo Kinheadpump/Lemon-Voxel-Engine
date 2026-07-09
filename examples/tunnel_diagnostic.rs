@@ -10,6 +10,27 @@ fn main() {
     let config = EngineConfig::default();
     let generator = TerrainGenerator::new(&config);
 
+    // Relief-Statistik: Hoehenverteilung ueber ein grosses Gebiet (Berge? Ozeane? Flachland?).
+    let mut min_h = i32::MAX;
+    let mut max_h = i32::MIN;
+    let mut below_water = 0u32;
+    let mut samples = 0u32;
+    for cz in -60..60 {
+        for cx in -60..60 {
+            let h = generator.height_at(cx * 32 + 16, cz * 32 + 16);
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+            if h < 0 {
+                below_water += 1;
+            }
+            samples += 1;
+        }
+    }
+    println!(
+        "Relief ueber {samples} Spalten: min={min_h} max={max_h}, Ozeananteil (h<0): {:.1}%",
+        below_water as f64 / samples as f64 * 100.0
+    );
+
     // Fuer viele Chunk-XZ-Koordinaten pruefen, ob eine tiefe Saeule (weit unter jeder Oberflaeche,
     // also garantiert massiv ausser wo Hoehlen/Tunnel carven) ueberhaupt jemals carved ist.
     let mut active_columns = 0u32;

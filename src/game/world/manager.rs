@@ -10,6 +10,7 @@ use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk}
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
 
+use super::blocks;
 use super::chunk::{CHUNK_SIZE, Chunk};
 use super::generator::TerrainGenerator;
 use super::raycast::{RaycastHit, raycast};
@@ -202,17 +203,21 @@ impl ChunkManager {
             && (coord.2 - center.2).abs() <= self.render_distance_chunks
     }
 
-    /// Voxel-Festigkeit unter Beruecksichtigung geladener/editierter Chunk-Daten. Ist der Chunk an
-    /// dieser Position nicht geladen, wird auf die rein prozedurale Vorhersage zurueckgefallen -
-    /// das reicht fuer Physik/Raycast, da beide ohnehin nur innerhalb der Render-Distanz abfragen.
+    /// PHYSIKALISCHE Voxel-Festigkeit (Kollision/Raycast) unter Beruecksichtigung geladener/
+    /// editierter Chunk-Daten - Wasser ist begehbar/durchschwimmbar und zaehlt NICHT als solide
+    /// (der Mesher nutzt fuer Okklusion stattdessen `TerrainGenerator::is_solid`, das Wasser als
+    /// sichtbaren Block einschliesst). Ist der Chunk nicht geladen, faellt es auf die prozedurale
+    /// Vorhersage zurueck - das reicht fuer Physik/Raycast, da beide ohnehin nur innerhalb der
+    /// Render-Distanz abfragen.
     pub fn is_solid_at(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let (coord, local) = chunk_and_local(world_x, world_y, world_z);
         if let Some(loaded) = self.loaded.get(&coord)
             && let Some(chunk) = self.pool[loaded.pool_slot].as_deref()
         {
-            return chunk.get_block(local.x, local.y, local.z) != 0;
+            let block = chunk.get_block(local.x, local.y, local.z);
+            return block != 0 && block != blocks::WATER;
         }
-        self.generator.is_solid(world_x, world_y, world_z)
+        self.generator.is_physically_solid(world_x, world_y, world_z)
     }
 
     pub fn raycast(&self, origin: glam::Vec3, direction: glam::Vec3, max_distance: f32) -> Option<RaycastHit> {

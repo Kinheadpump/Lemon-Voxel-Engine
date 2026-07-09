@@ -1,25 +1,26 @@
 use std::cell::RefCell;
 
 use bevy_math::{Vec2, Vec3};
-use noiz::cell_noise::WorleyDifference;
 use noiz::{Noise, NoiseFunction};
 use noiz::prelude::*;
 
 use crate::engine::config::EngineConfig;
 
-use super::blocks;
+use super::blocks::{self, ColumnSurface};
 use super::chunk::{CHUNK_SIZE, Chunk};
 
-/// `WorleyDifference` liefert die unorm-Differenz zwischen der 1. und 2. naechsten Zellpunkt-
-/// Distanz - nahe 0 heisst "genau auf der Voronoi-Zellgrenze". Zellgrenzen bilden ein
-/// zusammenhaengendes Graph-Netzwerk, das den gesamten Raum durchzieht (anders als Zellzentren, die
-/// nur isolierte Punkte sind) - genau das ergibt bei einem Schwellwert-Cutoff verbundene
-/// Tunnelroehren statt isolierter Blasen.
-type WorleyTunnel = PerCellPointDistances<Voronoi, EuclideanLength, WorleyDifference>;
+/// Fraktales Perlin (fBm) fuer die Regional-Heightmap - mehrere Octaves mit konfigurierbarer
+/// Lacunarity/Gain statt einer einzelnen, glatten Frequenz (echtes Relief statt sanftem Gewoge).
+type RegionalFbm = common_noise::Fbm<common_noise::Perlin>;
 
 /// Fixe Meereshoehe - keine Konfigurationsoption, sondern eine architektonische Festlegung: alle
 /// Shaping-Funktionen (See-Kompression, Straende) sind relativ zu `y=0` formuliert.
 const SEA_LEVEL: i32 = 0;
+/// Wasseroberflaeche: Spalten, deren Terrainhoehe darunter liegt, werden bis hierher mit Wasser
+/// aufgefuellt (`is_water_position`) - NUR ueber der Terrainoberflaeche, nie in Hoehlen (die liegen
+/// per Definition UNTER der Oberflaeche und `MIN_CAVE_DEPTH` haelt die Deckschicht des Ozeanbodens
+/// geschlossen, s. `is_carved`).
+const WATER_LEVEL: i32 = SEA_LEVEL;
 
 /// Formt die "cliffy" Regional-Karte: Exponent < 1 auf `|noise|` drueckt die meisten Werte schnell
 /// Richtung +-1 (breite Plateaus), nur nahe der Nulldurchgaenge bleibt eine schmale, steile Rampe -
@@ -43,11 +44,13 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// Direkt-gemapptes Memo fuer 2D-Spalten-Werte (`height_at`, `is_tunnel_region`) - Potenz von 2,
-/// damit der Slot-Index eine reine Bitmaske statt eines Modulo ist. Der Mesher haelt pro Rand-Spalte
-/// 2 gleichzeitig "heisse" (world_x,world_z)-Paare (unterer/oberer Nachbar) ueber jeweils 32
-/// Iterationen der anderen Achse aktiv (s. Kommentar an `height_at`) - 128 Slots geben dafuer
-/// ausreichend Kollisions-Spielraum.
-const COLUMN_CACHE_SLOTS: usize = 128;
+/// damit der Slot-Index eine reine Bitmaske statt eines Modulo ist. Gross genug fuer ALLE 1024
+/// Spalten eines Chunks gleichzeitig (plus Kollisions-Spielraum): das direkt auf `generate_chunk`
+/// folgende `mesh_chunk` desselben Rayon-Tasks prueft seine Ober-/Unterkante gegen exakt dieselben
+/// 1024 Spalten (`is_solid` bei y=origin-1/origin+32) - mit nur 128 Slots evictete der Chunk seine
+/// eigenen Spalten, und der Mesher bezahlte alle ~2000 Randabfragen erneut mit der vollen
+/// Hoehenberechnung (8 Rauschproben). 4096 Slots * 12 B = 48 KiB thread-lokal, im L2 irrelevant.
+const COLUMN_CACHE_SLOTS: usize = 4096;
 
 #[inline(always)]
 fn column_cache_slot(world_x: i32, world_z: i32) -> usize {
@@ -86,34 +89,46 @@ fn tunnel_grid_slot(gx: i32, gy: i32, gz: i32) -> usize {
     (hash as usize) & (TUNNEL_GRID_CACHE_SLOTS - 1)
 }
 
-/// (gx, gy, gz, min(tunnel_a,tunnel_b), min(connector_a,connector_b)) an EINEM Gitterpunkt.
-type TunnelGridCacheSlot = (i32, i32, i32, f32, f32);
+/// Die 4 Ridged-Traegerwerte an einem Gitterpunkt: `[|tunnel_a|, |tunnel_b|, |connector_a|,
+/// |connector_b|]`. Die Betraege werden VOR der Interpolation genommen (an den Gitterpunkten) und
+/// dann pro Kanal getrennt interpoliert - glatter als der Betrag eines interpolierten Werts.
+type TunnelGridChannels = [f32; 4];
+
+/// (gx, gy, gz, Kanalwerte) an EINEM Gitterpunkt.
+type TunnelGridCacheSlot = (i32, i32, i32, TunnelGridChannels);
 
 thread_local! {
-    /// Alle `TUNNEL_GRID_STRIDE` Bloecke. 4 Worley-Rohproben pro Gitterpunkt statt pro Voxel - ein
+    /// Alle `TUNNEL_GRID_STRIDE` Bloecke. 4 Perlin-Rohproben pro Gitterpunkt statt pro Voxel - ein
     /// voller Chunk (32768 Voxel) braucht bei einem direkten Pro-Voxel-Ansatz bis zu 131072
-    /// Worley-Proben (~280ns/Probe = >30ms), mit dem Raster nur 729*4=2916 (~800us) plus billige
-    /// trilineare Interpolation. `generate_chunk` (Bulk-Fuellung, riesige Wiederverwendung ueber
-    /// 32768 Voxel) UND `is_solid` (Einzel-Fallback-Abfrage) teilen sich DENSELBEN Cache und rufen
-    /// exakt dieselbe Interpolationsfunktion auf - beide Pfade liefern also IMMER identische
-    /// Ergebnisse (anders als beim fruehen Hoehen-/Hoehlendichte-Bug, wo Bulk- und Fallback-Pfad zwei
-    /// VERSCHIEDENE Formeln nutzten). Reine Performance-Optimierung, keine Genauigkeits-Abweichung
-    /// zwischen den Pfaden.
+    /// Rauschproben (>10ms), mit dem Raster nur 729*4=2916 plus billige trilineare Interpolation.
+    /// `generate_chunk` (Bulk-Fuellung, riesige Wiederverwendung ueber 32768 Voxel) UND `is_solid`
+    /// (Einzel-Fallback-Abfrage) teilen sich DENSELBEN Cache und rufen exakt dieselbe
+    /// Interpolationsfunktion auf - beide Pfade liefern also IMMER identische Ergebnisse (anders als
+    /// beim fruehen Hoehen-/Hoehlendichte-Bug, wo Bulk- und Fallback-Pfad zwei VERSCHIEDENE Formeln
+    /// nutzten). Reine Performance-Optimierung, keine Genauigkeits-Abweichung zwischen den Pfaden.
     static TUNNEL_GRID_CACHE: RefCell<[TunnelGridCacheSlot; TUNNEL_GRID_CACHE_SLOTS]> =
-        const { RefCell::new([(i32::MIN, i32::MIN, i32::MIN, 0.0, 0.0); TUNNEL_GRID_CACHE_SLOTS]) };
+        const { RefCell::new([(i32::MIN, i32::MIN, i32::MIN, [0.0; 4]); TUNNEL_GRID_CACHE_SLOTS]) };
+}
+
+#[inline(always)]
+fn lerp_channels(a: TunnelGridChannels, b: TunnelGridChannels, t: f32) -> TunnelGridChannels {
+    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t), lerp(a[3], b[3], t)]
 }
 
 /// Multi-Stage-Terraingenerator: 2D-Rauschen fuer Hoehe/Klippen/Straende, 3D-Rauschen nur fuer
 /// Hoehlen (und dort nur unterhalb der bereits bekannten Oberflaeche) - siehe Kommentare an den
 /// einzelnen Feldern fuer die Rolle jeder Rauschschicht.
 pub struct TerrainGenerator {
-    /// Sehr niedrige Frequenz, haelt Land/Ozean auf kontinentaler Ebene auseinander.
+    /// Sehr niedrige Frequenz, haelt Land/Ozean auf kontinentaler Ebene auseinander UND treibt den
+    /// exponentiellen Berg-Boost (s. `raw_height_at`).
     continental: Noise<common_noise::Perlin>,
     continental_frequency: f32,
     continental_amplitude: f32,
-    /// Sanfte Huegel-Variante der Regional-Karte.
-    regional_smooth: Noise<common_noise::Perlin>,
-    /// Kontrastierte Variante derselben Skala - erzeugt die Klippen-Kandidaten.
+    mountain_amplitude: f32,
+    mountain_exponent: f32,
+    /// Fraktale (fBm) Huegel-Variante der Regional-Karte - 4-5 Octaves fuer echtes Relief.
+    regional_smooth: Noise<RegionalFbm>,
+    /// Kontrastierte Einzel-Frequenz derselben Skala - erzeugt die Klippen-Kandidaten.
     regional_cliff: Noise<common_noise::Perlin>,
     regional_frequency: f32,
     regional_amplitude: f32,
@@ -122,6 +137,13 @@ pub struct TerrainGenerator {
     cliff_mask_frequency: f32,
     sea_compression_range: f32,
     sea_compression_exponent: f32,
+    /// Strikte 2D-Biom-Achsen: Wueste nur bei hoher Temperatur UND geringer Feuchtigkeit.
+    temperature: Noise<common_noise::Perlin>,
+    temperature_frequency: f32,
+    humidity: Noise<common_noise::Perlin>,
+    humidity_frequency: f32,
+    desert_temperature_min: f32,
+    desert_humidity_max: f32,
     /// 3D-Perlin fuer "Cheese Caves" (Cutoff-Hoehlen).
     cave: Noise<common_noise::Perlin>,
     cave_frequency: f32,
@@ -131,9 +153,10 @@ pub struct TerrainGenerator {
     cave_region: Noise<common_noise::Perlin>,
     cave_region_frequency: f32,
     cave_region_threshold: f32,
-    /// Haupt-Tunnelsystem: 2 unabhaengige `WorleyTunnel`-Karten.
-    tunnel_a: Noise<WorleyTunnel>,
-    tunnel_b: Noise<WorleyTunnel>,
+    /// Haupt-Tunnelsystem: Ridged-Schnitt zweier unabhaengiger 3D-Perlin-Karten
+    /// (`|a| < t && |b| < t`) - s. Kommentar an `is_tunnel`.
+    tunnel_a: Noise<common_noise::Perlin>,
+    tunnel_b: Noise<common_noise::Perlin>,
     tunnel_frequency: f32,
     tunnel_threshold: f32,
     /// Wie viele Bloecke unterhalb `SEA_LEVEL` die Tunnel-Verbreiterung ihr Maximum erreicht.
@@ -142,10 +165,9 @@ pub struct TerrainGenerator {
     /// tiefer).
     tunnel_widen_max_multiplier: f32,
     /// Feineres Verbindungs-Tunnelsystem (hoehere Frequenz als das Hauptsystem) - schafft kleine
-    /// Querverbindungen zwischen Haupttunneln und, dank der hoeheren Zellgrenzen-Dichte, nebenbei
-    /// mehr Oberflaecheneingaenge.
-    connector_a: Noise<WorleyTunnel>,
-    connector_b: Noise<WorleyTunnel>,
+    /// Querverbindungen zwischen Haupttunneln und nebenbei mehr Oberflaecheneingaenge.
+    connector_a: Noise<common_noise::Perlin>,
+    connector_b: Noise<common_noise::Perlin>,
     connector_frequency: f32,
     connector_threshold: f32,
     dirt_layer_depth: i32,
@@ -160,7 +182,15 @@ impl TerrainGenerator {
         let mut continental = Noise::<common_noise::Perlin>::default();
         continental.set_seed(config.terrain_seed);
 
-        let mut regional_smooth = Noise::<common_noise::Perlin>::default();
+        let mut regional_smooth = Noise::from(LayeredNoise::new(
+            Normed::default(),
+            Persistence(config.terrain_regional_gain),
+            FractalLayers {
+                layer: Octave(common_noise::Perlin::default()),
+                lacunarity: config.terrain_regional_lacunarity,
+                amount: config.terrain_regional_octaves,
+            },
+        ));
         regional_smooth.set_seed(config.terrain_seed.wrapping_add(0x9E37_79B9));
 
         let mut regional_cliff = Noise::<common_noise::Perlin>::default();
@@ -169,26 +199,33 @@ impl TerrainGenerator {
         let mut cliff_mask = Noise::<common_noise::Perlin>::default();
         cliff_mask.set_seed(config.terrain_seed.wrapping_add(0xC2B2_AE3D));
 
+        let mut temperature = Noise::<common_noise::Perlin>::default();
+        temperature.set_seed(config.terrain_seed.wrapping_add(0x68E3_1DA4));
+        let mut humidity = Noise::<common_noise::Perlin>::default();
+        humidity.set_seed(config.terrain_seed.wrapping_add(0xB529_7A4D));
+
         let mut cave = Noise::<common_noise::Perlin>::default();
         cave.set_seed(config.terrain_seed.wrapping_add(0x27D4_EB2F));
 
         let mut cave_region = Noise::<common_noise::Perlin>::default();
         cave_region.set_seed(config.terrain_seed.wrapping_add(0x1656_67B1));
 
-        let mut tunnel_a = Noise::<WorleyTunnel>::default();
+        let mut tunnel_a = Noise::<common_noise::Perlin>::default();
         tunnel_a.set_seed(config.terrain_seed.wrapping_add(0x9E3B_2265));
-        let mut tunnel_b = Noise::<WorleyTunnel>::default();
+        let mut tunnel_b = Noise::<common_noise::Perlin>::default();
         tunnel_b.set_seed(config.terrain_seed.wrapping_add(0xD35A_2D97));
 
-        let mut connector_a = Noise::<WorleyTunnel>::default();
+        let mut connector_a = Noise::<common_noise::Perlin>::default();
         connector_a.set_seed(config.terrain_seed.wrapping_add(0x4F51_1D37));
-        let mut connector_b = Noise::<WorleyTunnel>::default();
+        let mut connector_b = Noise::<common_noise::Perlin>::default();
         connector_b.set_seed(config.terrain_seed.wrapping_add(0x9749_2F09));
 
         Self {
             continental,
             continental_frequency: config.terrain_continental_frequency,
             continental_amplitude: config.terrain_continental_amplitude,
+            mountain_amplitude: config.terrain_mountain_amplitude,
+            mountain_exponent: config.terrain_mountain_exponent,
             regional_smooth,
             regional_cliff,
             regional_frequency: config.terrain_regional_frequency,
@@ -197,6 +234,12 @@ impl TerrainGenerator {
             cliff_mask_frequency: config.terrain_cliff_mask_frequency,
             sea_compression_range: config.terrain_sea_compression_range.max(1.0),
             sea_compression_exponent: config.terrain_sea_compression_exponent,
+            temperature,
+            temperature_frequency: config.terrain_temperature_frequency,
+            humidity,
+            humidity_frequency: config.terrain_humidity_frequency,
+            desert_temperature_min: config.terrain_desert_temperature_min,
+            desert_humidity_max: config.terrain_desert_humidity_max,
             cave,
             cave_frequency: config.terrain_cave_frequency,
             cave_threshold: config.terrain_cave_threshold,
@@ -219,7 +262,13 @@ impl TerrainGenerator {
     }
 
     #[inline]
-    fn sample2d(&self, noise: &Noise<common_noise::Perlin>, frequency: f32, world_x: i32, world_z: i32) -> f32 {
+    fn sample2d<N: NoiseFunction<Vec2, Output = f32>>(
+        &self,
+        noise: &Noise<N>,
+        frequency: f32,
+        world_x: i32,
+        world_z: i32,
+    ) -> f32 {
         let point = Vec2::new(
             world_x as f32 * frequency + self.noise_origin_offset,
             world_z as f32 * frequency + self.noise_origin_offset,
@@ -276,11 +325,27 @@ impl TerrainGenerator {
         let mask_raw = self.sample2d(&self.cliff_mask, self.cliff_mask_frequency, world_x, world_z);
         let blend = signed_pow(mask_raw, MASK_CONTRAST_EXPONENT) * 0.5 + 0.5;
 
+        // Continentalness-Shaping: `unorm^exponent` haelt Ebenen/Meere flach (unorm um 0.5 traegt
+        // kaum bei) und laesst NUR die Kontinentalmaxima exponentiell zu Bergmassiven hochschiessen -
+        // reuse desselben Kontinental-Samples, keine zusaetzliche Rauschprobe.
+        let mountain = ((continental + 1.0) * 0.5).powf(self.mountain_exponent) * self.mountain_amplitude;
+
         let regional_shape = lerp(smooth, cliff, blend);
-        let raw_height =
-            SEA_LEVEL as f32 + continental * self.continental_amplitude + regional_shape * self.regional_amplitude;
+        let raw_height = SEA_LEVEL as f32
+            + continental * self.continental_amplitude
+            + mountain
+            + regional_shape * self.regional_amplitude;
 
         self.compress_toward_sea_level(raw_height)
+    }
+
+    /// Wasserfuellung: NUR ueber der Terrainoberflaeche bis zum Wasserspiegel (Ozeane/Seen in
+    /// Senken) - Positionen unter der Oberflaeche (auch ausgehoehlte) bleiben unberuehrt, Hoehlen
+    /// fluten also nie. Reines O(1)-Praedikat aus der Spaltenhoehe, keine zusaetzliche Rauschprobe -
+    /// exakt dieselbe Formel fuer `generate_chunk` (Befuellung) und `is_solid` (Fallback).
+    #[inline(always)]
+    fn is_water_position(height: i32, world_y: i32) -> bool {
+        world_y > height && world_y <= WATER_LEVEL
     }
 
     /// Drueckt Hoehen nahe `SEA_LEVEL` mit sanft steigender Staerke Richtung Meereshoehe (flache
@@ -325,47 +390,47 @@ impl TerrainGenerator {
         })
     }
 
-    /// Rohwerte EINES Tunnel-Gitterpunkts (`min(tunnel_a,tunnel_b)`, `min(connector_a,connector_b)`),
+    /// Rohwerte EINES Tunnel-Gitterpunkts (die 4 Ridged-Betraege, s. `TunnelGridChannels`),
     /// `TUNNEL_GRID_CACHE`-gecached - s. Kommentar dort. `gx`/`gy`/`gz` sind bereits durch
     /// `TUNNEL_GRID_STRIDE` geteilte Gitterkoordinaten, keine Weltkoordinaten.
-    fn tunnel_grid_corner(&self, gx: i32, gy: i32, gz: i32) -> (f32, f32) {
+    fn tunnel_grid_corner(&self, gx: i32, gy: i32, gz: i32) -> TunnelGridChannels {
         let slot = tunnel_grid_slot(gx, gy, gz);
         TUNNEL_GRID_CACHE.with_borrow_mut(|cache| {
-            let (cached_x, cached_y, cached_z, main_min, connector_min) = cache[slot];
+            let (cached_x, cached_y, cached_z, channels) = cache[slot];
             if cached_x == gx && cached_y == gy && cached_z == gz {
-                return (main_min, connector_min);
+                return channels;
             }
 
             let world_x = gx * TUNNEL_GRID_STRIDE;
             let world_y = gy * TUNNEL_GRID_STRIDE;
             let world_z = gz * TUNNEL_GRID_STRIDE;
-            let a = self.sample3d(&self.tunnel_a, self.tunnel_frequency, world_x, world_y, world_z);
-            let b = self.sample3d(&self.tunnel_b, self.tunnel_frequency, world_x, world_y, world_z);
-            let ca = self.sample3d(&self.connector_a, self.connector_frequency, world_x, world_y, world_z);
-            let cb = self.sample3d(&self.connector_b, self.connector_frequency, world_x, world_y, world_z);
-            let result = (a.min(b), ca.min(cb));
-            cache[slot] = (gx, gy, gz, result.0, result.1);
-            result
+            let channels = [
+                self.sample3d(&self.tunnel_a, self.tunnel_frequency, world_x, world_y, world_z).abs(),
+                self.sample3d(&self.tunnel_b, self.tunnel_frequency, world_x, world_y, world_z).abs(),
+                self.sample3d(&self.connector_a, self.connector_frequency, world_x, world_y, world_z).abs(),
+                self.sample3d(&self.connector_b, self.connector_frequency, world_x, world_y, world_z).abs(),
+            ];
+            cache[slot] = (gx, gy, gz, channels);
+            channels
         })
     }
 
     /// XZ-bilineare Interpolation der Tunnel-Traegerwerte auf EINER Gitter-Y-Ebene (`gy`, bereits
     /// durch `TUNNEL_GRID_STRIDE` geteilt) - Baustein von `tunnel_fields_at` UND
     /// `tunnel_column_layers`, damit beide Pfade garantiert dieselbe Formel nutzen.
-    fn tunnel_xz_layer(&self, gx0: i32, gz0: i32, tx: f32, tz: f32, gy: i32) -> (f32, f32) {
-        let lerp2 = |a: (f32, f32), b: (f32, f32), t: f32| (lerp(a.0, b.0, t), lerp(a.1, b.1, t));
+    fn tunnel_xz_layer(&self, gx0: i32, gz0: i32, tx: f32, tz: f32, gy: i32) -> TunnelGridChannels {
         let c00 = self.tunnel_grid_corner(gx0, gy, gz0);
         let c10 = self.tunnel_grid_corner(gx0 + 1, gy, gz0);
         let c01 = self.tunnel_grid_corner(gx0, gy, gz0 + 1);
         let c11 = self.tunnel_grid_corner(gx0 + 1, gy, gz0 + 1);
-        lerp2(lerp2(c00, c10, tx), lerp2(c01, c11, tx), tz)
+        lerp_channels(lerp_channels(c00, c10, tx), lerp_channels(c01, c11, tx), tz)
     }
 
     /// Trilineare Interpolation der Tunnel-Traegerwerte an einer beliebigen Weltposition - fuer
     /// Einzelabfragen (`is_solid`-Fallback). Fuer die Bulk-Fuellung in `generate_chunk` s. stattdessen
     /// `tunnel_column_layers`/`tunnel_from_layers`, die dieselbe XZ-Ebene ueber 32 Y-Voxel
     /// wiederverwenden statt sie pro Voxel neu zu berechnen.
-    fn tunnel_fields_at(&self, world_x: i32, world_y: i32, world_z: i32) -> (f32, f32) {
+    fn tunnel_fields_at(&self, world_x: i32, world_y: i32, world_z: i32) -> TunnelGridChannels {
         let gx0 = world_x.div_euclid(TUNNEL_GRID_STRIDE);
         let gz0 = world_z.div_euclid(TUNNEL_GRID_STRIDE);
         let gy0 = world_y.div_euclid(TUNNEL_GRID_STRIDE);
@@ -375,29 +440,30 @@ impl TerrainGenerator {
 
         let bottom = self.tunnel_xz_layer(gx0, gz0, tx, tz, gy0);
         let top = self.tunnel_xz_layer(gx0, gz0, tx, tz, gy0 + 1);
-        (lerp(bottom.0, top.0, ty), lerp(bottom.1, top.1, ty))
+        lerp_channels(bottom, top, ty)
     }
 
-    /// Ob `(main_min, connector_min)` bei `world_y` einen Tunnel ergeben - einzige Stelle, die die
-    /// Schwellwert-/Tiefenverbreiterungs-Formel kennt, genutzt von `is_tunnel` UND
+    /// Ob die 4 interpolierten Ridged-Betraege bei `world_y` einen Tunnel ergeben - einzige Stelle,
+    /// die die Schwellwert-/Tiefenverbreiterungs-Formel kennt, genutzt von `is_tunnel` UND
     /// `tunnel_from_layers` (garantiert identisches Ergebnis fuer beide Performance-Pfade).
-    fn tunnel_threshold_check(&self, world_y: i32, main_min: f32, connector_min: f32) -> bool {
+    /// Ridged-Schnitt: `|a| < t` allein ergibt gekruemmte 2D-FLAECHEN (die Null-Isoflaeche eines
+    /// 3D-Perlin); der Schnitt ZWEIER unabhaengiger solcher Flaechen (`max(|a|,|b|) < t`) ergibt
+    /// deren 1D-Schnittkurven - wurmartige, zusammenhaengende Roehren ("Spaghetti Caves").
+    fn tunnel_threshold_check(&self, world_y: i32, channels: TunnelGridChannels) -> bool {
         let depth_factor = ((SEA_LEVEL - world_y) as f32 / self.tunnel_widen_depth_range).clamp(0.0, 1.0);
         let widened_threshold = self.tunnel_threshold * (1.0 + self.tunnel_widen_max_multiplier * depth_factor);
-        main_min < widened_threshold || connector_min < self.connector_threshold
+        channels[0].max(channels[1]) < widened_threshold
+            || channels[2].max(channels[3]) < self.connector_threshold
     }
 
-    /// Haupt- + Verbindungstunnelnetz via Worley-Zellgrenzen (`WorleyDifference` nahe 0 = auf der
-    /// Grenze zwischen den 2 naechsten Zellpunkten = Tunnelwand - Zellgrenzen bilden im Gegensatz zu
-    /// isolierten Zellzentren ein zusammenhaengendes Netzwerk durch den ganzen Raum). 2 unabhaengige
-    /// Karten pro System ergeben ein verzweigteres, organischeres Netz als eine einzelne. Haupttunnel
-    /// werden mit der Tiefe breiter; die feineren, konstant duennen Verbindungstunnel schaffen dank
-    /// ihrer hoeheren Zellgrenzen-Dichte nebenbei mehr Querverbindungen und Oberflaecheneingaenge.
-    /// Nur aufgerufen, wenn `is_tunnel_region` bereits zugestimmt hat. Einzelabfrage-Pfad fuer
-    /// `is_solid` - s. Kommentar an `tunnel_fields_at`.
+    /// Haupt- + Verbindungs-Spaghetti-Tunnel via Ridged-Schnitt (s. `tunnel_threshold_check`).
+    /// Haupttunnel werden mit der Tiefe breiter; die feineren, konstant duennen Verbindungstunnel
+    /// schaffen Querverbindungen und Oberflaecheneingaenge. Nur aufgerufen, wenn `is_tunnel_region`
+    /// bereits zugestimmt hat. Einzelabfrage-Pfad fuer `is_solid` - s. Kommentar an
+    /// `tunnel_fields_at`.
     fn is_tunnel(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
-        let (main_min, connector_min) = self.tunnel_fields_at(world_x, world_y, world_z);
-        self.tunnel_threshold_check(world_y, main_min, connector_min)
+        let channels = self.tunnel_fields_at(world_x, world_y, world_z);
+        self.tunnel_threshold_check(world_y, channels)
     }
 
     /// Anzahl Tunnel-Gitter-Y-Ebenen, die eine volle Chunk-Spalte (`CHUNK_SIZE` Voxel) im
@@ -420,7 +486,7 @@ impl TerrainGenerator {
         world_z: i32,
         y_min: i32,
         y_max: i32,
-    ) -> (i32, [(f32, f32); Self::TUNNEL_COLUMN_MAX_LAYERS]) {
+    ) -> (i32, [TunnelGridChannels; Self::TUNNEL_COLUMN_MAX_LAYERS]) {
         let gx0 = world_x.div_euclid(TUNNEL_GRID_STRIDE);
         let gz0 = world_z.div_euclid(TUNNEL_GRID_STRIDE);
         let tx = world_x.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
@@ -429,7 +495,7 @@ impl TerrainGenerator {
         let gy_min = y_min.div_euclid(TUNNEL_GRID_STRIDE);
         let gy_max = y_max.div_euclid(TUNNEL_GRID_STRIDE) + 1;
 
-        let mut layers = [(0.0f32, 0.0f32); Self::TUNNEL_COLUMN_MAX_LAYERS];
+        let mut layers = [[0.0f32; 4]; Self::TUNNEL_COLUMN_MAX_LAYERS];
         for (i, layer) in layers.iter_mut().enumerate() {
             let gy = gy_min + i as i32;
             if gy > gy_max {
@@ -447,15 +513,13 @@ impl TerrainGenerator {
         &self,
         world_y: i32,
         gy_min: i32,
-        layers: &[(f32, f32); Self::TUNNEL_COLUMN_MAX_LAYERS],
+        layers: &[TunnelGridChannels; Self::TUNNEL_COLUMN_MAX_LAYERS],
     ) -> bool {
         let gy0 = world_y.div_euclid(TUNNEL_GRID_STRIDE);
         let ty = world_y.rem_euclid(TUNNEL_GRID_STRIDE) as f32 / TUNNEL_GRID_STRIDE as f32;
         let bottom = layers[(gy0 - gy_min) as usize];
         let top = layers[(gy0 - gy_min) as usize + 1];
-        let main_min = lerp(bottom.0, top.0, ty);
-        let connector_min = lerp(bottom.1, top.1, ty);
-        self.tunnel_threshold_check(world_y, main_min, connector_min)
+        self.tunnel_threshold_check(world_y, lerp_channels(bottom, top, ty))
     }
 
     /// Vereinigung aller Hoehlensysteme (Cheese Caves + regional gegatetes Tunnelnetz) UNTER dem
@@ -470,10 +534,23 @@ impl TerrainGenerator {
                 || (self.is_tunnel_region(world_x, world_z) && self.is_tunnel(world_x, world_y, world_z)))
     }
 
-    /// Fallback-Quelle der Wahrheit fuer Voxel-Festigkeit ausserhalb geladener/editierter
-    /// Chunk-Daten - genutzt vom Mesher (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten
-    /// Chunks) UND von `ChunkManager::is_solid_at` fuer Regionen, die (noch) nicht geladen sind.
+    /// Fallback-Quelle der Wahrheit fuer OKKLUSION ("belegt diese Position einen sichtbaren Block?",
+    /// inklusive Wasser - opak gerendert) ausserhalb geladener Chunk-Daten - genutzt vom Mesher
+    /// (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten Chunks). MUSS exakt `block != 0`
+    /// des spaeter generierten Chunks vorhersagen, also Wasser einschliessen - sonst entstehen an
+    /// Ozean-Chunk-Naehten dieselben dauerhaften Face-Fehler wie beim fruehen Hoehen-Bug.
     pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        let height = self.height_at(world_x, world_z);
+        if Self::is_water_position(height, world_y) {
+            return true;
+        }
+        world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
+    }
+
+    /// Physik-Variante: Wasser ist begehbar/durchschwimmbar, also NICHT solide - nur echtes Terrain
+    /// blockiert. Fallback fuer `ChunkManager::is_solid_at` (Kollision/Raycast), waehrend der Mesher
+    /// die Okklusions-Variante `is_solid` nutzt.
+    pub fn is_physically_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let height = self.height_at(world_x, world_z);
         world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
     }
@@ -505,9 +582,9 @@ impl TerrainGenerator {
             }
         }
 
-        // Chunk liegt vollstaendig ueber der Terrainoberflaeche - reine Luft, `chunk.clear()` oben
-        // reicht bereits. Spart die komplette Hoehlen-Auswertung.
-        if chunk_origin_y > chunk_max_height {
+        // Chunk liegt vollstaendig ueber Terrainoberflaeche UND Wasserspiegel - reine Luft,
+        // `chunk.clear()` oben reicht bereits. Spart die komplette Hoehlen-/Wasser-Auswertung.
+        if chunk_origin_y > chunk_max_height && chunk_origin_y > WATER_LEVEL {
             return;
         }
 
@@ -519,24 +596,37 @@ impl TerrainGenerator {
             }
         };
 
-        let beach_half_range = (self.sea_compression_range * 0.25).max(1.0) as i32;
-
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
                 let height = local_height[(local_z * CHUNK_SIZE + local_x) as usize];
-                if chunk_origin_y > height {
+                let column_has_terrain = chunk_origin_y <= height;
+                let column_has_water = height < WATER_LEVEL && chunk_origin_y <= WATER_LEVEL;
+                if !column_has_terrain && !column_has_water {
                     continue;
                 }
 
                 let world_x = chunk_origin_x + local_x;
                 let world_z = chunk_origin_z + local_z;
 
+                // Wasserfuellung zuerst - billig (kein Rauschen, s. `is_water_position`) und
+                // unabhaengig von Hangneigung/Biom/Tunneln.
+                if column_has_water {
+                    let water_bottom = (height + 1).max(chunk_origin_y);
+                    let water_top = WATER_LEVEL.min(chunk_origin_y + CHUNK_SIZE - 1);
+                    for world_y in water_bottom..=water_top {
+                        chunk.set_block(local_x, world_y - chunk_origin_y, local_z, blocks::WATER);
+                    }
+                }
+                if !column_has_terrain {
+                    continue;
+                }
+
                 let slope = (height - height_lookup(local_x - 1, local_z))
                     .abs()
                     .max((height - height_lookup(local_x + 1, local_z)).abs())
                     .max((height - height_lookup(local_x, local_z - 1)).abs())
                     .max((height - height_lookup(local_x, local_z + 1)).abs());
-                let is_beach = (height - SEA_LEVEL).abs() <= beach_half_range;
+                let surface = self.column_surface(world_x, world_z, height);
 
                 // Einmal pro Spalte statt pro Voxel vorberechnet (s. Kommentar an
                 // `tunnel_column_layers`) - nur wenn `is_tunnel_region` ueberhaupt zustimmt. Deckt
@@ -563,10 +653,27 @@ impl TerrainGenerator {
                         }
                     }
 
-                    let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, is_beach);
+                    let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, surface);
                     chunk.set_block(local_x, local_y, local_z, block_id);
                 }
             }
+        }
+    }
+
+    /// Oberflaechen-Kontext einer Spalte: Hoehenband-Strand, Unterwasser-Boden und das strikte
+    /// 2D-Biom-Mapping (Wueste NUR bei Temperatur > min UND Feuchtigkeit < max). Temperatur/
+    /// Feuchtigkeit sind sehr niedrigfrequent + hart geschwellt - grosse zusammenhaengende Biome,
+    /// kein Einzelspalten-Bleeding. Bewusst NICHT Teil von `is_solid`: Biome aendern nur die
+    /// Block-ID (Sand vs. Gras), nie die Festigkeit - keine Konsistenzanforderung an den Fallback,
+    /// keine zusaetzlichen Rauschproben im Mesher-/Physik-Hotpath.
+    fn column_surface(&self, world_x: i32, world_z: i32, height: i32) -> ColumnSurface {
+        let beach_half_range = (self.sea_compression_range * 0.25).max(1.0) as i32;
+        let temperature = self.sample2d(&self.temperature, self.temperature_frequency, world_x, world_z);
+        let humidity = self.sample2d(&self.humidity, self.humidity_frequency, world_x, world_z);
+        ColumnSurface {
+            is_beach: (height - SEA_LEVEL).abs() <= beach_half_range,
+            is_underwater: height < WATER_LEVEL,
+            is_desert: temperature > self.desert_temperature_min && humidity < self.desert_humidity_max,
         }
     }
 }
@@ -622,10 +729,11 @@ mod tests {
         }
     }
 
-    /// Diagnose-Tool, KEIN Korrektheitstest - misst die tatsaechliche Verteilung der Tunnel-
-    /// Traeger-Werte (`min(a,b)` beider Worley-Karten je System) an vielen zufaelligen Punkten, um
-    /// `terrain_tunnel_threshold`/`terrain_connector_threshold`/`terrain_cave_region_threshold`
-    /// empirisch zu kalibrieren, statt sie zu erraten. Manuell ausfuehren mit:
+    /// Diagnose-Tool, KEIN Korrektheitstest - misst die tatsaechliche Verteilung der Ridged-
+    /// Tunnel-Traegerwerte (`max(|a|,|b|)` beider Perlin-Karten je System) an vielen zufaelligen
+    /// Punkten, um `terrain_tunnel_threshold`/`terrain_connector_threshold`/
+    /// `terrain_cave_region_threshold` empirisch zu kalibrieren, statt sie zu erraten. Manuell
+    /// ausfuehren mit:
     /// `cargo test --release --lib -- --ignored --nocapture calibrate_tunnel_thresholds`
     #[test]
     #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
@@ -638,38 +746,34 @@ mod tests {
             values[((values.len() as f64 - 1.0) * p) as usize]
         };
 
-        let mut tunnel_min: Vec<f32> = (0..N)
-            .map(|i| {
-                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
-                let a = generator.sample3d(&generator.tunnel_a, generator.tunnel_frequency, x, y, z);
-                let b = generator.sample3d(&generator.tunnel_b, generator.tunnel_frequency, x, y, z);
-                a.min(b)
-            })
-            .collect();
-        println!(
-            "tunnel min(a,b): p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
-            percentile(&mut tunnel_min, 0.01),
-            percentile(&mut tunnel_min, 0.02),
-            percentile(&mut tunnel_min, 0.05),
-            percentile(&mut tunnel_min, 0.10),
-            percentile(&mut tunnel_min, 0.50),
-        );
+        let mut ridged_percentiles = |label: &str,
+                                      map_a: &Noise<common_noise::Perlin>,
+                                      map_b: &Noise<common_noise::Perlin>,
+                                      frequency: f32| {
+            let mut values: Vec<f32> = (0..N)
+                .map(|i| {
+                    let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
+                    let a = generator.sample3d(map_a, frequency, x, y, z).abs();
+                    let b = generator.sample3d(map_b, frequency, x, y, z).abs();
+                    a.max(b)
+                })
+                .collect();
+            println!(
+                "{label} max(|a|,|b|): p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
+                percentile(&mut values, 0.01),
+                percentile(&mut values, 0.02),
+                percentile(&mut values, 0.05),
+                percentile(&mut values, 0.10),
+                percentile(&mut values, 0.50),
+            );
+        };
 
-        let mut connector_min: Vec<f32> = (0..N)
-            .map(|i| {
-                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
-                let a = generator.sample3d(&generator.connector_a, generator.connector_frequency, x, y, z);
-                let b = generator.sample3d(&generator.connector_b, generator.connector_frequency, x, y, z);
-                a.min(b)
-            })
-            .collect();
-        println!(
-            "connector min(a,b): p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
-            percentile(&mut connector_min, 0.01),
-            percentile(&mut connector_min, 0.02),
-            percentile(&mut connector_min, 0.05),
-            percentile(&mut connector_min, 0.10),
-            percentile(&mut connector_min, 0.50),
+        ridged_percentiles("tunnel", &generator.tunnel_a, &generator.tunnel_b, generator.tunnel_frequency);
+        ridged_percentiles(
+            "connector",
+            &generator.connector_a,
+            &generator.connector_b,
+            generator.connector_frequency,
         );
 
         let mut region: Vec<f32> = (0..N)
