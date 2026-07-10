@@ -133,6 +133,13 @@ pub struct DevSettings {
     /// Faktor, um den `terrain_tunnel_threshold` in maximaler Tiefe multipliziert wird (breitere
     /// Roehren).
     pub terrain_tunnel_widen_multiplier: f32,
+    /// Zweites, unabhaengiges Worley-Tunnelsystem (andere Frequenz/Seed als `terrain_tunnel_*`) -
+    /// verbindet isolierte Tunnelsegmente/Kavernen des primaeren Systems: zwei unabhaengige Voronoi-
+    /// Zellgrenz-Netze ueberlappen sich an ganz anderen Stellen als ein einzelnes, dadurch werden
+    /// Sackgassen des einen Systems oft vom anderen durchbrochen.
+    pub terrain_connector_frequency: f32,
+    pub terrain_connector_threshold: f32,
+    pub terrain_connector_widen_multiplier: f32,
     /// Frequenz des 2D-Gates, das entscheidet, ob eine Region ueberhaupt Tunnel bekommt.
     pub terrain_cave_region_frequency: f32,
     /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) gelten als "Hoehlen-aktive" Region.
@@ -207,7 +214,12 @@ impl Default for PlayerSettings {
 impl Default for DevSettings {
     fn default() -> Self {
         Self {
-            clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
+            clear_color: wgpu::Color {
+                r: 0.02,
+                g: 0.02,
+                b: 0.02,
+                a: 1.0,
+            },
             gravity: 26.0,
             jump_speed: 9.0,
             terminal_velocity: 80.0,
@@ -272,6 +284,15 @@ impl Default for DevSettings {
             // geraten. 0.0012 (~p1.5) haelt Tunnel duenn statt den kompletten Zellraum auszuhoehlen.
             terrain_tunnel_frequency: 0.028,
             terrain_tunnel_threshold: 0.0012,
+            // Hoehere Frequenz (kleinere Zellen) als das primaere Tunnelsystem - ein unabhaengiges,
+            // ANDERS geformtes Zellgrenz-Netz, damit es Sackgassen aus einer voellig anderen Richtung
+            // durchbricht statt einfach eine zweite Kopie desselben Musters zu sein. Schwelle
+            // absichtlich etwas kleiner/spaerlicher als das primaere System (0.0012) - "kleine
+            // Verbindungstunnel", kein zweites Vollnetz. Platzhalter, empirisch kalibriert via
+            // `calibrate_cave_thresholds`.
+            terrain_connector_frequency: 0.045,
+            terrain_connector_threshold: 0.0008,
+            terrain_connector_widen_multiplier: 1.0,
             // Gemeinsamer Tiefenfaktor fuer beide Systeme - ab hier (Bloecke unter Meeresspiegel)
             // volle Verbreiterung.
             terrain_cave_widen_depth_range: 150.0,
@@ -328,7 +349,10 @@ pub const CHUNK_POOL_SAFETY_CAP: usize = 65_536;
 
 /// `(2*render_distance+1)^2 * (2*vertical_render_distance+1)` - die Anzahl Chunks, die gleichzeitig
 /// innerhalb des Ladefensters liegen koennen.
-fn required_chunk_pool_size(render_distance_chunks: i32, vertical_render_distance_chunks: i32) -> usize {
+fn required_chunk_pool_size(
+    render_distance_chunks: i32,
+    vertical_render_distance_chunks: i32,
+) -> usize {
     let horizontal_span = 2 * render_distance_chunks as i64 + 1;
     let vertical_span = 2 * vertical_render_distance_chunks as i64 + 1;
     (horizontal_span * horizontal_span * vertical_span) as usize
@@ -349,8 +373,10 @@ impl EngineConfig {
     ///   Render-Distanz sichtbare Chunks kommentarlos aus dem Draw fallen ("kuenstlich limitierte
     ///   Sichtweite"). Kostet 2*16 Byte pro Slot ueber 6 Richtungen - vernachlaessigbar.
     fn normalized(mut self) -> Self {
-        let required =
-            required_chunk_pool_size(self.player.render_distance_chunks, self.player.vertical_render_distance_chunks);
+        let required = required_chunk_pool_size(
+            self.player.render_distance_chunks,
+            self.player.vertical_render_distance_chunks,
+        );
         if required > CHUNK_POOL_SAFETY_CAP {
             log::warn!(
                 "Render-Distanz {}x{} braeuchte {} Chunk-Pool-Slots, gedeckelt auf {} ({} GiB RAM) - \
@@ -362,8 +388,14 @@ impl EngineConfig {
                 CHUNK_POOL_SAFETY_CAP * 64 / 1024 / 1024,
             );
         }
-        self.dev.chunk_pool_size = self.dev.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
-        self.dev.max_draws_per_direction = self.dev.max_draws_per_direction.max(self.dev.chunk_pool_size);
+        self.dev.chunk_pool_size = self
+            .dev
+            .chunk_pool_size
+            .max(required.min(CHUNK_POOL_SAFETY_CAP));
+        self.dev.max_draws_per_direction = self
+            .dev
+            .max_draws_per_direction
+            .max(self.dev.chunk_pool_size);
         self
     }
 
@@ -380,7 +412,10 @@ impl EngineConfig {
                     file.into()
                 }
                 Err(error) => {
-                    log::error!("Konfiguration {} fehlerhaft ({error}) - nutze Defaults", path.display());
+                    log::error!(
+                        "Konfiguration {} fehlerhaft ({error}) - nutze Defaults",
+                        path.display()
+                    );
                     Self::default().normalized()
                 }
             },
@@ -392,7 +427,10 @@ impl EngineConfig {
                         if let Err(error) = std::fs::write(path, serialized) {
                             log::warn!("Konnte {} nicht schreiben: {error}", path.display());
                         } else {
-                            log::info!("Standard-Konfiguration nach {} geschrieben", path.display());
+                            log::info!(
+                                "Standard-Konfiguration nach {} geschrieben",
+                                path.display()
+                            );
                         }
                     }
                     Err(error) => log::warn!("Konnte Konfiguration nicht serialisieren: {error}"),
@@ -475,6 +513,9 @@ struct DevSettingsFile {
     terrain_cheese_threshold: f32,
     terrain_tunnel_frequency: f32,
     terrain_tunnel_threshold: f32,
+    terrain_connector_frequency: f32,
+    terrain_connector_threshold: f32,
+    terrain_connector_widen_multiplier: f32,
     terrain_cave_widen_depth_range: f32,
     terrain_cheese_widen_amount: f32,
     terrain_tunnel_widen_multiplier: f32,
@@ -635,6 +676,9 @@ impl From<DevSettings> for DevSettingsFile {
             terrain_cheese_threshold: d.terrain_cheese_threshold,
             terrain_tunnel_frequency: d.terrain_tunnel_frequency,
             terrain_tunnel_threshold: d.terrain_tunnel_threshold,
+            terrain_connector_frequency: d.terrain_connector_frequency,
+            terrain_connector_threshold: d.terrain_connector_threshold,
+            terrain_connector_widen_multiplier: d.terrain_connector_widen_multiplier,
             terrain_cave_widen_depth_range: d.terrain_cave_widen_depth_range,
             terrain_cheese_widen_amount: d.terrain_cheese_widen_amount,
             terrain_tunnel_widen_multiplier: d.terrain_tunnel_widen_multiplier,
@@ -721,6 +765,9 @@ impl From<DevSettingsFile> for DevSettings {
             terrain_cheese_threshold: f.terrain_cheese_threshold,
             terrain_tunnel_frequency: f.terrain_tunnel_frequency,
             terrain_tunnel_threshold: f.terrain_tunnel_threshold,
+            terrain_connector_frequency: f.terrain_connector_frequency,
+            terrain_connector_threshold: f.terrain_connector_threshold,
+            terrain_connector_widen_multiplier: f.terrain_connector_widen_multiplier.max(0.0),
             terrain_cave_widen_depth_range: f.terrain_cave_widen_depth_range.max(1.0),
             terrain_cheese_widen_amount: f.terrain_cheese_widen_amount.max(0.0),
             terrain_tunnel_widen_multiplier: f.terrain_tunnel_widen_multiplier.max(0.0),
@@ -731,9 +778,13 @@ impl From<DevSettingsFile> for DevSettings {
             terrain_tree_grid_size: f.terrain_tree_grid_size.max(1),
             terrain_tree_spawn_chance: f.terrain_tree_spawn_chance.clamp(0.0, 1.0),
             terrain_tree_trunk_height_min: f.terrain_tree_trunk_height_min.max(1),
-            terrain_tree_trunk_height_max: f.terrain_tree_trunk_height_max.max(f.terrain_tree_trunk_height_min.max(1)),
+            terrain_tree_trunk_height_max: f
+                .terrain_tree_trunk_height_max
+                .max(f.terrain_tree_trunk_height_min.max(1)),
             terrain_tree_crown_radius_min: f.terrain_tree_crown_radius_min.max(0),
-            terrain_tree_crown_radius_max: f.terrain_tree_crown_radius_max.max(f.terrain_tree_crown_radius_min.max(0)),
+            terrain_tree_crown_radius_max: f
+                .terrain_tree_crown_radius_max
+                .max(f.terrain_tree_crown_radius_min.max(0)),
 
             player_half_width: f.player_half_width,
             player_height: f.player_height,
@@ -755,12 +806,19 @@ impl From<DevSettingsFile> for DevSettings {
 
 impl From<EngineConfig> for ConfigFile {
     fn from(c: EngineConfig) -> Self {
-        Self { player: PlayerSettingsFile::from(c.player), dev: DevSettingsFile::from(c.dev) }
+        Self {
+            player: PlayerSettingsFile::from(c.player),
+            dev: DevSettingsFile::from(c.dev),
+        }
     }
 }
 
 impl From<ConfigFile> for EngineConfig {
     fn from(f: ConfigFile) -> Self {
-        Self { player: PlayerSettings::from(f.player), dev: DevSettings::from(f.dev) }.normalized()
+        Self {
+            player: PlayerSettings::from(f.player),
+            dev: DevSettings::from(f.dev),
+        }
+        .normalized()
     }
 }

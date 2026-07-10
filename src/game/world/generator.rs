@@ -2,8 +2,8 @@ use std::cell::RefCell;
 
 use bevy_math::{Vec2, Vec3};
 use noiz::cell_noise::WorleyDifference;
-use noiz::{Noise, NoiseFunction};
 use noiz::prelude::*;
+use noiz::{Noise, NoiseFunction};
 
 use crate::engine::config::EngineConfig;
 
@@ -74,7 +74,8 @@ const COLUMN_CACHE_SLOTS: usize = 4096;
 
 #[inline(always)]
 fn column_cache_slot(world_x: i32, world_z: i32) -> usize {
-    let hash = (world_x as u32).wrapping_mul(0x9E37_79B1) ^ (world_z as u32).wrapping_mul(0x85EB_CA6B);
+    let hash =
+        (world_x as u32).wrapping_mul(0x9E37_79B1) ^ (world_z as u32).wrapping_mul(0x85EB_CA6B);
     (hash as usize) & (COLUMN_CACHE_SLOTS - 1)
 }
 
@@ -123,6 +124,12 @@ thread_local! {
     /// Tunnel-Worley-F2-F1-Distanz (1 Worley-Rohprobe/Gitterpunkt) - nur befuellt fuer Spalten, die
     /// `is_tunnel_region` passieren.
     static TUNNEL_GRID_CACHE: RefCell<[CaveGridCacheSlot; CAVE_GRID_CACHE_SLOTS]> =
+        const { RefCell::new([(i32::MIN, i32::MIN, i32::MIN, 0.0); CAVE_GRID_CACHE_SLOTS]) };
+    /// Wie `TUNNEL_GRID_CACHE`, fuer das zweite (Connector-)Worley-Tunnelsystem - eigener Cache,
+    /// weil dieselben (gx,gy,gz)-Koordinaten bei unterschiedlicher Frequenz einen ANDEREN Rohwert
+    /// ergeben (unterschiedliche Weltposition pro Gitterpunkt) - ein gemeinsamer Cache wuerde die
+    /// beiden Systeme gegenseitig eviktieren.
+    static CONNECTOR_GRID_CACHE: RefCell<[CaveGridCacheSlot; CAVE_GRID_CACHE_SLOTS]> =
         const { RefCell::new([(i32::MIN, i32::MIN, i32::MIN, 0.0); CAVE_GRID_CACHE_SLOTS]) };
 }
 
@@ -214,6 +221,15 @@ pub struct TerrainGenerator {
     tunnel: Noise<WorleyTunnel>,
     tunnel_frequency: f32,
     tunnel_threshold: f32,
+    /// Zweites, UNABHAENGIGES Worley-Tunnelsystem (andere Frequenz UND anderer Seed als `tunnel`) -
+    /// verbindet isolierte Sackgassen des primaeren Systems: zwei unabhaengige Voronoi-Zellgrenz-
+    /// Netze ueberschneiden sich an voellig anderen Stellen als ein einzelnes Netz mit sich selbst,
+    /// dadurch findet praktisch jede primaere Sackgasse frueher oder spaeter eine Querverbindung.
+    /// Nutzt DIESELBE `is_tunnel_region`-Gate wie `tunnel` (geografisch an dieselben "Hoehlen-
+    /// aktiven" Regionen gebunden, keine zusaetzliche 2D-Rauschprobe noetig).
+    connector: Noise<WorleyTunnel>,
+    connector_frequency: f32,
+    connector_threshold: f32,
     /// Gemeinsamer Tiefenfaktor: sowohl Cheese Caves als auch Tunnel werden graduell groesser, je
     /// weiter man unter `SEA_LEVEL` kommt - erreicht sein Maximum nach dieser Blocktiefe.
     cave_widen_depth_range: f32,
@@ -223,6 +239,8 @@ pub struct TerrainGenerator {
     /// Um welchen Faktor `tunnel_threshold` in maximaler Tiefe MULTIPLIZIERT wird (groesser ->
     /// breitere Roehren, da der Cutoff auf der F2-F1-Distanz dann grosszuegiger ist).
     tunnel_widen_multiplier: f32,
+    /// Wie `tunnel_widen_multiplier`, fuer `connector_threshold`.
+    connector_widen_multiplier: f32,
     /// Grobes 2D-Gate (1 Rauschprobe, gecached): nur "Hoehlen-aktive" Regionen zahlen ueberhaupt
     /// fuer das Tunnelsystem - s. Kommentar an `is_tunnel_region`.
     cave_region: Noise<common_noise::Perlin>,
@@ -277,6 +295,9 @@ impl TerrainGenerator {
         let mut tunnel = Noise::<WorleyTunnel>::default();
         tunnel.set_seed(config.dev.terrain_seed.wrapping_add(0x9E3B_2265));
 
+        let mut connector = Noise::<WorleyTunnel>::default();
+        connector.set_seed(config.dev.terrain_seed.wrapping_add(0x5BD1_E995));
+
         let mut cave_region = Noise::<common_noise::Perlin>::default();
         cave_region.set_seed(config.dev.terrain_seed.wrapping_add(0x1656_67B1));
 
@@ -306,9 +327,13 @@ impl TerrainGenerator {
             tunnel,
             tunnel_frequency: config.dev.terrain_tunnel_frequency,
             tunnel_threshold: config.dev.terrain_tunnel_threshold,
+            connector,
+            connector_frequency: config.dev.terrain_connector_frequency,
+            connector_threshold: config.dev.terrain_connector_threshold,
             cave_widen_depth_range: config.dev.terrain_cave_widen_depth_range.max(1.0),
             cheese_widen_amount: config.dev.terrain_cheese_widen_amount,
             tunnel_widen_multiplier: config.dev.terrain_tunnel_widen_multiplier,
+            connector_widen_multiplier: config.dev.terrain_connector_widen_multiplier,
             cave_region,
             cave_region_frequency: config.dev.terrain_cave_region_frequency,
             cave_region_threshold: config.dev.terrain_cave_region_threshold,
@@ -318,9 +343,15 @@ impl TerrainGenerator {
             tree_grid_size: config.dev.terrain_tree_grid_size.max(1),
             tree_spawn_chance: config.dev.terrain_tree_spawn_chance.clamp(0.0, 1.0),
             tree_trunk_height_min: config.dev.terrain_tree_trunk_height_min.max(1),
-            tree_trunk_height_max: config.dev.terrain_tree_trunk_height_max.max(config.dev.terrain_tree_trunk_height_min.max(1)),
+            tree_trunk_height_max: config
+                .dev
+                .terrain_tree_trunk_height_max
+                .max(config.dev.terrain_tree_trunk_height_min.max(1)),
             tree_crown_radius_min: config.dev.terrain_tree_crown_radius_min.max(0),
-            tree_crown_radius_max: config.dev.terrain_tree_crown_radius_max.max(config.dev.terrain_tree_crown_radius_min.max(0)),
+            tree_crown_radius_max: config
+                .dev
+                .terrain_tree_crown_radius_max
+                .max(config.dev.terrain_tree_crown_radius_min.max(0)),
         }
     }
 
@@ -381,17 +412,38 @@ impl TerrainGenerator {
     }
 
     fn raw_height_at(&self, world_x: i32, world_z: i32) -> f32 {
-        let continental = self.sample2d(&self.continental, self.continental_frequency, world_x, world_z);
-        let smooth = self.sample2d(&self.regional_smooth, self.regional_frequency, world_x, world_z);
-        let cliff_raw = self.sample2d(&self.regional_cliff, self.regional_frequency, world_x, world_z);
+        let continental = self.sample2d(
+            &self.continental,
+            self.continental_frequency,
+            world_x,
+            world_z,
+        );
+        let smooth = self.sample2d(
+            &self.regional_smooth,
+            self.regional_frequency,
+            world_x,
+            world_z,
+        );
+        let cliff_raw = self.sample2d(
+            &self.regional_cliff,
+            self.regional_frequency,
+            world_x,
+            world_z,
+        );
         let cliff = signed_pow(cliff_raw, CLIFF_CONTRAST_EXPONENT);
-        let mask_raw = self.sample2d(&self.cliff_mask, self.cliff_mask_frequency, world_x, world_z);
+        let mask_raw = self.sample2d(
+            &self.cliff_mask,
+            self.cliff_mask_frequency,
+            world_x,
+            world_z,
+        );
         let blend = signed_pow(mask_raw, MASK_CONTRAST_EXPONENT) * 0.5 + 0.5;
 
         // Continentalness-Shaping: `unorm^exponent` haelt Ebenen/Meere flach (unorm um 0.5 traegt
         // kaum bei) und laesst NUR die Kontinentalmaxima exponentiell zu Bergmassiven hochschiessen -
         // reuse desselben Kontinental-Samples, keine zusaetzliche Rauschprobe.
-        let mountain = ((continental + 1.0) * 0.5).powf(self.mountain_exponent) * self.mountain_amplitude;
+        let mountain =
+            ((continental + 1.0) * 0.5).powf(self.mountain_exponent) * self.mountain_amplitude;
 
         let regional_shape = lerp(smooth, cliff, blend);
         let raw_height = SEA_LEVEL as f32
@@ -445,6 +497,13 @@ impl TerrainGenerator {
         self.tunnel_threshold * (1.0 + self.tunnel_widen_multiplier * self.depth_factor(world_y))
     }
 
+    /// Wie `tunnel_threshold_at`, fuer das zweite (Connector-)Worley-Tunnelsystem.
+    #[inline(always)]
+    fn connector_threshold_at(&self, world_y: i32) -> f32 {
+        self.connector_threshold
+            * (1.0 + self.connector_widen_multiplier * self.depth_factor(world_y))
+    }
+
     /// Rohe Cheese-Cave-Dichte an EINEM Gitterpunkt (`gx`/`gy`/`gz` bereits durch
     /// `CAVE_GRID_STRIDE` geteilt), `CHEESE_GRID_CACHE`-gecached.
     fn cheese_grid_corner(&self, gx: i32, gy: i32, gz: i32) -> f32 {
@@ -454,7 +513,11 @@ impl TerrainGenerator {
             if cached_x == gx && cached_y == gy && cached_z == gz {
                 return value;
             }
-            let (wx, wy, wz) = (gx * CAVE_GRID_STRIDE, gy * CAVE_GRID_STRIDE, gz * CAVE_GRID_STRIDE);
+            let (wx, wy, wz) = (
+                gx * CAVE_GRID_STRIDE,
+                gy * CAVE_GRID_STRIDE,
+                gz * CAVE_GRID_STRIDE,
+            );
             let value = self.sample3d(&self.cheese, self.cheese_frequency, wx, wy, wz);
             cache[slot] = (gx, gy, gz, value);
             value
@@ -470,8 +533,33 @@ impl TerrainGenerator {
             if cached_x == gx && cached_y == gy && cached_z == gz {
                 return value;
             }
-            let (wx, wy, wz) = (gx * CAVE_GRID_STRIDE, gy * CAVE_GRID_STRIDE, gz * CAVE_GRID_STRIDE);
+            let (wx, wy, wz) = (
+                gx * CAVE_GRID_STRIDE,
+                gy * CAVE_GRID_STRIDE,
+                gz * CAVE_GRID_STRIDE,
+            );
             let value = self.sample3d(&self.tunnel, self.tunnel_frequency, wx, wy, wz);
+            cache[slot] = (gx, gy, gz, value);
+            value
+        })
+    }
+
+    /// Wie `tunnel_grid_corner`, fuer das zweite (Connector-)Worley-Tunnelsystem - andere Frequenz
+    /// UND anderer Noise-Seed, deshalb eigener Cache (`CONNECTOR_GRID_CACHE`). Nur aufgerufen, wenn
+    /// `is_tunnel_region` bereits zugestimmt hat (dieselbe Gate wie `tunnel_grid_corner`).
+    fn connector_grid_corner(&self, gx: i32, gy: i32, gz: i32) -> f32 {
+        let slot = cave_grid_slot(gx, gy, gz);
+        CONNECTOR_GRID_CACHE.with_borrow_mut(|cache| {
+            let (cached_x, cached_y, cached_z, value) = cache[slot];
+            if cached_x == gx && cached_y == gy && cached_z == gz {
+                return value;
+            }
+            let (wx, wy, wz) = (
+                gx * CAVE_GRID_STRIDE,
+                gy * CAVE_GRID_STRIDE,
+                gz * CAVE_GRID_STRIDE,
+            );
+            let value = self.sample3d(&self.connector, self.connector_frequency, wx, wy, wz);
             cache[slot] = (gx, gy, gz, value);
             value
         })
@@ -482,7 +570,13 @@ impl TerrainGenerator {
     /// Nutzt DIESELBEN Gitter-Ecken (`corner`) wie die Zellen-Bulk-Fuellung `cave_grid_stack` in
     /// `generate_chunk` - beide Pfade duerfen fuer denselben Voxel NIE unterschiedliche Werte
     /// liefern, s. Kommentar an `is_carved`.
-    fn cave_fields_at(&self, corner: impl Fn(&Self, i32, i32, i32) -> f32, world_x: i32, world_y: i32, world_z: i32) -> f32 {
+    fn cave_fields_at(
+        &self,
+        corner: impl Fn(&Self, i32, i32, i32) -> f32,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+    ) -> f32 {
         let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
         let gy0 = world_y.div_euclid(CAVE_GRID_STRIDE);
         let gz0 = world_z.div_euclid(CAVE_GRID_STRIDE);
@@ -516,8 +610,12 @@ impl TerrainGenerator {
             if cached_x == world_x && cached_z == world_z {
                 return cached_region;
             }
-            let region =
-                self.sample2d(&self.cave_region, self.cave_region_frequency, world_x, world_z) > self.cave_region_threshold;
+            let region = self.sample2d(
+                &self.cave_region,
+                self.cave_region_frequency,
+                world_x,
+                world_z,
+            ) > self.cave_region_threshold;
             cache[slot] = (world_x, world_z, region);
             region
         })
@@ -537,7 +635,8 @@ impl TerrainGenerator {
         if depth_from_surface < MIN_CAVE_DEPTH {
             return false;
         }
-        let cheese_density = self.cave_fields_at(Self::cheese_grid_corner, world_x, world_y, world_z);
+        let cheese_density =
+            self.cave_fields_at(Self::cheese_grid_corner, world_x, world_y, world_z);
         if cheese_density > self.cheese_threshold_at(world_y) {
             return true;
         }
@@ -545,7 +644,12 @@ impl TerrainGenerator {
             return false;
         }
         let tunnel_diff = self.cave_fields_at(Self::tunnel_grid_corner, world_x, world_y, world_z);
-        tunnel_diff < self.tunnel_threshold_at(world_y)
+        if tunnel_diff < self.tunnel_threshold_at(world_y) {
+            return true;
+        }
+        let connector_diff =
+            self.cave_fields_at(Self::connector_grid_corner, world_x, world_y, world_z);
+        connector_diff < self.connector_threshold_at(world_y)
     }
 
     /// Fallback-Quelle der Wahrheit fuer OKKLUSION ("belegt diese Position einen sichtbaren Block?",
@@ -611,7 +715,12 @@ impl TerrainGenerator {
     /// Tunnel-Gitter-Ecken werden je Achse (X fest, `gx0`/`gx0+1`) EINMAL ueber die volle
     /// (Y,Z)-Flaeche geholt und pro Punkt per Lerp kombiniert - exakt dieselbe Trilinear-Formel wie
     /// `cave_fields_at` (X innen, Z mitte, Y aussen), nur mit Array- statt Cache-Zugriffen.
-    pub fn solid_plane_x(&self, world_x: i32, chunk_origin_y: i32, chunk_origin_z: i32) -> BoundaryPlane {
+    pub fn solid_plane_x(
+        &self,
+        world_x: i32,
+        chunk_origin_y: i32,
+        chunk_origin_z: i32,
+    ) -> BoundaryPlane {
         let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
 
         let mut height_by_z = [0i32; PLANE_SIZE];
@@ -624,7 +733,9 @@ impl TerrainGenerator {
         // Gitterzellen-Suche fuer denselben (world_x, world_z) bis zu 32x wiederholt (einmal pro
         // Y-Wert dieser Spalte).
         let nearby_trees_by_z: [([TreeSpawn; MAX_NEARBY_TREES], usize); PLANE_SIZE] =
-            std::array::from_fn(|z| self.nearby_tree_candidates(world_x, chunk_origin_z + z as i32));
+            std::array::from_fn(|z| {
+                self.nearby_tree_candidates(world_x, chunk_origin_z + z as i32)
+            });
 
         let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
         let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
@@ -635,15 +746,68 @@ impl TerrainGenerator {
 
         let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
-        self.grid_slice(Self::cheese_grid_corner, |gy, gz| (gx0, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut cheese_a);
-        self.grid_slice(Self::cheese_grid_corner, |gy, gz| (gx0 + 1, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut cheese_b);
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gy, gz| (gx0, gy, gz),
+            gy_min,
+            gy_max,
+            gz_min,
+            gz_max,
+            &mut cheese_a,
+        );
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gy, gz| (gx0 + 1, gy, gz),
+            gy_min,
+            gy_max,
+            gz_min,
+            gz_max,
+            &mut cheese_b,
+        );
 
-        let any_tunnel_region = (0..PLANE_SIZE).any(|z| self.is_tunnel_region(world_x, chunk_origin_z + z as i32));
+        let any_tunnel_region =
+            (0..PLANE_SIZE).any(|z| self.is_tunnel_region(world_x, chunk_origin_z + z as i32));
         let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         if any_tunnel_region {
-            self.grid_slice(Self::tunnel_grid_corner, |gy, gz| (gx0, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut tunnel_a);
-            self.grid_slice(Self::tunnel_grid_corner, |gy, gz| (gx0 + 1, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut tunnel_b);
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gy, gz| (gx0, gy, gz),
+                gy_min,
+                gy_max,
+                gz_min,
+                gz_max,
+                &mut tunnel_a,
+            );
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gy, gz| (gx0 + 1, gy, gz),
+                gy_min,
+                gy_max,
+                gz_min,
+                gz_max,
+                &mut tunnel_b,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gy, gz| (gx0, gy, gz),
+                gy_min,
+                gy_max,
+                gz_min,
+                gz_max,
+                &mut connector_a,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gy, gz| (gx0 + 1, gy, gz),
+                gy_min,
+                gy_max,
+                gz_min,
+                gz_max,
+                &mut connector_b,
+            );
         }
 
         for (y, row) in out.iter_mut().enumerate() {
@@ -681,8 +845,11 @@ impl TerrainGenerator {
                         tz,
                     )
                 };
-                let cheese_density =
-                    lerp(xz_layer(&cheese_a, &cheese_b, iy0), xz_layer(&cheese_a, &cheese_b, iy1), ty);
+                let cheese_density = lerp(
+                    xz_layer(&cheese_a, &cheese_b, iy0),
+                    xz_layer(&cheese_a, &cheese_b, iy1),
+                    ty,
+                );
                 if cheese_density > self.cheese_threshold_at(world_y) {
                     continue;
                 }
@@ -690,11 +857,25 @@ impl TerrainGenerator {
                     *cell = true;
                     continue;
                 }
-                let tunnel_diff =
-                    lerp(xz_layer(&tunnel_a, &tunnel_b, iy0), xz_layer(&tunnel_a, &tunnel_b, iy1), ty);
-                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
-                    *cell = true;
+                let tunnel_diff = lerp(
+                    xz_layer(&tunnel_a, &tunnel_b, iy0),
+                    xz_layer(&tunnel_a, &tunnel_b, iy1),
+                    ty,
+                );
+                if tunnel_diff < self.tunnel_threshold_at(world_y) {
+                    // Von Tunnel ausgehoehlt - bleibt Luft (`cell` bleibt `false`), Connector-Check
+                    // ueberfluessig.
+                    continue;
                 }
+                let connector_diff = lerp(
+                    xz_layer(&connector_a, &connector_b, iy0),
+                    xz_layer(&connector_a, &connector_b, iy1),
+                    ty,
+                );
+                if connector_diff < self.connector_threshold_at(world_y) {
+                    continue;
+                }
+                *cell = true;
             }
         }
 
@@ -705,7 +886,12 @@ impl TerrainGenerator {
     /// allgemeine Prinzip. Y ist in `cave_fields_at`s Formel die AEUSSERE Lerp-Achse: bei fixem Y
     /// liefert je EIN Gitter-Ausschnitt (an `gy0` bzw. `gy0+1`) direkt die komplette XZ-Ebene, ohne
     /// dass Grid A/B pro Punkt gemischt werden muessen (anders als bei X-/Z-Ebenen).
-    pub fn solid_plane_y(&self, world_y: i32, chunk_origin_x: i32, chunk_origin_z: i32) -> BoundaryPlane {
+    pub fn solid_plane_y(
+        &self,
+        world_y: i32,
+        chunk_origin_x: i32,
+        chunk_origin_z: i32,
+    ) -> BoundaryPlane {
         let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
 
         let mut height = [[0i32; PLANE_SIZE]; PLANE_SIZE];
@@ -724,8 +910,24 @@ impl TerrainGenerator {
 
         let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
-        self.grid_slice(Self::cheese_grid_corner, |gx, gz| (gx, gy0, gz), gx_min, gx_max, gz_min, gz_max, &mut cheese_a);
-        self.grid_slice(Self::cheese_grid_corner, |gx, gz| (gx, gy0 + 1, gz), gx_min, gx_max, gz_min, gz_max, &mut cheese_b);
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gx, gz| (gx, gy0, gz),
+            gx_min,
+            gx_max,
+            gz_min,
+            gz_max,
+            &mut cheese_a,
+        );
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gx, gz| (gx, gy0 + 1, gz),
+            gx_min,
+            gx_max,
+            gz_min,
+            gz_max,
+            &mut cheese_b,
+        );
 
         let mut any_tunnel_region = false;
         for x in 0..PLANE_SIZE {
@@ -737,9 +939,45 @@ impl TerrainGenerator {
         }
         let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         if any_tunnel_region {
-            self.grid_slice(Self::tunnel_grid_corner, |gx, gz| (gx, gy0, gz), gx_min, gx_max, gz_min, gz_max, &mut tunnel_a);
-            self.grid_slice(Self::tunnel_grid_corner, |gx, gz| (gx, gy0 + 1, gz), gx_min, gx_max, gz_min, gz_max, &mut tunnel_b);
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gx, gz| (gx, gy0, gz),
+                gx_min,
+                gx_max,
+                gz_min,
+                gz_max,
+                &mut tunnel_a,
+            );
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gx, gz| (gx, gy0 + 1, gz),
+                gx_min,
+                gx_max,
+                gz_min,
+                gz_max,
+                &mut tunnel_b,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gx, gz| (gx, gy0, gz),
+                gx_min,
+                gx_max,
+                gz_min,
+                gz_max,
+                &mut connector_a,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gx, gz| (gx, gy0 + 1, gz),
+                gx_min,
+                gx_max,
+                gz_min,
+                gz_max,
+                &mut connector_b,
+            );
         }
 
         for (x, row) in out.iter_mut().enumerate() {
@@ -770,7 +1008,11 @@ impl TerrainGenerator {
                 let (jz0, jz1) = ((gz0 - gz_min) as usize, (gz0 - gz_min + 1) as usize);
 
                 let xz_layer = |grid: &GridSlice| {
-                    lerp(lerp(grid[ix0][jz0], grid[ix1][jz0], tx), lerp(grid[ix0][jz1], grid[ix1][jz1], tx), tz)
+                    lerp(
+                        lerp(grid[ix0][jz0], grid[ix1][jz0], tx),
+                        lerp(grid[ix0][jz1], grid[ix1][jz1], tx),
+                        tz,
+                    )
                 };
                 let cheese_density = lerp(xz_layer(&cheese_a), xz_layer(&cheese_b), ty);
                 if cheese_density > self.cheese_threshold_at(world_y) {
@@ -781,9 +1023,14 @@ impl TerrainGenerator {
                     continue;
                 }
                 let tunnel_diff = lerp(xz_layer(&tunnel_a), xz_layer(&tunnel_b), ty);
-                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
-                    *cell = true;
+                if tunnel_diff < self.tunnel_threshold_at(world_y) {
+                    continue;
                 }
+                let connector_diff = lerp(xz_layer(&connector_a), xz_layer(&connector_b), ty);
+                if connector_diff < self.connector_threshold_at(world_y) {
+                    continue;
+                }
+                *cell = true;
             }
         }
 
@@ -795,7 +1042,12 @@ impl TerrainGenerator {
     /// kombinieren beide Gitter-Ausschnitte (an `gz0`/`gz0+1`) ueber `tz`, waehrend X (innen, `tx`)
     /// weiterhin INNERHALB jedes Ausschnitts kombiniert wird und Y (aussen, `ty`) wie gehabt zwei
     /// Zeilen mischt.
-    pub fn solid_plane_z(&self, world_z: i32, chunk_origin_x: i32, chunk_origin_y: i32) -> BoundaryPlane {
+    pub fn solid_plane_z(
+        &self,
+        world_z: i32,
+        chunk_origin_x: i32,
+        chunk_origin_y: i32,
+    ) -> BoundaryPlane {
         let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
 
         let mut height_by_x = [0i32; PLANE_SIZE];
@@ -812,15 +1064,68 @@ impl TerrainGenerator {
 
         let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
-        self.grid_slice(Self::cheese_grid_corner, |gx, gy| (gx, gy, gz0), gx_min, gx_max, gy_min, gy_max, &mut cheese_a);
-        self.grid_slice(Self::cheese_grid_corner, |gx, gy| (gx, gy, gz0 + 1), gx_min, gx_max, gy_min, gy_max, &mut cheese_b);
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gx, gy| (gx, gy, gz0),
+            gx_min,
+            gx_max,
+            gy_min,
+            gy_max,
+            &mut cheese_a,
+        );
+        self.grid_slice(
+            Self::cheese_grid_corner,
+            |gx, gy| (gx, gy, gz0 + 1),
+            gx_min,
+            gx_max,
+            gy_min,
+            gy_max,
+            &mut cheese_b,
+        );
 
-        let any_tunnel_region = (0..PLANE_SIZE).any(|x| self.is_tunnel_region(chunk_origin_x + x as i32, world_z));
+        let any_tunnel_region =
+            (0..PLANE_SIZE).any(|x| self.is_tunnel_region(chunk_origin_x + x as i32, world_z));
         let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut connector_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
         if any_tunnel_region {
-            self.grid_slice(Self::tunnel_grid_corner, |gx, gy| (gx, gy, gz0), gx_min, gx_max, gy_min, gy_max, &mut tunnel_a);
-            self.grid_slice(Self::tunnel_grid_corner, |gx, gy| (gx, gy, gz0 + 1), gx_min, gx_max, gy_min, gy_max, &mut tunnel_b);
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gx, gy| (gx, gy, gz0),
+                gx_min,
+                gx_max,
+                gy_min,
+                gy_max,
+                &mut tunnel_a,
+            );
+            self.grid_slice(
+                Self::tunnel_grid_corner,
+                |gx, gy| (gx, gy, gz0 + 1),
+                gx_min,
+                gx_max,
+                gy_min,
+                gy_max,
+                &mut tunnel_b,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gx, gy| (gx, gy, gz0),
+                gx_min,
+                gx_max,
+                gy_min,
+                gy_max,
+                &mut connector_a,
+            );
+            self.grid_slice(
+                Self::connector_grid_corner,
+                |gx, gy| (gx, gy, gz0 + 1),
+                gx_min,
+                gx_max,
+                gy_min,
+                gy_max,
+                &mut connector_b,
+            );
         }
 
         for (x, row) in out.iter_mut().enumerate() {
@@ -843,7 +1148,12 @@ impl TerrainGenerator {
                     continue;
                 }
                 if world_y > height {
-                    *cell = Self::tree_occupies_among(&nearby_trees[..nearby_tree_count], world_x, world_y, world_z);
+                    *cell = Self::tree_occupies_among(
+                        &nearby_trees[..nearby_tree_count],
+                        world_x,
+                        world_y,
+                        world_z,
+                    );
                     continue;
                 }
                 if height - world_y < MIN_CAVE_DEPTH {
@@ -856,10 +1166,17 @@ impl TerrainGenerator {
                 let (iy0, iy1) = ((gy0 - gy_min) as usize, (gy0 - gy_min + 1) as usize);
 
                 let layer_at = |grid_a: &GridSlice, grid_b: &GridSlice, iy: usize| {
-                    lerp(lerp(grid_a[ix0][iy], grid_a[ix1][iy], tx), lerp(grid_b[ix0][iy], grid_b[ix1][iy], tx), tz)
+                    lerp(
+                        lerp(grid_a[ix0][iy], grid_a[ix1][iy], tx),
+                        lerp(grid_b[ix0][iy], grid_b[ix1][iy], tx),
+                        tz,
+                    )
                 };
-                let cheese_density =
-                    lerp(layer_at(&cheese_a, &cheese_b, iy0), layer_at(&cheese_a, &cheese_b, iy1), ty);
+                let cheese_density = lerp(
+                    layer_at(&cheese_a, &cheese_b, iy0),
+                    layer_at(&cheese_a, &cheese_b, iy1),
+                    ty,
+                );
                 if cheese_density > self.cheese_threshold_at(world_y) {
                     continue;
                 }
@@ -867,10 +1184,23 @@ impl TerrainGenerator {
                     *cell = true;
                     continue;
                 }
-                let tunnel_diff = lerp(layer_at(&tunnel_a, &tunnel_b, iy0), layer_at(&tunnel_a, &tunnel_b, iy1), ty);
-                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
-                    *cell = true;
+                let tunnel_diff = lerp(
+                    layer_at(&tunnel_a, &tunnel_b, iy0),
+                    layer_at(&tunnel_a, &tunnel_b, iy1),
+                    ty,
+                );
+                if tunnel_diff < self.tunnel_threshold_at(world_y) {
+                    continue;
                 }
+                let connector_diff = lerp(
+                    layer_at(&connector_a, &connector_b, iy0),
+                    layer_at(&connector_a, &connector_b, iy1),
+                    ty,
+                );
+                if connector_diff < self.connector_threshold_at(world_y) {
+                    continue;
+                }
+                *cell = true;
             }
         }
 
@@ -942,7 +1272,11 @@ impl TerrainGenerator {
         c10: &[f32; CAVE_COLUMN_MAX_LAYERS],
         c01: &[f32; CAVE_COLUMN_MAX_LAYERS],
         c11: &[f32; CAVE_COLUMN_MAX_LAYERS],
-    ) -> ([f32; CAVE_COLUMN_MAX_LAYERS], [f32; CAVE_COLUMN_MAX_LAYERS], [f32; CAVE_COLUMN_MAX_LAYERS]) {
+    ) -> (
+        [f32; CAVE_COLUMN_MAX_LAYERS],
+        [f32; CAVE_COLUMN_MAX_LAYERS],
+        [f32; CAVE_COLUMN_MAX_LAYERS],
+    ) {
         let mut layers = [0.0f32; CAVE_COLUMN_MAX_LAYERS];
         let mut layer_min = [0.0f32; CAVE_COLUMN_MAX_LAYERS];
         let mut layer_max = [0.0f32; CAVE_COLUMN_MAX_LAYERS];
@@ -986,7 +1320,11 @@ impl TerrainGenerator {
     fn cave_from_layers(world_y: i32, gy_min: i32, layers: &[f32; CAVE_COLUMN_MAX_LAYERS]) -> f32 {
         let gy0 = world_y.div_euclid(CAVE_GRID_STRIDE);
         let ty = world_y.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
-        lerp(layers[(gy0 - gy_min) as usize], layers[(gy0 - gy_min) as usize + 1], ty)
+        lerp(
+            layers[(gy0 - gy_min) as usize],
+            layers[(gy0 - gy_min) as usize + 1],
+            ty,
+        )
     }
 
     /// Extremity Bound Checking: da trilineare Interpolation eine konvexe Kombination ihrer
@@ -1054,7 +1392,9 @@ impl TerrainGenerator {
         // Chunk liegt vollstaendig ueber Terrainoberflaeche UND Wasserspiegel (PLUS Sicherheitsmarge
         // fuer Baumkronen aus Nachbar-Spalten ausserhalb der eigenen 1024 Saeulen, s.
         // `TREE_HEIGHT_SAFETY_MARGIN`) - reine Luft, `chunk.clear()` oben reicht bereits.
-        if chunk_origin_y > chunk_max_height + TREE_HEIGHT_SAFETY_MARGIN && chunk_origin_y > WATER_LEVEL {
+        if chunk_origin_y > chunk_max_height + TREE_HEIGHT_SAFETY_MARGIN
+            && chunk_origin_y > WATER_LEVEL
+        {
             return;
         }
 
@@ -1089,21 +1429,29 @@ impl TerrainGenerator {
                     for cell_local_x in 0..CAVE_GRID_STRIDE {
                         let local_x = cell_x * CAVE_GRID_STRIDE + cell_local_x;
                         let local_z = cell_z * CAVE_GRID_STRIDE + cell_local_z;
-                        cell_max_height = cell_max_height.max(local_height[(local_z * CHUNK_SIZE + local_x) as usize]);
+                        cell_max_height = cell_max_height
+                            .max(local_height[(local_z * CHUNK_SIZE + local_x) as usize]);
                     }
                 }
-                let cell_gy_max = cave_gy_max.min(cell_max_height.min(chunk_origin_y + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1);
+                let cell_gy_max = cave_gy_max.min(
+                    cell_max_height
+                        .min(chunk_origin_y + CHUNK_SIZE - 1)
+                        .div_euclid(CAVE_GRID_STRIDE)
+                        + 1,
+                );
 
                 // Cheese Caves: ungegatet, EINMAL PRO ZELLE (16 Spalten) statt pro Spalte geholt -
                 // s. Kommentar an `cave_grid_stack`.
-                let (cheese_count, cheese_c00, cheese_c10, cheese_c01, cheese_c11) =
-                    self.cave_grid_stack(Self::cheese_grid_corner, gx0, gz0, cave_gy_min, cell_gy_max);
+                let (cheese_count, cheese_c00, cheese_c10, cheese_c01, cheese_c11) = self
+                    .cave_grid_stack(Self::cheese_grid_corner, gx0, gz0, cave_gy_min, cell_gy_max);
 
-                // Tunnel-Zellen-Stack wird NUR bei Bedarf geholt (erste Spalte der Zelle mit
-                // `is_tunnel_region == true`) und dann fuer den Rest der Zelle wiederverwendet - bei
-                // `cave_region_frequency` (500-Block-Wellenlaenge) ist das Ergebnis innerhalb einer
-                // 4-Block-Zelle so gut wie immer fuer alle 16 Spalten identisch.
+                // Tunnel-/Connector-Zellen-Stacks werden NUR bei Bedarf geholt (erste Spalte der
+                // Zelle mit `is_tunnel_region == true`) und dann fuer den Rest der Zelle
+                // wiederverwendet - bei `cave_region_frequency` (500-Block-Wellenlaenge) ist das
+                // Ergebnis innerhalb einer 4-Block-Zelle so gut wie immer fuer alle 16 Spalten
+                // identisch. Beide Systeme teilen sich dieselbe Gate (`is_tunnel_region`).
                 let mut tunnel_stack: Option<CaveGridStack> = None;
+                let mut connector_stack: Option<CaveGridStack> = None;
 
                 for cell_local_z in 0..CAVE_GRID_STRIDE {
                     for cell_local_x in 0..CAVE_GRID_STRIDE {
@@ -1111,7 +1459,8 @@ impl TerrainGenerator {
                         let local_z = cell_z * CAVE_GRID_STRIDE + cell_local_z;
                         let height = local_height[(local_z * CHUNK_SIZE + local_x) as usize];
                         let column_has_terrain = chunk_origin_y <= height;
-                        let column_has_water = height < WATER_LEVEL && chunk_origin_y <= WATER_LEVEL;
+                        let column_has_water =
+                            height < WATER_LEVEL && chunk_origin_y <= WATER_LEVEL;
                         if !column_has_terrain && !column_has_water {
                             continue;
                         }
@@ -1125,7 +1474,12 @@ impl TerrainGenerator {
                             let water_bottom = (height + 1).max(chunk_origin_y);
                             let water_top = WATER_LEVEL.min(chunk_origin_y + CHUNK_SIZE - 1);
                             for world_y in water_bottom..=water_top {
-                                chunk.set_block(local_x, world_y - chunk_origin_y, local_z, blocks::WATER);
+                                chunk.set_block(
+                                    local_x,
+                                    world_y - chunk_origin_y,
+                                    local_z,
+                                    blocks::WATER,
+                                );
                             }
                         }
                         if !column_has_terrain {
@@ -1139,22 +1493,25 @@ impl TerrainGenerator {
                             .max((height - height_lookup(local_x, local_z + 1)).abs());
                         let surface = self.column_surface(world_x, world_z, height);
 
-                        let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
-                        let tz = world_z.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+                        let tx =
+                            world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+                        let tz =
+                            world_z.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
 
                         // Bounds PRO SLAB (4-Voxel-Y-Streifen) statt fuer die ganze Spalte - bei voll
                         // unterirdischen 32-Voxel-Spalten wuerde ein spaltenweiter Bound fast immer
                         // auf `Maybe` degenerieren (s. Kommentar an `slab_bounds`), pro Slab loesen
                         // sich die meisten Streifen dagegen eindeutig auf.
-                        let (cheese_layers, cheese_layer_min, cheese_layer_max) = Self::cave_column_from_stack(
-                            tx,
-                            tz,
-                            cheese_count,
-                            &cheese_c00,
-                            &cheese_c10,
-                            &cheese_c01,
-                            &cheese_c11,
-                        );
+                        let (cheese_layers, cheese_layer_min, cheese_layer_max) =
+                            Self::cave_column_from_stack(
+                                tx,
+                                tz,
+                                cheese_count,
+                                &cheese_c00,
+                                &cheese_c10,
+                                &cheese_c01,
+                                &cheese_c11,
+                            );
                         let cheese_bounds = Self::slab_bounds(
                             cave_gy_min,
                             cheese_count,
@@ -1167,14 +1524,70 @@ impl TerrainGenerator {
                             .iter()
                             .any(|b| *b != CarveBound::Never);
 
-                        // Tunnel: nur ausgewertet, wenn die Spalte ueberhaupt in einer
+                        // Tunnel/Connector: nur ausgewertet, wenn die Spalte ueberhaupt in einer
                         // Hoehlen-aktiven Region liegt - CarveBound::Never ohne jede
                         // Gitter-Auswertung, wenn nicht.
                         let tunnel_region = self.is_tunnel_region(world_x, world_z);
-                        let (tunnel_count, tunnel_bounds, tunnel_any_carve, tunnel_layers) = if tunnel_region {
-                            let (count, c00, c10, c01, c11) = tunnel_stack.get_or_insert_with(|| {
-                                self.cave_grid_stack(Self::tunnel_grid_corner, gx0, gz0, cave_gy_min, cell_gy_max)
+                        let (tunnel_count, tunnel_bounds, tunnel_any_carve, tunnel_layers) =
+                            if tunnel_region {
+                                let (count, c00, c10, c01, c11) =
+                                    tunnel_stack.get_or_insert_with(|| {
+                                        self.cave_grid_stack(
+                                            Self::tunnel_grid_corner,
+                                            gx0,
+                                            gz0,
+                                            cave_gy_min,
+                                            cell_gy_max,
+                                        )
+                                    });
+                                let (layers, layer_min, layer_max) = Self::cave_column_from_stack(
+                                    tx, tz, *count, c00, c10, c01, c11,
+                                );
+                                let bounds = Self::slab_bounds(
+                                    cave_gy_min,
+                                    *count,
+                                    &layer_min,
+                                    &layer_max,
+                                    |y| self.tunnel_threshold_at(y),
+                                    true,
+                                );
+                                let any_carve = bounds[..count.saturating_sub(1)]
+                                    .iter()
+                                    .any(|b| *b != CarveBound::Never);
+                                (*count, bounds, any_carve, layers)
+                            } else {
+                                (
+                                    0,
+                                    [CarveBound::Never; CAVE_COLUMN_MAX_LAYERS],
+                                    false,
+                                    [0.0; CAVE_COLUMN_MAX_LAYERS],
+                                )
+                            };
+                        // Connector-Fetch nur, wenn er ueberhaupt etwas beitragen KOENNTE: wenn
+                        // Cheese oder Tunnel bereits JEDES beruehrte Slab auf `Always` aufloesen,
+                        // wird die Spalte per Kurzschluss (`||`) im Voxel-Loop unten sowieso nie bis
+                        // zum Connector-Check kommen - dann lohnt sich nicht mal die Gitter-Abfrage.
+                        let fully_resolved_without_connector = (0..cheese_count.saturating_sub(1))
+                            .all(|slab| {
+                                cheese_bounds[slab] == CarveBound::Always
+                                    || tunnel_bounds[slab] == CarveBound::Always
                             });
+                        let (
+                            connector_count,
+                            connector_bounds,
+                            connector_any_carve,
+                            connector_layers,
+                        ) = if tunnel_region && !fully_resolved_without_connector {
+                            let (count, c00, c10, c01, c11) =
+                                connector_stack.get_or_insert_with(|| {
+                                    self.cave_grid_stack(
+                                        Self::connector_grid_corner,
+                                        gx0,
+                                        gz0,
+                                        cave_gy_min,
+                                        cell_gy_max,
+                                    )
+                                });
                             let (layers, layer_min, layer_max) =
                                 Self::cave_column_from_stack(tx, tz, *count, c00, c10, c01, c11);
                             let bounds = Self::slab_bounds(
@@ -1182,13 +1595,20 @@ impl TerrainGenerator {
                                 *count,
                                 &layer_min,
                                 &layer_max,
-                                |y| self.tunnel_threshold_at(y),
+                                |y| self.connector_threshold_at(y),
                                 true,
                             );
-                            let any_carve = bounds[..count.saturating_sub(1)].iter().any(|b| *b != CarveBound::Never);
+                            let any_carve = bounds[..count.saturating_sub(1)]
+                                .iter()
+                                .any(|b| *b != CarveBound::Never);
                             (*count, bounds, any_carve, layers)
                         } else {
-                            (0, [CarveBound::Never; CAVE_COLUMN_MAX_LAYERS], false, [0.0; CAVE_COLUMN_MAX_LAYERS])
+                            (
+                                0,
+                                [CarveBound::Never; CAVE_COLUMN_MAX_LAYERS],
+                                false,
+                                [0.0; CAVE_COLUMN_MAX_LAYERS],
+                            )
                         };
 
                         for local_y in 0..CHUNK_SIZE {
@@ -1198,24 +1618,54 @@ impl TerrainGenerator {
                             }
 
                             let depth_from_surface = height - world_y;
-                            if depth_from_surface >= MIN_CAVE_DEPTH && (cheese_any_carve || tunnel_any_carve) {
-                                let slab = (world_y.div_euclid(CAVE_GRID_STRIDE) - cave_gy_min) as usize;
+                            if depth_from_surface >= MIN_CAVE_DEPTH
+                                && (cheese_any_carve || tunnel_any_carve || connector_any_carve)
+                            {
+                                let slab =
+                                    (world_y.div_euclid(CAVE_GRID_STRIDE) - cave_gy_min) as usize;
                                 let cheese_slab = cheese_bounds[slab];
-                                let tunnel_slab = if tunnel_count > 0 { tunnel_bounds[slab] } else { CarveBound::Never };
+                                let tunnel_slab = if tunnel_count > 0 {
+                                    tunnel_bounds[slab]
+                                } else {
+                                    CarveBound::Never
+                                };
+                                let connector_slab = if connector_count > 0 {
+                                    connector_bounds[slab]
+                                } else {
+                                    CarveBound::Never
+                                };
                                 let carved = cheese_slab == CarveBound::Always
                                     || tunnel_slab == CarveBound::Always
+                                    || connector_slab == CarveBound::Always
                                     || (cheese_slab == CarveBound::Maybe
-                                        && Self::cave_from_layers(world_y, cave_gy_min, &cheese_layers)
-                                            > self.cheese_threshold_at(world_y))
+                                        && Self::cave_from_layers(
+                                            world_y,
+                                            cave_gy_min,
+                                            &cheese_layers,
+                                        ) > self.cheese_threshold_at(world_y))
                                     || (tunnel_slab == CarveBound::Maybe
-                                        && Self::cave_from_layers(world_y, cave_gy_min, &tunnel_layers)
-                                            < self.tunnel_threshold_at(world_y));
+                                        && Self::cave_from_layers(
+                                            world_y,
+                                            cave_gy_min,
+                                            &tunnel_layers,
+                                        ) < self.tunnel_threshold_at(world_y))
+                                    || (connector_slab == CarveBound::Maybe
+                                        && Self::cave_from_layers(
+                                            world_y,
+                                            cave_gy_min,
+                                            &connector_layers,
+                                        ) < self.connector_threshold_at(world_y));
                                 if carved {
                                     continue;
                                 }
                             }
 
-                            let block_id = blocks::surface_block(depth_from_surface, slope, self.dirt_layer_depth, surface);
+                            let block_id = blocks::surface_block(
+                                depth_from_surface,
+                                slope,
+                                self.dirt_layer_depth,
+                                surface,
+                            );
                             chunk.set_block(local_x, local_y, local_z, block_id);
                         }
                     }
@@ -1233,13 +1683,19 @@ impl TerrainGenerator {
     /// Block-ID (Sand vs. Gras), nie die Festigkeit - keine Konsistenzanforderung an den Fallback,
     /// keine zusaetzlichen Rauschproben im Mesher-/Physik-Hotpath.
     fn column_surface(&self, world_x: i32, world_z: i32, height: i32) -> ColumnSurface {
-        let temperature = self.sample2d(&self.temperature, self.temperature_frequency, world_x, world_z);
+        let temperature = self.sample2d(
+            &self.temperature,
+            self.temperature_frequency,
+            world_x,
+            world_z,
+        );
         let humidity = self.sample2d(&self.humidity, self.humidity_frequency, world_x, world_z);
         let rock_height = ROCK_HEIGHT + temperature * ROCK_HEIGHT_TEMPERATURE_DITHER;
         ColumnSurface {
             is_beach: (height - WATER_LEVEL).abs() <= BEACH_HALF_RANGE,
             is_underwater: height < WATER_LEVEL,
-            is_desert: temperature > self.desert_temperature_min && humidity < self.desert_humidity_max,
+            is_desert: temperature > self.desert_temperature_min
+                && humidity < self.desert_humidity_max,
             is_rock: height as f32 > rock_height,
             temperature,
         }
@@ -1295,7 +1751,9 @@ mod tests {
         // die dieser Test bewusst nicht mitprueft).
         'search: for cell_z in -20..20 {
             for cell_x in -20..20 {
-                let Some(tree) = generator.tree_candidate(cell_x, cell_z) else { continue };
+                let Some(tree) = generator.tree_candidate(cell_x, cell_z) else {
+                    continue;
+                };
                 let crosses_x = (tree.world_x - tree.crown_radius).div_euclid(CHUNK_SIZE)
                     != (tree.world_x + tree.crown_radius).div_euclid(CHUNK_SIZE);
                 let crosses_z = (tree.world_z - tree.crown_radius).div_euclid(CHUNK_SIZE)
@@ -1334,7 +1792,8 @@ mod tests {
                 for world_y in (tree.ground_y + 1)..=trunk_top {
                     expected.insert((tree.world_x, world_y, tree.world_z), blocks::LOG);
                 }
-                let root = glam::Vec3::new(tree.world_x as f32, trunk_top as f32, tree.world_z as f32);
+                let root =
+                    glam::Vec3::new(tree.world_x as f32, trunk_top as f32, tree.world_z as f32);
                 let node_count = tree.node_count as usize;
                 for i in 1..node_count {
                     let from = root + tree.nodes[tree.parents[i] as usize];
@@ -1345,14 +1804,17 @@ mod tests {
                         for wz in min.z.floor() as i32..=max.z.ceil() as i32 {
                             for wx in min.x.floor() as i32..=max.x.ceil() as i32 {
                                 let p = glam::Vec3::new(wx as f32, wy as f32, wz as f32);
-                                if super::flora::point_to_segment_distance(p, from, to) <= super::flora::BRANCH_RADIUS {
+                                if super::flora::point_to_segment_distance(p, from, to)
+                                    <= super::flora::BRANCH_RADIUS
+                                {
                                     expected.entry((wx, wy, wz)).or_insert(blocks::LOG);
                                 }
                             }
                         }
                     }
                 }
-                let leaf_radius = super::flora::leaf_cluster_radius(tree.species, tree.crown_radius as f32);
+                let leaf_radius =
+                    super::flora::leaf_cluster_radius(tree.species, tree.crown_radius as f32);
                 for i in 0..node_count {
                     let center = root + tree.nodes[i];
                     let min = center - glam::Vec3::splat(leaf_radius);
@@ -1393,7 +1855,12 @@ mod tests {
                 for (world_x, world_y, world_z, expected_block, chunk_coord) in verified {
                     let chunk = chunk_cache.entry(chunk_coord).or_insert_with(|| {
                         let mut c = Chunk::empty();
-                        generator.generate_chunk(chunk_coord.0, chunk_coord.1, chunk_coord.2, &mut c);
+                        generator.generate_chunk(
+                            chunk_coord.0,
+                            chunk_coord.1,
+                            chunk_coord.2,
+                            &mut c,
+                        );
                         c
                     });
                     let local_x = world_x.rem_euclid(CHUNK_SIZE);
@@ -1546,7 +2013,11 @@ mod tests {
 
         let mut cheese: Vec<f32> = (0..N)
             .map(|i| {
-                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
+                let (x, y, z) = (
+                    i as i32 * 37 - 700_000,
+                    i as i32 * 11 - 50_000,
+                    i as i32 * 53 - 900_000,
+                );
                 generator.sample3d(&generator.cheese, generator.cheese_frequency, x, y, z)
             })
             .collect();
@@ -1561,7 +2032,11 @@ mod tests {
 
         let mut tunnel: Vec<f32> = (0..N)
             .map(|i| {
-                let (x, y, z) = (i as i32 * 37 - 700_000, i as i32 * 11 - 50_000, i as i32 * 53 - 900_000);
+                let (x, y, z) = (
+                    i as i32 * 37 - 700_000,
+                    i as i32 * 11 - 50_000,
+                    i as i32 * 53 - 900_000,
+                );
                 generator.sample3d(&generator.tunnel, generator.tunnel_frequency, x, y, z)
             })
             .collect();
@@ -1574,10 +2049,34 @@ mod tests {
             percentile(&mut tunnel, 0.50),
         );
 
+        let mut connector: Vec<f32> = (0..N)
+            .map(|i| {
+                let (x, y, z) = (
+                    i as i32 * 37 - 700_000,
+                    i as i32 * 11 - 50_000,
+                    i as i32 * 53 - 900_000,
+                );
+                generator.sample3d(&generator.connector, generator.connector_frequency, x, y, z)
+            })
+            .collect();
+        println!(
+            "connector F2-F1: p1={:.4} p2={:.4} p5={:.4} p10={:.4} p50={:.4}",
+            percentile(&mut connector, 0.01),
+            percentile(&mut connector, 0.02),
+            percentile(&mut connector, 0.05),
+            percentile(&mut connector, 0.10),
+            percentile(&mut connector, 0.50),
+        );
+
         let mut region: Vec<f32> = (0..N)
             .map(|i| {
                 let (x, z) = (i as i32 * 37 - 700_000, i as i32 * 53 - 900_000);
-                generator.sample2d(&generator.cave_region, generator.cave_region_frequency, x, z)
+                generator.sample2d(
+                    &generator.cave_region,
+                    generator.cave_region_frequency,
+                    x,
+                    z,
+                )
             })
             .collect();
         println!(
