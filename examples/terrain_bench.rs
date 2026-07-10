@@ -1,9 +1,9 @@
 // Mikrobenchmark fuer `TerrainGenerator::generate_chunk` UND den realistischen End-zu-End-Pfad des
 // asynchronen Chunk-Ladens (`ChunkManager::dispatch_pending`): Generierung + Meshing, wobei das
-// Meshing IMMER auf den prozeduralen `is_solid`-Fallback zurueckfaellt (nie echte Nachbar-Chunk-
-// Referenzen - das ist auf dem Rayon-Worker-Thread unmoeglich, s. Kommentar an
-// `ChunkManager::dispatch_pending`). Das ist der mit Abstand haeufigste Aufrufpfad in der Praxis
-// (jeder frisch generierte Chunk beim initialen Laden/schnellen Fliegen).
+// Meshing IMMER auf die gebatchten Rand-Ebenen (`TerrainGenerator::boundary_planes`) zurueckfaellt
+// (nie echte Nachbar-Chunk-Referenzen - das ist auf dem Rayon-Worker-Thread unmoeglich, s.
+// Kommentar an `ChunkManager::dispatch_pending`). Das ist der mit Abstand haeufigste Aufrufpfad in
+// der Praxis (jeder frisch generierte Chunk beim initialen Laden/schnellen Fliegen).
 
 use std::time::Instant;
 
@@ -42,18 +42,41 @@ fn bench_generate_and_mesh(
     chunk_y: i32,
     chunk_z: i32,
 ) -> f64 {
-    let neighbor_solid = |x: i32, y: i32, z: i32| generator.is_solid(x, y, z);
+    use voxel_engine::game::world::chunk::CHUNK_SIZE;
+
     let mut chunk = Chunk::empty();
+    let ox = chunk_x * CHUNK_SIZE;
+    let oy = chunk_y * CHUNK_SIZE;
+    let oz = chunk_z * CHUNK_SIZE;
+
+    let mesh_once = |chunk: &Chunk| {
+        let planes = generator.boundary_planes(chunk_x, chunk_y, chunk_z);
+        mesh_chunk(chunk, chunk_x, chunk_y, chunk_z, [None; 6], move |world_x, world_y, world_z| {
+            if world_x < ox {
+                planes.neg_x[(world_y - oy) as usize][(world_z - oz) as usize]
+            } else if world_x >= ox + CHUNK_SIZE {
+                planes.pos_x[(world_y - oy) as usize][(world_z - oz) as usize]
+            } else if world_y < oy {
+                planes.neg_y[(world_x - ox) as usize][(world_z - oz) as usize]
+            } else if world_y >= oy + CHUNK_SIZE {
+                planes.pos_y[(world_x - ox) as usize][(world_z - oz) as usize]
+            } else if world_z < oz {
+                planes.neg_z[(world_x - ox) as usize][(world_y - oy) as usize]
+            } else {
+                planes.pos_z[(world_x - ox) as usize][(world_y - oy) as usize]
+            }
+        })
+    };
 
     for _ in 0..WARMUP_ITERATIONS {
         generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
-        std::hint::black_box(mesh_chunk(&chunk, chunk_x, chunk_y, chunk_z, [None; 6], neighbor_solid));
+        std::hint::black_box(mesh_once(&chunk));
     }
 
     let start = Instant::now();
     for _ in 0..MEASURED_ITERATIONS {
         generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
-        std::hint::black_box(mesh_chunk(&chunk, chunk_x, chunk_y, chunk_z, [None; 6], neighbor_solid));
+        std::hint::black_box(mesh_once(&chunk));
     }
     let elapsed = start.elapsed();
 
@@ -74,7 +97,7 @@ fn main() {
     let sky_us = bench_generate("Himmel (chunk_y=20)", &generator, 4, 20, 4);
     let tunnel_us = bench_generate("Tunnelgebiet (chunk_y=-10)", &generator, 4, -10, 8);
 
-    println!("-- Generierung + Meshing, IMMER mit is_solid-Fallback (realistischer Lade-Pfad) --");
+    println!("-- Generierung + Meshing, IMMER mit gebatchten Rand-Ebenen (realistischer Lade-Pfad) --");
     let surface_mesh_us = bench_generate_and_mesh("Oberflaeche+Mesh (chunk_y=0)", &generator, 4, 0, 4);
     let underground_mesh_us = bench_generate_and_mesh("Tiefe+Mesh (chunk_y=-5)", &generator, 4, -5, 4);
     let tunnel_mesh_us = bench_generate_and_mesh("Tunnelgebiet+Mesh (chunk_y=-10)", &generator, 4, -10, 8);

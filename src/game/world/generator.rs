@@ -138,6 +138,27 @@ type CaveGridStack = (
     [f32; CAVE_COLUMN_MAX_LAYERS],
 );
 
+/// Kantenlaenge einer Rand-Ebene - identisch `CHUNK_SIZE`, eigener `usize`-Name fuer die
+/// Ebenen-Arrays der `solid_plane_*`-Funktionen.
+const PLANE_SIZE: usize = CHUNK_SIZE as usize;
+/// `is_solid`-Ergebnis einer GANZEN 32x32-Rand-Ebene einer Chunk-Seite. Indizierung passend zu den
+/// jeweiligen `solid_*`-Achsentabellen im Mesher: X-Ebenen `[y][z]`, Y-Ebenen `[x][z]`, Z-Ebenen
+/// `[x][y]` (lokale Indizes relativ zum jeweiligen Chunk-Origin).
+pub type BoundaryPlane = [[bool; PLANE_SIZE]; PLANE_SIZE];
+/// Roh-Eckwert-Ausschnitt EINES Hoehlenrasters ueber einen 2D-Gitterbereich - Baustein der
+/// `solid_plane_*`-Funktionen, s. `TerrainGenerator::grid_slice`.
+type GridSlice = [[f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+
+/// Alle 6 Rand-Ebenen EINES Chunks, s. `TerrainGenerator::boundary_planes`.
+pub struct BoundaryPlanes {
+    pub neg_x: BoundaryPlane,
+    pub pos_x: BoundaryPlane,
+    pub neg_y: BoundaryPlane,
+    pub pos_y: BoundaryPlane,
+    pub neg_z: BoundaryPlane,
+    pub pos_z: BoundaryPlane,
+}
+
 /// Ergebnis von "Extremity Bound Checking" (s. Kommentar an `bound_check`) fuer eine ganze Spalte:
 /// da trilineare Interpolation eine KONVEXE Kombination ihrer 8 Eckwerte ist, liegt jeder
 /// interpolierte Wert innerhalb einer Zelle garantiert zwischen deren Minimum und Maximum. Liegen
@@ -528,6 +549,311 @@ impl TerrainGenerator {
     pub fn is_physically_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let height = self.height_at(world_x, world_z);
         world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
+    }
+
+    /// Holt `corner(to_grid(i,j))` fuer `i in i_min..=i_max`, `j in j_min..=j_max` in
+    /// `out[i-i_min][j-j_min]` - gemeinsamer Baustein aller drei `solid_plane_*`-Funktionen: jede
+    /// Rand-Ebene braucht genau ZWEI solcher 2D-Ausschnitte (an den beiden Gitter-Nachbarn ihrer
+    /// festen Achse), aus denen anschliessend PRO PUNKT exakt dieselbe Trilinear-Formel wie
+    /// `cave_fields_at` zusammengesetzt wird - bit-identisch zum `is_solid`-Einzelpunktpfad, nur
+    /// ohne die pro Punkt wiederholten Gitter-Cache-Lookups (bei 1024 Punkten je Ebene sonst bis zu
+    /// 8192 gehashte Eckwert-Abfragen PRO Hoehlensystem).
+    #[allow(clippy::too_many_arguments)]
+    fn grid_slice(
+        &self,
+        corner: impl Fn(&Self, i32, i32, i32) -> f32,
+        to_grid: impl Fn(i32, i32) -> (i32, i32, i32),
+        i_min: i32,
+        i_max: i32,
+        j_min: i32,
+        j_max: i32,
+        out: &mut GridSlice,
+    ) {
+        let mut i = i_min;
+        while i <= i_max {
+            let mut j = j_min;
+            while j <= j_max {
+                let (gx, gy, gz) = to_grid(i, j);
+                out[(i - i_min) as usize][(j - j_min) as usize] = corner(self, gx, gy, gz);
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// Rand-Ebene senkrecht zur X-Achse bei festem `world_x` (Chunk-Rand), ueber `world_y`/`world_z`
+    /// je 32 Werte ab `chunk_origin_y`/`chunk_origin_z`. Ersetzt bis zu 1024 Einzelaufrufe von
+    /// `is_solid` (je bis zu 16 gecachte Gitter-Eckwert-Lookups) durch EINEN Zellen-Batch: Cheese-/
+    /// Tunnel-Gitter-Ecken werden je Achse (X fest, `gx0`/`gx0+1`) EINMAL ueber die volle
+    /// (Y,Z)-Flaeche geholt und pro Punkt per Lerp kombiniert - exakt dieselbe Trilinear-Formel wie
+    /// `cave_fields_at` (X innen, Z mitte, Y aussen), nur mit Array- statt Cache-Zugriffen.
+    pub fn solid_plane_x(&self, world_x: i32, chunk_origin_y: i32, chunk_origin_z: i32) -> BoundaryPlane {
+        let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
+
+        let mut height_by_z = [0i32; PLANE_SIZE];
+        for (z, height) in height_by_z.iter_mut().enumerate() {
+            *height = self.height_at(world_x, chunk_origin_z + z as i32);
+        }
+
+        let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
+        let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+        let gy_min = chunk_origin_y.div_euclid(CAVE_GRID_STRIDE);
+        let gy_max = (chunk_origin_y + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+        let gz_min = chunk_origin_z.div_euclid(CAVE_GRID_STRIDE);
+        let gz_max = (chunk_origin_z + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+
+        let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        self.grid_slice(Self::cheese_grid_corner, |gy, gz| (gx0, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut cheese_a);
+        self.grid_slice(Self::cheese_grid_corner, |gy, gz| (gx0 + 1, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut cheese_b);
+
+        let any_tunnel_region = (0..PLANE_SIZE).any(|z| self.is_tunnel_region(world_x, chunk_origin_z + z as i32));
+        let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        if any_tunnel_region {
+            self.grid_slice(Self::tunnel_grid_corner, |gy, gz| (gx0, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut tunnel_a);
+            self.grid_slice(Self::tunnel_grid_corner, |gy, gz| (gx0 + 1, gy, gz), gy_min, gy_max, gz_min, gz_max, &mut tunnel_b);
+        }
+
+        for (y, row) in out.iter_mut().enumerate() {
+            let world_y = chunk_origin_y + y as i32;
+            let gy0 = world_y.div_euclid(CAVE_GRID_STRIDE);
+            let ty = world_y.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+            let (iy0, iy1) = ((gy0 - gy_min) as usize, (gy0 - gy_min + 1) as usize);
+
+            for (z, cell) in row.iter_mut().enumerate() {
+                let world_z = chunk_origin_z + z as i32;
+                let height = height_by_z[z];
+
+                if Self::is_water_position(height, world_y) {
+                    *cell = true;
+                    continue;
+                }
+                if world_y > height {
+                    continue;
+                }
+                if height - world_y < MIN_CAVE_DEPTH {
+                    *cell = true;
+                    continue;
+                }
+
+                let gz0 = world_z.div_euclid(CAVE_GRID_STRIDE);
+                let tz = world_z.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+                let (jz0, jz1) = ((gz0 - gz_min) as usize, (gz0 - gz_min + 1) as usize);
+
+                let xz_layer = |grid_a: &GridSlice, grid_b: &GridSlice, iy: usize| {
+                    lerp(
+                        lerp(grid_a[iy][jz0], grid_b[iy][jz0], tx),
+                        lerp(grid_a[iy][jz1], grid_b[iy][jz1], tx),
+                        tz,
+                    )
+                };
+                let cheese_density =
+                    lerp(xz_layer(&cheese_a, &cheese_b, iy0), xz_layer(&cheese_a, &cheese_b, iy1), ty);
+                if cheese_density > self.cheese_threshold_at(world_y) {
+                    continue;
+                }
+                if !any_tunnel_region || !self.is_tunnel_region(world_x, world_z) {
+                    *cell = true;
+                    continue;
+                }
+                let tunnel_diff =
+                    lerp(xz_layer(&tunnel_a, &tunnel_b, iy0), xz_layer(&tunnel_a, &tunnel_b, iy1), ty);
+                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
+                    *cell = true;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Rand-Ebene senkrecht zur Y-Achse bei festem `world_y` - s. `solid_plane_x` fuer das
+    /// allgemeine Prinzip. Y ist in `cave_fields_at`s Formel die AEUSSERE Lerp-Achse: bei fixem Y
+    /// liefert je EIN Gitter-Ausschnitt (an `gy0` bzw. `gy0+1`) direkt die komplette XZ-Ebene, ohne
+    /// dass Grid A/B pro Punkt gemischt werden muessen (anders als bei X-/Z-Ebenen).
+    pub fn solid_plane_y(&self, world_y: i32, chunk_origin_x: i32, chunk_origin_z: i32) -> BoundaryPlane {
+        let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
+
+        let mut height = [[0i32; PLANE_SIZE]; PLANE_SIZE];
+        for (x, row) in height.iter_mut().enumerate() {
+            for (z, h) in row.iter_mut().enumerate() {
+                *h = self.height_at(chunk_origin_x + x as i32, chunk_origin_z + z as i32);
+            }
+        }
+
+        let gy0 = world_y.div_euclid(CAVE_GRID_STRIDE);
+        let ty = world_y.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+        let gx_min = chunk_origin_x.div_euclid(CAVE_GRID_STRIDE);
+        let gx_max = (chunk_origin_x + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+        let gz_min = chunk_origin_z.div_euclid(CAVE_GRID_STRIDE);
+        let gz_max = (chunk_origin_z + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+
+        let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        self.grid_slice(Self::cheese_grid_corner, |gx, gz| (gx, gy0, gz), gx_min, gx_max, gz_min, gz_max, &mut cheese_a);
+        self.grid_slice(Self::cheese_grid_corner, |gx, gz| (gx, gy0 + 1, gz), gx_min, gx_max, gz_min, gz_max, &mut cheese_b);
+
+        let mut any_tunnel_region = false;
+        for x in 0..PLANE_SIZE {
+            for z in 0..PLANE_SIZE {
+                if self.is_tunnel_region(chunk_origin_x + x as i32, chunk_origin_z + z as i32) {
+                    any_tunnel_region = true;
+                }
+            }
+        }
+        let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        if any_tunnel_region {
+            self.grid_slice(Self::tunnel_grid_corner, |gx, gz| (gx, gy0, gz), gx_min, gx_max, gz_min, gz_max, &mut tunnel_a);
+            self.grid_slice(Self::tunnel_grid_corner, |gx, gz| (gx, gy0 + 1, gz), gx_min, gx_max, gz_min, gz_max, &mut tunnel_b);
+        }
+
+        for (x, row) in out.iter_mut().enumerate() {
+            let world_x = chunk_origin_x + x as i32;
+            let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
+            let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+            let (ix0, ix1) = ((gx0 - gx_min) as usize, (gx0 - gx_min + 1) as usize);
+
+            for (z, cell) in row.iter_mut().enumerate() {
+                let world_z = chunk_origin_z + z as i32;
+                let h = height[x][z];
+
+                if Self::is_water_position(h, world_y) {
+                    *cell = true;
+                    continue;
+                }
+                if world_y > h {
+                    continue;
+                }
+                if h - world_y < MIN_CAVE_DEPTH {
+                    *cell = true;
+                    continue;
+                }
+
+                let gz0 = world_z.div_euclid(CAVE_GRID_STRIDE);
+                let tz = world_z.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+                let (jz0, jz1) = ((gz0 - gz_min) as usize, (gz0 - gz_min + 1) as usize);
+
+                let xz_layer = |grid: &GridSlice| {
+                    lerp(lerp(grid[ix0][jz0], grid[ix1][jz0], tx), lerp(grid[ix0][jz1], grid[ix1][jz1], tx), tz)
+                };
+                let cheese_density = lerp(xz_layer(&cheese_a), xz_layer(&cheese_b), ty);
+                if cheese_density > self.cheese_threshold_at(world_y) {
+                    continue;
+                }
+                if !any_tunnel_region || !self.is_tunnel_region(world_x, world_z) {
+                    *cell = true;
+                    continue;
+                }
+                let tunnel_diff = lerp(xz_layer(&tunnel_a), xz_layer(&tunnel_b), ty);
+                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
+                    *cell = true;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Rand-Ebene senkrecht zur Z-Achse bei festem `world_z` - s. `solid_plane_x` fuer das
+    /// allgemeine Prinzip. Z ist die MITTLERE Lerp-Achse in `cave_fields_at`s Formel: bei fixem Z
+    /// kombinieren beide Gitter-Ausschnitte (an `gz0`/`gz0+1`) ueber `tz`, waehrend X (innen, `tx`)
+    /// weiterhin INNERHALB jedes Ausschnitts kombiniert wird und Y (aussen, `ty`) wie gehabt zwei
+    /// Zeilen mischt.
+    pub fn solid_plane_z(&self, world_z: i32, chunk_origin_x: i32, chunk_origin_y: i32) -> BoundaryPlane {
+        let mut out = [[false; PLANE_SIZE]; PLANE_SIZE];
+
+        let mut height_by_x = [0i32; PLANE_SIZE];
+        for (x, height) in height_by_x.iter_mut().enumerate() {
+            *height = self.height_at(chunk_origin_x + x as i32, world_z);
+        }
+
+        let gz0 = world_z.div_euclid(CAVE_GRID_STRIDE);
+        let tz = world_z.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+        let gx_min = chunk_origin_x.div_euclid(CAVE_GRID_STRIDE);
+        let gx_max = (chunk_origin_x + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+        let gy_min = chunk_origin_y.div_euclid(CAVE_GRID_STRIDE);
+        let gy_max = (chunk_origin_y + CHUNK_SIZE - 1).div_euclid(CAVE_GRID_STRIDE) + 1;
+
+        let mut cheese_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut cheese_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        self.grid_slice(Self::cheese_grid_corner, |gx, gy| (gx, gy, gz0), gx_min, gx_max, gy_min, gy_max, &mut cheese_a);
+        self.grid_slice(Self::cheese_grid_corner, |gx, gy| (gx, gy, gz0 + 1), gx_min, gx_max, gy_min, gy_max, &mut cheese_b);
+
+        let any_tunnel_region = (0..PLANE_SIZE).any(|x| self.is_tunnel_region(chunk_origin_x + x as i32, world_z));
+        let mut tunnel_a = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        let mut tunnel_b = [[0.0f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
+        if any_tunnel_region {
+            self.grid_slice(Self::tunnel_grid_corner, |gx, gy| (gx, gy, gz0), gx_min, gx_max, gy_min, gy_max, &mut tunnel_a);
+            self.grid_slice(Self::tunnel_grid_corner, |gx, gy| (gx, gy, gz0 + 1), gx_min, gx_max, gy_min, gy_max, &mut tunnel_b);
+        }
+
+        for (x, row) in out.iter_mut().enumerate() {
+            let world_x = chunk_origin_x + x as i32;
+            let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
+            let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+            let (ix0, ix1) = ((gx0 - gx_min) as usize, (gx0 - gx_min + 1) as usize);
+            let height = height_by_x[x];
+
+            for (y, cell) in row.iter_mut().enumerate() {
+                let world_y = chunk_origin_y + y as i32;
+
+                if Self::is_water_position(height, world_y) {
+                    *cell = true;
+                    continue;
+                }
+                if world_y > height {
+                    continue;
+                }
+                if height - world_y < MIN_CAVE_DEPTH {
+                    *cell = true;
+                    continue;
+                }
+
+                let gy0 = world_y.div_euclid(CAVE_GRID_STRIDE);
+                let ty = world_y.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
+                let (iy0, iy1) = ((gy0 - gy_min) as usize, (gy0 - gy_min + 1) as usize);
+
+                let layer_at = |grid_a: &GridSlice, grid_b: &GridSlice, iy: usize| {
+                    lerp(lerp(grid_a[ix0][iy], grid_a[ix1][iy], tx), lerp(grid_b[ix0][iy], grid_b[ix1][iy], tx), tz)
+                };
+                let cheese_density =
+                    lerp(layer_at(&cheese_a, &cheese_b, iy0), layer_at(&cheese_a, &cheese_b, iy1), ty);
+                if cheese_density > self.cheese_threshold_at(world_y) {
+                    continue;
+                }
+                if !any_tunnel_region || !self.is_tunnel_region(world_x, world_z) {
+                    *cell = true;
+                    continue;
+                }
+                let tunnel_diff = lerp(layer_at(&tunnel_a, &tunnel_b, iy0), layer_at(&tunnel_a, &tunnel_b, iy1), ty);
+                if tunnel_diff >= self.tunnel_threshold_at(world_y) {
+                    *cell = true;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Alle 6 Rand-Ebenen EINES Chunks in einem Rutsch - genutzt vom asynchronen Rayon-Ladepfad
+    /// (`ChunkManager::dispatch_pending`), der wegen der Thread-Grenze NIE echte Nachbar-Chunk-
+    /// Referenzen an `mesh_chunk` uebergeben kann und dessen `compute_exposure` deshalb IMMER auf
+    /// den prozeduralen Fallback zurueckfaellt - vorher 6144 (6 Seiten * 1024 Randzellen)
+    /// Einzelaufrufe von `is_solid` pro Chunk, jetzt 6 gebatchte Ebenen-Berechnungen.
+    pub fn boundary_planes(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32) -> BoundaryPlanes {
+        let ox = chunk_x * CHUNK_SIZE;
+        let oy = chunk_y * CHUNK_SIZE;
+        let oz = chunk_z * CHUNK_SIZE;
+        BoundaryPlanes {
+            neg_x: self.solid_plane_x(ox - 1, oy, oz),
+            pos_x: self.solid_plane_x(ox + CHUNK_SIZE, oy, oz),
+            neg_y: self.solid_plane_y(oy - 1, ox, oz),
+            pos_y: self.solid_plane_y(oy + CHUNK_SIZE, ox, oz),
+            neg_z: self.solid_plane_z(oz - 1, ox, oy),
+            pos_z: self.solid_plane_z(oz + CHUNK_SIZE, ox, oy),
+        }
     }
 
     /// Praeberechnet fuer eine GANZE `CAVE_GRID_STRIDE`x`CAVE_GRID_STRIDE`-Zelle (16 Spalten) alle
@@ -921,6 +1247,73 @@ mod tests {
                              tatsaechlich generiert={actual}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// `TerrainGenerator::boundary_planes` MUSS fuer jeden Randpunkt exakt dasselbe liefern wie der
+    /// per-Punkt-Fallback `is_solid` - beide muessen bit-identisch sein, sonst wiederholt sich
+    /// exakt der Bulk/Fallback-Divergenz-Bug, der `is_carved` schon einmal getroffen hat (s. dortiger
+    /// Kommentar). Deckt alle 6 Ebenen ueber dieselben diversen Chunk-Koordinaten wie der
+    /// `is_solid`-Gesamttest ab, inklusive vertikaler Stapelung (Tunnel-/Cheese-Gitter unterscheiden
+    /// sich je nach Achse strukturell, s. `solid_plane_x/y/z`-Kommentare - alle drei muessen separat
+    /// geprueft werden).
+    #[test]
+    fn boundary_planes_match_is_solid_everywhere() {
+        let generator = TerrainGenerator::new(&EngineConfig::default());
+
+        let coords: Vec<(i32, i32, i32)> = [(0, 0, 0), (3, -2, -5), (-4, 1, 2), (7, 0, -1)]
+            .into_iter()
+            .chain((0..12).map(|i| (i * 5 - 30, (i % 5) - 2, i * 7 - 40)))
+            .collect();
+
+        for &(chunk_x, chunk_y, chunk_z) in &coords {
+            let ox = chunk_x * CHUNK_SIZE;
+            let oy = chunk_y * CHUNK_SIZE;
+            let oz = chunk_z * CHUNK_SIZE;
+            let planes = generator.boundary_planes(chunk_x, chunk_y, chunk_z);
+
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    let expected = generator.is_solid(ox - 1, oy + y, oz + z);
+                    assert_eq!(
+                        planes.neg_x[y as usize][z as usize], expected,
+                        "neg_x bei Chunk ({chunk_x},{chunk_y},{chunk_z}) y={y} z={z}"
+                    );
+                    let expected = generator.is_solid(ox + CHUNK_SIZE, oy + y, oz + z);
+                    assert_eq!(
+                        planes.pos_x[y as usize][z as usize], expected,
+                        "pos_x bei Chunk ({chunk_x},{chunk_y},{chunk_z}) y={y} z={z}"
+                    );
+                }
+            }
+            for x in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    let expected = generator.is_solid(ox + x, oy - 1, oz + z);
+                    assert_eq!(
+                        planes.neg_y[x as usize][z as usize], expected,
+                        "neg_y bei Chunk ({chunk_x},{chunk_y},{chunk_z}) x={x} z={z}"
+                    );
+                    let expected = generator.is_solid(ox + x, oy + CHUNK_SIZE, oz + z);
+                    assert_eq!(
+                        planes.pos_y[x as usize][z as usize], expected,
+                        "pos_y bei Chunk ({chunk_x},{chunk_y},{chunk_z}) x={x} z={z}"
+                    );
+                }
+            }
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    let expected = generator.is_solid(ox + x, oy + y, oz - 1);
+                    assert_eq!(
+                        planes.neg_z[x as usize][y as usize], expected,
+                        "neg_z bei Chunk ({chunk_x},{chunk_y},{chunk_z}) x={x} y={y}"
+                    );
+                    let expected = generator.is_solid(ox + x, oy + y, oz + CHUNK_SIZE);
+                    assert_eq!(
+                        planes.pos_z[x as usize][y as usize], expected,
+                        "pos_z bei Chunk ({chunk_x},{chunk_y},{chunk_z}) x={x} y={y}"
+                    );
                 }
             }
         }

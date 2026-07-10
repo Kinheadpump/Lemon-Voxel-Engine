@@ -486,11 +486,31 @@ impl ChunkManager {
                     DirectionalMesh::default()
                 } else {
                     // Keine Nachbar-Referenzen moeglich (anderer Thread, s. Kommentar an
-                    // `ChunkManager::neighbor_chunk_refs`) - faellt auf die prozedurale
-                    // Welt-Vorhersage zurueck, was fuer frisch generierte Chunks ohnehin meist
-                    // zutrifft (Nachbarn sind beim initialen Laden haeufig noch nicht fertig).
-                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, [None; 6], |world_x, world_y, world_z| {
-                        generator.is_solid(world_x, world_y, world_z)
+                    // `ChunkManager::neighbor_chunk_refs`) - `compute_exposure` faellt fuer ALLE 6
+                    // Seiten auf die prozedurale Welt-Vorhersage zurueck. Statt bis zu 6144
+                    // Einzelaufrufen von `generator.is_solid` (je bis zu 16 gehashte Gitter-Eckwert-
+                    // Lookups) werden die 6 Rand-Ebenen EINMAL gebatcht vorberechnet
+                    // (`TerrainGenerator::boundary_planes`) und die Closure macht nur noch simple
+                    // Array-Lookups - der dominante Meshing-Kostenblock (s. Profiling: 81.5% von
+                    // `mesh_chunk`), der JEDEN frisch geladenen Chunk trifft.
+                    let ox = coord.0 * CHUNK_SIZE;
+                    let oy = coord.1 * CHUNK_SIZE;
+                    let oz = coord.2 * CHUNK_SIZE;
+                    let planes = generator.boundary_planes(coord.0, coord.1, coord.2);
+                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, [None; 6], move |world_x, world_y, world_z| {
+                        if world_x < ox {
+                            planes.neg_x[(world_y - oy) as usize][(world_z - oz) as usize]
+                        } else if world_x >= ox + CHUNK_SIZE {
+                            planes.pos_x[(world_y - oy) as usize][(world_z - oz) as usize]
+                        } else if world_y < oy {
+                            planes.neg_y[(world_x - ox) as usize][(world_z - oz) as usize]
+                        } else if world_y >= oy + CHUNK_SIZE {
+                            planes.pos_y[(world_x - ox) as usize][(world_z - oz) as usize]
+                        } else if world_z < oz {
+                            planes.neg_z[(world_x - ox) as usize][(world_y - oy) as usize]
+                        } else {
+                            planes.pos_z[(world_x - ox) as usize][(world_y - oy) as usize]
+                        }
                     })
                 };
 
