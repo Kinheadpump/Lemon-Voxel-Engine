@@ -34,13 +34,23 @@ pub struct LodRingRuntime {
     pub voxel_scale: i32,
     pub render_distance_chunks: i32,
     pub vertical_render_distance_chunks: i32,
-    /// Ringe sind KEINE vollen Kuben um die Kamera, sondern quadratische Schalen: Chunks, deren
-    /// Achsenabstand zum Zentrum (in DIESES Rings eigenen Chunk-Einheiten) UNTER diesem Wert liegt,
-    /// sind bereits vom naechst-feineren Ring abgedeckt und werden von DIESEM Ring nicht geladen -
-    /// sonst ueberlappen sich alle Ringe komplett im Kamera-Nahbereich (riesige LOD-Voxel direkt
-    /// neben/statt der LOD0-Feingeometrie). 0 fuer LOD0 (kein innerer Ring).
-    pub inner_exclusion_chunks: i32,
-    pub inner_exclusion_vertical_chunks: i32,
+    /// Ringe sind KEINE vollen Kuben um die Kamera, sondern quadratische Schalen: Weltbloecke
+    /// innerhalb dieses Radius um die Kamera sind bereits vom naechst-feineren Ring abgedeckt und
+    /// werden von DIESEM Ring nicht geladen - sonst ueberlappen sich alle Ringe komplett im
+    /// Kamera-Nahbereich (riesige LOD-Voxel direkt neben/statt der LOD0-Feingeometrie).
+    ///
+    /// IN WELTBLOECKEN, nicht in ring-lokalen Chunk-Einheiten - und exakt gleich dem
+    /// `render_distance_chunks * CHUNK_SIZE * voxel_scale` des naechst-feineren Rings (identische
+    /// Formel auf beiden Seiten, s. `lod_ring_runtimes`). Eine fruehere Version rechnete den
+    /// Ausschluss in DIESES Rings eigenen (per `floor(kamera/schrittweite)` quantisierten)
+    /// Chunk-Einheiten - LOD0 (Schrittweite 32) und ein Zusatz-Ring (z.B. Schrittweite 128)
+    /// runden die Kameraposition dabei auf UNTERSCHIEDLICHE Gitter, wodurch Innen- und
+    /// Aussengrenze zweier Ringe je nach Kameraposition innerhalb ihrer jeweiligen Gitterzelle um
+    /// bis zu einer Schrittweite auseinanderlaufen konnten - sichtbar als Luecken ODER
+    /// Ueberlappungen. Weltblock-Radien sind gitter-unabhaengig und schliessen exakt aneinander an.
+    /// 0 fuer LOD0 (kein innerer Ring).
+    pub inner_exclusion_world_h: i32,
+    pub inner_exclusion_world_v: i32,
     pub pool_slot_base: usize,
     pub pool_size: usize,
 }
@@ -375,12 +385,15 @@ impl Default for DevSettings {
 
             // Zwei zusaetzliche Ringe jenseits LOD0: Scale 4 deckt das 4-fache Weltvolumen pro
             // Chunk ab (Hoehlen/Baeume entfallen dort komplett, s. `generator/lod.rs` - macht LOD1
-            // trotz groesserer Reichweite GUENSTIGER pro Chunk als LOD0), Scale 16 nochmal das
-            // 4-fache. Sichtweite waechst dadurch weit ueber das reine LOD0-Fenster hinaus, waehrend
-            // der Chunk-Pool nur linear (nicht quadratisch mit der Gesamtdistanz) mitwaechst.
+            // trotz groesserer Reichweite GUENSTIGER pro Chunk als LOD0), Scale 8 nochmal das
+            // Doppelte - bewusst NUR verdoppelt statt vervierfacht (1-4-16 sprang beim Uebergang
+            // LOD1->LOD2 visuell zu hart, 16x16x16-Weltblock-Voxel wirkten direkt am Ring-Rand wie
+            // grobe Wuerfel statt Terrain). Sichtweite waechst trotzdem weit ueber das reine
+            // LOD0-Fenster hinaus, waehrend der Chunk-Pool nur linear (nicht quadratisch mit der
+            // Gesamtdistanz) mitwaechst.
             lod_rings: [
                 LodRingSetting { voxel_scale: 4, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
-                LodRingSetting { voxel_scale: 16, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
+                LodRingSetting { voxel_scale: 8, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
             ],
             lod_ring_count: 2,
 
@@ -465,28 +478,23 @@ impl EngineConfig {
             voxel_scale: 1,
             render_distance_chunks: self.player.render_distance_chunks,
             vertical_render_distance_chunks: self.player.vertical_render_distance_chunks,
-            inner_exclusion_chunks: 0,
-            inner_exclusion_vertical_chunks: 0,
+            inner_exclusion_world_h: 0,
+            inner_exclusion_world_v: 0,
             pool_slot_base,
             pool_size: lod0_size,
         });
         pool_slot_base += lod0_size;
 
-        // Weltblock-Reichweite des zuletzt hinzugefuegten (naeheren, feineren) Rings - jeder
-        // weitere Ring schliesst diesen Bereich als "inneren" aus (s. `LodRingRuntime::
-        // inner_exclusion_chunks`-Kommentar), sonst ueberlappen sich alle Ringe komplett um die
-        // Kamera. `+1` deckt den letzten INKLUSIVEN Chunk-Index bis zu seiner Fern-Kante ab;
-        // Ganzzahl-Division (floor) rundet den Ausschluss absichtlich eher zu KLEIN statt zu GROSS -
-        // eine duenne Ueberlappung an der Ring-Grenze ist harmlos, eine Luecke waere ein sichtbares
-        // Loch im Terrain.
-        let mut prev_world_h = (self.player.render_distance_chunks as i64 + 1) * CHUNK_SIZE as i64;
-        let mut prev_world_v = (self.player.vertical_render_distance_chunks as i64 + 1) * CHUNK_SIZE as i64;
+        // Weltblock-Aussenradius des zuletzt hinzugefuegten (naeheren, feineren) Rings - jeder
+        // weitere Ring schliesst GENAU diesen Radius als seinen inneren Ausschluss aus (identische
+        // Formel auf beiden Seiten der Ring-Grenze, s. `LodRingRuntime::inner_exclusion_world_h`-
+        // Kommentar) - dadurch schliessen die Ringe exakt aneinander an, ohne Luecke oder
+        // Ueberlappung.
+        let mut prev_outer_world_h = self.player.render_distance_chunks * CHUNK_SIZE;
+        let mut prev_outer_world_v = self.player.vertical_render_distance_chunks * CHUNK_SIZE;
 
         for ring in &self.dev.lod_rings[..self.dev.lod_ring_count as usize] {
             let voxel_scale = ring.voxel_scale.max(1);
-            let step = CHUNK_SIZE as i64 * voxel_scale as i64;
-            let inner_exclusion_chunks = (prev_world_h / step) as i32;
-            let inner_exclusion_vertical_chunks = (prev_world_v / step) as i32;
 
             let pool_size = required_chunk_pool_size(ring.render_distance_chunks, ring.vertical_render_distance_chunks)
                 .min(CHUNK_POOL_SAFETY_CAP);
@@ -494,15 +502,15 @@ impl EngineConfig {
                 voxel_scale,
                 render_distance_chunks: ring.render_distance_chunks,
                 vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
-                inner_exclusion_chunks,
-                inner_exclusion_vertical_chunks,
+                inner_exclusion_world_h: prev_outer_world_h,
+                inner_exclusion_world_v: prev_outer_world_v,
                 pool_slot_base,
                 pool_size,
             });
             pool_slot_base += pool_size;
 
-            prev_world_h = (ring.render_distance_chunks as i64 + 1) * step;
-            prev_world_v = (ring.vertical_render_distance_chunks as i64 + 1) * step;
+            prev_outer_world_h = ring.render_distance_chunks * CHUNK_SIZE * voxel_scale;
+            prev_outer_world_v = ring.vertical_render_distance_chunks * CHUNK_SIZE * voxel_scale;
         }
 
         rings
@@ -949,38 +957,36 @@ impl From<ConfigFile> for EngineConfig {
 mod tests {
     use super::*;
 
-    /// Regressionstest fuer den "LOD-Ringe ueberlappen komplett"-Bug: jeder Ring jenseits von LOD0
-    /// muss einen inneren Ausschluss-Radius haben, der (in Weltbloecken) mindestens die Reichweite
-    /// des naechst-feineren Rings abdeckt - keine Luecke (`>=` in Weltbloecken), leichte
-    /// Ueberlappung ist erlaubt (absichtlich, s. `lod_ring_runtimes`-Kommentar).
+    /// Regressionstest fuer den "LOD-Ringe ueberlappen komplett"-Bug UND den nachfolgenden Gitter-
+    /// Quantisierungs-Bug ("massive Chunk-Luecken"): der innere Ausschluss-Radius eines Rings muss
+    /// EXAKT dem Weltblock-Aussenradius des naechst-feineren Rings entsprechen (nicht bloss `<=`) -
+    /// nur exakte Gleichheit auf beiden Seiten der Grenze garantiert weder Luecke noch Ueberlappung,
+    /// unabhaengig von den (bei unterschiedlichen `voxel_scale`-Werten unterschiedlichen) Gitter-
+    /// Schrittweiten der beiden Ringe.
     #[test]
-    fn lod_rings_form_a_gapless_nested_sequence() {
+    fn lod_rings_form_an_exactly_nested_sequence() {
         let config = EngineConfig::default().normalized();
         let rings = config.lod_ring_runtimes();
         assert!(rings.len() >= 2, "Default-Config sollte mindestens LOD0 + einen Zusatz-Ring haben");
 
         for pair in rings.windows(2) {
             let [inner, outer] = pair else { unreachable!() };
-            let inner_world_reach_h = (inner.render_distance_chunks + 1) * CHUNK_SIZE * inner.voxel_scale;
-            let inner_world_reach_v = (inner.vertical_render_distance_chunks + 1) * CHUNK_SIZE * inner.voxel_scale;
-            let outer_exclusion_world_h = outer.inner_exclusion_chunks * CHUNK_SIZE * outer.voxel_scale;
-            let outer_exclusion_world_v = outer.inner_exclusion_vertical_chunks * CHUNK_SIZE * outer.voxel_scale;
+            let inner_outer_world_h = inner.render_distance_chunks * CHUNK_SIZE * inner.voxel_scale;
+            let inner_outer_world_v = inner.vertical_render_distance_chunks * CHUNK_SIZE * inner.voxel_scale;
 
-            assert!(
-                outer_exclusion_world_h <= inner_world_reach_h,
-                "Ring mit voxel_scale={} schliesst mehr aus ({outer_exclusion_world_h} Weltbloecke) als der \
-                 innere Ring abdeckt ({inner_world_reach_h}) - das waere eine sichtbare Luecke",
+            assert_eq!(
+                outer.inner_exclusion_world_h, inner_outer_world_h,
+                "Ring mit voxel_scale={} schliesst einen anderen Weltblock-Radius aus als der innere Ring \
+                 abdeckt - das waere eine Luecke oder Ueberlappung an der Ring-Grenze",
                 outer.voxel_scale,
             );
-            assert!(
-                outer_exclusion_world_v <= inner_world_reach_v,
-                "vertikal: Ring mit voxel_scale={} schliesst mehr aus ({outer_exclusion_world_v}) als der \
-                 innere Ring abdeckt ({inner_world_reach_v})",
+            assert_eq!(
+                outer.inner_exclusion_world_v, inner_outer_world_v,
+                "vertikal: Ring mit voxel_scale={} schliesst einen anderen Weltblock-Radius aus als der \
+                 innere Ring abdeckt",
                 outer.voxel_scale,
             );
-            // Ausschluss auch nicht KOMPLETT unter-dimensioniert (sonst waeren die Ringe wieder
-            // grosse ueberlappende Kuben statt duenner Schalen).
-            assert!(outer.inner_exclusion_chunks > 0, "Zusatz-Ring ohne inneren Ausschluss ueberlappt vollstaendig");
+            assert!(outer.inner_exclusion_world_h > 0, "Zusatz-Ring ohne inneren Ausschluss ueberlappt vollstaendig");
         }
     }
 
