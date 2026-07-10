@@ -8,6 +8,17 @@ use super::camera::Camera;
 /// f32::MAX` nie als Treffer ausgewaehlt.
 pub const MAX_SHADOW_CASCADES: usize = 4;
 
+/// Feste Sicherheitsmarge (Weltbloecke) auf den geometrisch berechneten Kaskaden-Radius. Der reine
+/// Kamera-Frustum-Ausschnitt deckt NUR ab, was aktuell sichtbar ist - eine Hoehlendecke direkt ueber
+/// dem Spieler, der seitwaerts durch einen Tunnel schaut, liegt haeufig ausserhalb dieses Kegels
+/// (das Sichtfeld zeigt nach vorne, nicht nach oben) und wuerde ohne diese Marge NIE als
+/// Schatten-Werfer gezeichnet - Sonnenlicht "leckt" dann durch eine Felsdecke, die nirgends in der
+/// Shadow-Map existiert (s. `sample_shadow`s Fallback "ausserhalb des Kaskaden-Frustums = unbeschattet").
+/// Additiv statt multiplikativ, damit sie nicht mit der (bei fernen Kaskaden potenziell riesigen)
+/// Sichtweite mitwaechst - kostet dafuer bei der naechsten (kleinsten) Kaskade anteilig etwas
+/// Texel-Aufloesung, das ist der Preis fuer "keine Luecken in geschlossenen Raeumen".
+const CASCADE_CASTER_MARGIN: f32 = 24.0;
+
 #[derive(Clone, Copy)]
 pub struct Cascade {
     pub view_proj: Mat4,
@@ -24,14 +35,24 @@ pub struct Cascade {
 
 impl Default for Cascade {
     fn default() -> Self {
-        Self { view_proj: Mat4::IDENTITY, split_far: f32::MAX, center: Vec3::ZERO, radius: 0.0 }
+        Self {
+            view_proj: Mat4::IDENTITY,
+            split_far: f32::MAX,
+            center: Vec3::ZERO,
+            radius: 0.0,
+        }
     }
 }
 
 /// Practical-Split-Scheme (Zhang et al.): mischt logarithmische und lineare Aufteilung. Log
 /// gewichtet mehr Aufloesung nahe der Kamera - genau dort, wo einzelne Voxel-Kanten den groessten
 /// Anteil am Bildschirm einnehmen.
-fn compute_split_distances(cascade_count: usize, near: f32, far: f32, lambda: f32) -> [f32; MAX_SHADOW_CASCADES] {
+fn compute_split_distances(
+    cascade_count: usize,
+    near: f32,
+    far: f32,
+    lambda: f32,
+) -> [f32; MAX_SHADOW_CASCADES] {
     let mut splits = [far; MAX_SHADOW_CASCADES];
     for (i, split) in splits.iter_mut().enumerate().take(cascade_count) {
         let p = (i + 1) as f32 / cascade_count as f32;
@@ -64,7 +85,11 @@ pub fn compute_cascades(
     let tan_half_v = (camera.fov_y_radians * 0.5).tan();
     let tan_half_h = tan_half_v * aspect;
 
-    let light_up = if light_direction.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let light_up = if light_direction.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
 
     let mut cascades = [Cascade::default(); MAX_SHADOW_CASCADES];
     let mut split_near = camera.near;
@@ -87,7 +112,14 @@ pub fn compute_cascades(
         // Umschliessende Kugel (rotationsinvariant): unter reiner Kamerarotation dreht sich der
         // Frustum-Ausschnitt starr um die Kamera, die Eckdistanzen zum Schwerpunkt bleiben also
         // gleich - der Radius (und damit die Texelgroesse) ist von der Blickrichtung unabhaengig.
-        let radius = corners.iter().map(|&c| center.distance(c)).fold(0.0f32, f32::max).max(0.1);
+        // Plus `CASCADE_CASTER_MARGIN` (s. dortiger Kommentar) gegen Schatten-Lecks in geschlossenen
+        // Raeumen ausserhalb des reinen Sichtkegels.
+        let radius = corners
+            .iter()
+            .map(|&c| center.distance(c))
+            .fold(0.0f32, f32::max)
+            .max(0.1)
+            + CASCADE_CASTER_MARGIN;
         let texel_size = (radius * 2.0) / shadow_map_resolution as f32;
 
         // Texel-Snapping muss in einem BLICKRICHTUNGS-UNABHAENGIGEN Licht-Frame passieren. Zuvor
@@ -96,14 +128,17 @@ pub fn compute_cascades(
         // wirkungslos und die Schatten "schwammen" bei jeder Kopfdrehung. Jetzt: Kugelmittelpunkt in
         // eine reine Rotations-View (Augpunkt im Ursprung) projizieren, dort aufs Texelraster runden
         // und zurueck in Weltkoordinaten - so rastet das Schattenraster stabil ein.
-        let light_rotation = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, light_direction, light_up);
+        let light_rotation =
+            glam::camera::rh::view::look_to_mat4(Vec3::ZERO, light_direction, light_up);
         let center_light_space = light_rotation.transform_point3(center);
         let snapped_light_space = Vec3::new(
             (center_light_space.x / texel_size).round() * texel_size,
             (center_light_space.y / texel_size).round() * texel_size,
             center_light_space.z,
         );
-        let snapped_center = light_rotation.inverse().transform_point3(snapped_light_space);
+        let snapped_center = light_rotation
+            .inverse()
+            .transform_point3(snapped_light_space);
 
         let eye = snapped_center - light_direction * radius * 2.0;
         let light_view = glam::camera::rh::view::look_to_mat4(eye, light_direction, light_up);
@@ -116,7 +151,12 @@ pub fn compute_cascades(
             radius * 4.0,
         );
 
-        cascades[i] = Cascade { view_proj: light_proj * light_view, split_far, center: snapped_center, radius };
+        cascades[i] = Cascade {
+            view_proj: light_proj * light_view,
+            split_far,
+            center: snapped_center,
+            radius,
+        };
         split_near = split_far;
     }
 
