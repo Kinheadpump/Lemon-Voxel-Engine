@@ -30,6 +30,9 @@ pub struct App {
     input: InputState,
     physics: PlayerPhysics,
     chunk_manager: ChunkManager,
+    // Godrays vorerst deaktiviert (s. Kommentar in `window_event`) - Feld bleibt fuer die
+    // spaetere Reaktivierung erhalten.
+    #[allow(dead_code)]
     godray_field: GodrayField,
     last_frame: Instant,
     last_stats_log: Instant,
@@ -233,11 +236,13 @@ impl ApplicationHandler for App {
                 let sun_color = glam::Vec3::new(1.0, 0.85 + 0.15 * sun_height, 0.7 + 0.3 * sun_height);
                 gpu.update_lighting(cascades, direction_to_sun, sun_color, self.config.sun_intensity, self.config.ambient_light);
 
-                if let Some(instances) =
-                    self.godray_field.update(self.camera.position, self.chunk_manager.generator())
-                {
-                    gpu.upload_godrays(instances);
-                }
+                // Godrays vorerst deaktiviert - Platzierung/Kantenerkennung liefert noch nicht das
+                // gewuenschte Ergebnis. Code bleibt unangetastet fuer die spaetere Reaktivierung.
+                // if let Some(instances) =
+                //     self.godray_field.update(self.camera.position, self.chunk_manager.generator())
+                // {
+                //     gpu.upload_godrays(instances);
+                // }
 
                 {
                     let (queue, renderer) = gpu.queue_and_renderer();

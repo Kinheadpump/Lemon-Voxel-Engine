@@ -39,6 +39,9 @@ pub struct GpuContext {
     shadow_pass: ShadowPass,
     skybox: SkyboxPass,
     godray: GodrayPass,
+    // Godrays vorerst deaktiviert (s. Kommentar in `App::window_event`) - Feld bleibt fuer die
+    // spaetere Reaktivierung erhalten.
+    #[allow(dead_code)]
     godray_temporal_blend: f32,
     /// Vom letzten `update_lighting`-Aufruf gemerkt, damit `render()` dieselben Kaskaden-Matrizen
     /// zum Befuellen der Shadow-Map-Ebenen nutzt, die auch im Lighting-Uniform des Opaque-Passes
@@ -260,18 +263,20 @@ impl GpuContext {
             ambient,
         );
         self.skybox.update_uniforms(&self.queue, self.last_view_proj, self.last_camera_pos, direction_to_sun);
-        self.godray.update_uniforms(
-            &self.queue,
-            self.last_view_proj,
-            &cascades,
-            self.cascade_count,
-            self.last_camera_pos,
-            self.last_camera_forward,
-            direction_to_sun,
-            sun_color,
-            sun_intensity,
-            self.godray_temporal_blend,
-        );
+        // Godrays vorerst deaktiviert (s. Kommentar in `App::window_event`) - Uniform-Update fuer
+        // einen Pass, der ohnehin nicht mehr dispatcht/gerendert wird, waere reine Verschwendung.
+        // self.godray.update_uniforms(
+        //     &self.queue,
+        //     self.last_view_proj,
+        //     &cascades,
+        //     self.cascade_count,
+        //     self.last_camera_pos,
+        //     self.last_camera_forward,
+        //     direction_to_sun,
+        //     sun_color,
+        //     sun_intensity,
+        //     self.godray_temporal_blend,
+        // );
         self.cascades = cascades;
     }
 
@@ -386,9 +391,8 @@ impl GpuContext {
             &self.renderer.shadow_draw_data(),
         );
 
-        // Compute-Pass fuer Godrays: nutzt die soeben gefuellten Shadow-Cascade-Tiefendaten fuer die
-        // Kantenerkennung, laeuft NACH dem Shadow-Pass und VOR dem Opaque-Pass.
-        self.godray.dispatch(&mut encoder);
+        // Godrays vorerst deaktiviert (s. Kommentar in `App::window_event`).
+        // self.godray.dispatch(&mut encoder);
 
         {
             let timestamp_writes = self.gpu_timer.as_ref().map(GpuTimer::timestamp_writes);
@@ -501,28 +505,27 @@ impl GpuContext {
             self.blur.render(&mut blur_pass);
         }
 
-        {
-            // Godrays laufen ERST nach Skybox UND SSAO/Blur (nicht direkt nach dem Opaque-Pass, wie
-            // eine woertliche Lesart der Pass-Reihenfolge nahelegen wuerde): additive Farbe mit
-            // depth_write=false wuerde von Skybox's unbedingtem Overwrite (`blend: None`) auf allen
-            // Hintergrund-Pixeln sofort wieder geloescht, und SSAO/Blur wuerde den Glow faelschlich
-            // wie Geometrie-AO abdunkeln. Additiv NACH dem finalen Farb-Composite ist hier korrekt.
-            let mut godray_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("godray_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &swapchain_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            self.godray.render(&mut godray_pass);
-        }
+        // Godrays vorerst deaktiviert (s. Kommentar in `App::window_event`) - Platzierung/
+        // Kantenerkennung liefert noch nicht das gewuenschte Ergebnis. Ganzer Pass uebersprungen
+        // statt nur `self.godray.render(...)` auszukommentieren, damit auch keine leere
+        // Render-Pass-Erstellung anfaellt.
+        // {
+        //     let mut godray_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        //         label: Some("godray_pass"),
+        //         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+        //             view: &swapchain_view,
+        //             resolve_target: None,
+        //             depth_slice: None,
+        //             ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        //         })],
+        //         depth_stencil_attachment: None,
+        //         timestamp_writes: None,
+        //         occlusion_query_set: None,
+        //         multiview_mask: None,
+        //     });
+        //
+        //     self.godray.render(&mut godray_pass);
+        // }
 
         {
             let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
