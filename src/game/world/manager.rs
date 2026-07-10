@@ -87,6 +87,22 @@ fn chunk_origin_scaled(coord: ChunkCoord, voxel_scale: i32) -> glam::Vec3 {
     glam::Vec3::new(coord.0 as f32 * step, coord.1 as f32 * step, coord.2 as f32 * step)
 }
 
+/// Ladefenster-Praedikat EINES Rings: eine quadratische SCHALE (`radius` nach aussen, `exclusion`
+/// nach innen ausgestanzt), NICHT ein voller Kubus - sonst wuerden sich alle LOD-Ringe im
+/// Kamera-Nahbereich komplett ueberlappen (riesige Fern-Voxel direkt neben/statt der LOD0-
+/// Feingeometrie, s. `EngineConfig::lod_ring_runtimes`-Kommentar zur Herleitung von `exclusion`).
+/// Freie Funktion statt Methode, damit sie auch dort aufrufbar ist, wo `self.loaded`/
+/// `self.pending_set` bereits mutably geborgt sind (`rebuild_load_window`).
+#[inline(always)]
+fn in_ring_box(coord: ChunkCoord, center: ChunkCoord, exclusion_h: i32, exclusion_v: i32, radius_h: i32, radius_v: i32) -> bool {
+    let dx = (coord.0 - center.0).abs();
+    let dy = (coord.1 - center.1).abs();
+    let dz = (coord.2 - center.2).abs();
+    let inside_outer = dx <= radius_h && dy <= radius_v && dz <= radius_h;
+    let inside_inner = dx < exclusion_h && dy < exclusion_v && dz < exclusion_h;
+    inside_outer && !inside_inner
+}
+
 fn sphere_intersects_aabb(center: glam::Vec3, radius: f32, min: glam::Vec3, max: glam::Vec3) -> bool {
     let closest = center.clamp(min, max);
     center.distance_squared(closest) <= radius * radius
@@ -142,6 +158,12 @@ pub struct ChunkManager {
     /// `pool`-Indices (0..pool_size) werden nur bei GPU-Aufrufen (`update_chunk_meta`/
     /// `clear_chunk_meta`) um diesen Wert verschoben, sonst bleibt der Ring komplett unabhaengig.
     pool_slot_base: usize,
+    /// Macht aus dem Ladefenster eine quadratische SCHALE statt eines vollen Kubus - Chunks
+    /// innerhalb dieses (in eigenen Chunk-Einheiten gemessenen) inneren Radius sind bereits vom
+    /// naechst-feineren Ring abgedeckt und werden NICHT geladen, sonst ueberlappen sich alle Ringe
+    /// komplett im Kamera-Nahbereich (s. `in_ring_box`). 0 fuer LOD0.
+    inner_exclusion_chunks: i32,
+    inner_exclusion_vertical_chunks: i32,
     /// Fenster-Zentrum (Kamera-Chunk-Koordinate) des letzten Rebuilds. Ob eine Koordinate zum
     /// Ladefenster gehoert, ist ein O(1)-Arithmetik-Praedikat gegen dieses Zentrum
     /// (`Self::in_window`) - es existiert bewusst KEINE materialisierte "Soll-Menge" mehr: das
@@ -198,6 +220,8 @@ impl ChunkManager {
             vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
             voxel_scale: ring.voxel_scale,
             pool_slot_base: ring.pool_slot_base,
+            inner_exclusion_chunks: ring.inner_exclusion_chunks,
+            inner_exclusion_vertical_chunks: ring.inner_exclusion_vertical_chunks,
             last_center: None,
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
@@ -227,9 +251,14 @@ impl ChunkManager {
 
     #[inline(always)]
     fn in_window(&self, coord: ChunkCoord, center: ChunkCoord) -> bool {
-        (coord.0 - center.0).abs() <= self.render_distance_chunks
-            && (coord.1 - center.1).abs() <= self.vertical_render_distance_chunks
-            && (coord.2 - center.2).abs() <= self.render_distance_chunks
+        in_ring_box(
+            coord,
+            center,
+            self.inner_exclusion_chunks,
+            self.inner_exclusion_vertical_chunks,
+            self.render_distance_chunks,
+            self.vertical_render_distance_chunks,
+        )
     }
 
     /// PHYSIKALISCHE Voxel-Festigkeit (Kollision/Raycast) unter Beruecksichtigung geladener/
@@ -380,11 +409,13 @@ impl ChunkManager {
     /// reinem Arithmetik-Praedikat.
     fn rebuild_load_window(&mut self, center: ChunkCoord) {
         let old_center = self.last_center;
+        let r = self.render_distance_chunks;
+        let rv = self.vertical_render_distance_chunks;
+        let exclusion_h = self.inner_exclusion_chunks;
+        let exclusion_v = self.inner_exclusion_vertical_chunks;
 
         for (coord, loaded) in self.loaded.iter_mut() {
-            let outside = (coord.0 - center.0).abs() > self.render_distance_chunks
-                || (coord.1 - center.1).abs() > self.vertical_render_distance_chunks
-                || (coord.2 - center.2).abs() > self.render_distance_chunks;
+            let outside = !in_ring_box(*coord, center, exclusion_h, exclusion_v, r, rv);
             if outside && !loaded.queued_for_unload {
                 loaded.queued_for_unload = true;
                 self.unload_scratch.push(*coord);
@@ -394,11 +425,7 @@ impl ChunkManager {
         // Chunks, die aus dem Fenster gewandert sind, bevor sie je dispatcht wurden, muessen aus
         // der Pending-Liste verschwinden - sonst wuerde spaeter fuer eine laengst irrelevante
         // Position noch ein Generierungs-Job gestartet.
-        let r = self.render_distance_chunks;
-        let rv = self.vertical_render_distance_chunks;
-        self.pending_set.retain(|&(x, y, z)| {
-            (x - center.0).abs() <= r && (y - center.1).abs() <= rv && (z - center.2).abs() <= r
-        });
+        self.pending_set.retain(|&coord| in_ring_box(coord, center, exclusion_h, exclusion_v, r, rv));
         let pending_set = &self.pending_set;
         self.pending_scratch.retain(|coord| pending_set.contains(coord));
 
@@ -406,8 +433,11 @@ impl ChunkManager {
             for dx in -r..=r {
                 for dy in -rv..=rv {
                     let coord = (center.0 + dx, center.1 + dy, center.2 + dz);
+                    if !in_ring_box(coord, center, exclusion_h, exclusion_v, r, rv) {
+                        continue;
+                    }
                     if let Some(old) = old_center
-                        && self.in_window(coord, old)
+                        && in_ring_box(coord, old, exclusion_h, exclusion_v, r, rv)
                     {
                         continue;
                     }
@@ -692,6 +722,33 @@ mod tests {
     #[test]
     fn chunk_origin_scales_with_voxel_scale() {
         assert_eq!(chunk_origin_scaled((1, -1, 2), 4), glam::Vec3::new(128.0, -128.0, 256.0));
+    }
+
+    #[test]
+    fn ring_box_without_exclusion_behaves_like_a_full_cube() {
+        // exclusion=0 (LOD0) muss sich exakt wie der alte reinen Aussen-Box-Check verhalten.
+        assert!(in_ring_box((0, 0, 0), (0, 0, 0), 0, 0, 4, 4));
+        assert!(in_ring_box((4, 4, 4), (0, 0, 0), 0, 0, 4, 4));
+        assert!(!in_ring_box((5, 0, 0), (0, 0, 0), 0, 0, 4, 4));
+    }
+
+    #[test]
+    fn ring_box_excludes_center_covered_by_finer_ring() {
+        // Regressionstest fuer den "LOD-Ringe ueberlappen komplett"-Bug: ein Ring mit
+        // exclusion=3 darf NICHTS innerhalb von |dx|,|dy|,|dz| < 3 laden (das deckt der naechst-
+        // feinere Ring bereits ab), auch wenn es innerhalb des aeusseren Radius liegt.
+        assert!(!in_ring_box((0, 0, 0), (0, 0, 0), 3, 3, 10, 10));
+        assert!(!in_ring_box((2, 0, 0), (0, 0, 0), 3, 3, 10, 10));
+        assert!(in_ring_box((3, 0, 0), (0, 0, 0), 3, 3, 10, 10));
+        assert!(in_ring_box((10, 0, 0), (0, 0, 0), 3, 3, 10, 10));
+        assert!(!in_ring_box((11, 0, 0), (0, 0, 0), 3, 3, 10, 10));
+    }
+
+    #[test]
+    fn ring_box_exclusion_and_radius_move_together_with_center() {
+        // Die Schale muss mit der Kamera mitwandern, nicht nur der aeussere Rand.
+        assert!(!in_ring_box((5, 0, 0), (5, 0, 0), 3, 3, 10, 10));
+        assert!(in_ring_box((8, 0, 0), (5, 0, 0), 3, 3, 10, 10));
     }
 
     #[test]
