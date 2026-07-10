@@ -101,6 +101,14 @@ fn chunk_and_local(world_x: i32, world_y: i32, world_z: i32) -> (ChunkCoord, IVe
     (coord, local)
 }
 
+/// Wie viele Generierungs-Jobs gleichzeitig auf dem Rayon-Pool sitzen duerfen, bevor
+/// `dispatch_pending` weitere zurueckhaelt - s. Kommentar dort. Ein kleines Vielfaches der
+/// tatsaechlichen Worker-Anzahl gibt jedem Kern genug Nachschub, um nie leerzulaufen (Work-Stealing-
+/// Overhead), ohne einen unbegrenzten Rueckstau zuzulassen.
+fn max_in_flight_generations() -> usize {
+    rayon::current_num_threads().max(1) * 2
+}
+
 /// Skaliert den per-Kaskade tolerierten Kugel-Versatz mit dem Kaskadenradius: die ferne Kaskade
 /// wandert bei reiner Kamerarotation deutlich weiter als die nahe (ihr Zentrum liegt weit entlang
 /// der Blickrichtung) - ein fixer kleiner Slack wuerde dort trotzdem jeden Frame einen Rebuild
@@ -426,10 +434,28 @@ impl ChunkManager {
     }
 
     /// Dispatcht bis zu `max_chunk_dispatches_per_frame` ausstehende Chunks (nearest-first, s.
-    /// `pending_scratch`-Sortierung). Gedeckelt, damit ein grosser Backlog nicht in einem einzigen
-    /// Frame tausende Rayon-Tasks spawnt - das verteilt die Dispatch-Kosten ueber mehrere Frames.
+    /// `pending_scratch`-Sortierung) - ABER NICHT, wenn bereits `max_in_flight_generations()` Jobs
+    /// unbeantwortet auf dem Rayon-Pool sitzen.
+    ///
+    /// Der reine Pro-Frame-Deckel (`max_chunk_dispatches_per_frame`) reicht allein NICHT: er
+    /// begrenzt, wie viele NEUE Tasks pro Frame gespawnt werden, aber nicht, wie viele INSGESAMT
+    /// gleichzeitig laufen. Solange Generierung schneller war als der Dispatch-Takt, war das
+    /// irrelevant - seit Hoehlen/Tunnel/fBm aber mehrere ms/Chunk kosten koennen (v.a. tief unter der
+    /// Oberflaeche in Tunnel-Regionen), spawnt dieser Deckel bei 60 FPS potenziell 128 NEUE Tasks
+    /// alle ~16ms, waehrend die vorherigen 128 noch gar nicht fertig sind - die Rayon-Warteschlange
+    /// waechst dadurch UNBEGRENZT. Ergebnis: alle CPU-Kerne dauerhaft mit Chunk-Generierung gesaettigt,
+    /// der Main-Thread bekommt vom OS-Scheduler kein Zeitfenster mehr fuer sein eigenes (triviales)
+    /// Pro-Frame-Setup - Frame-Zeiten von >200ms bei praktisch leerlaufender GPU (0.2ms), obwohl die
+    /// GPU-Kullung selbst blitzschnell ist. Die In-Flight-Grenze bremst den Dispatch-Takt auf das,
+    /// was der Pool tatsaechlich verarbeiten kann, statt blind auf Vorrat zu spawnen.
     fn dispatch_pending(&mut self) {
+        let max_in_flight = max_in_flight_generations();
+
         for _ in 0..self.max_chunk_dispatches_per_frame {
+            if self.in_flight.len() >= max_in_flight {
+                break;
+            }
+
             let Some(coord) = self.pending_scratch.pop() else { break };
             self.pending_set.remove(&coord);
 

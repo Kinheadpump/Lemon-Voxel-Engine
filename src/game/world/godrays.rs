@@ -19,6 +19,16 @@ pub struct GodrayInstanceData {
     pub size: [f32; 4],
 }
 
+/// Wie viele Bloecke unter der (glatten) 2D-Oberflaeche `find_nearby_cave_opening` nach einer
+/// Hoehlendecke sucht - klein halten, jede Stufe kostet einen `is_solid`-Aufruf (in Hoehlenregionen
+/// mehrere hundert ns) UND die Kandidaten-Regenerierung laeuft synchron auf dem Main-Thread.
+const CAVE_PROBE_MAX_DEPTH: i32 = 6;
+/// Minimaler Hoehenunterschied zu den 4 Nachbar-Spalten, ab dem eine reine Oberflaechen-Position
+/// (kein Hoehleneinschlag gefunden) ueberhaupt als Godray-Kandidat akzeptiert wird - auf komplett
+/// flachem Land kann die GPU-seitige Kantenerkennung (16 Samples im `sample_height`-Radius) nie
+/// einen echten Licht/Schatten-Uebergang finden, der Slot waere verschwendet.
+const MIN_SURFACE_RELIEF: i32 = 2;
+
 /// Platziert Godray-Kandidaten auf einem an die Terrainoberflaeche angehefteten Gitter um die
 /// Kamera. Regeneriert nur bei ausreichender Kamerabewegung (wie das Chunk-Ladefenster) statt jeden
 /// Frame Rauschen abzufragen und den kompletten SSBO neu hochzuladen.
@@ -31,6 +41,28 @@ pub struct GodrayField {
     last_center: Option<Vec3>,
     regen_threshold: f32,
     instances: Vec<GodrayInstanceData>,
+}
+
+/// Sucht straight nach unten ab der (2D-)Oberflaechenhoehe nach einem nahen Luftpocket unter festem
+/// Fels - genau das ist eine Hoehlendecke, durch die Tageslicht faellt. `generator.is_solid` sieht
+/// (anders als die reine Heightmap `height_at`) die tatsaechliche 3D-Aushoehlung (Cheese Caves,
+/// Tunnelnetz). Liefert die Y-Koordinate des ersten Luftblocks unter der Oberflaeche, falls
+/// innerhalb `CAVE_PROBE_MAX_DEPTH` einer gefunden wird.
+fn find_nearby_cave_opening(generator: &TerrainGenerator, world_x: i32, world_z: i32, surface_y: i32) -> Option<i32> {
+    (1..=CAVE_PROBE_MAX_DEPTH)
+        .map(|depth| surface_y - depth)
+        .find(|&y| !generator.is_solid(world_x, y, world_z))
+}
+
+/// Groesster Hoehenunterschied zu den 4 Nachbar-Spalten (1 Block Abstand) - billiges Relief-Mass
+/// aus bereits gecachten `height_at`-Aufrufen, um flache (fuer Kantenerkennung nutzlose) Kandidaten
+/// zu verwerfen.
+fn local_relief(generator: &TerrainGenerator, world_x: i32, world_z: i32, height: i32) -> i32 {
+    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .into_iter()
+        .map(|(dx, dz)| (height - generator.height_at(world_x + dx, world_z + dz)).abs())
+        .max()
+        .unwrap_or(0)
 }
 
 impl GodrayField {
@@ -76,6 +108,13 @@ impl GodrayField {
             (state as f32 / u32::MAX as f32) - 0.5
         };
 
+        // Der GPU-seitige Compute-/Render-Pass verarbeitet IMMER exakt `capacity` Slots (fixer
+        // Dispatch/Draw-Count, s. `GodrayPass`) - ungeschriebene Slots wuerden also veraltete Daten
+        // vom letzten Upload zeigen. Pro Gitterzelle werden deshalb bis zu `CELL_RETRIES` jitterte
+        // Positionen versucht (Hoehlenoeffnung > Oberflaechen-Relief > irgendeine), aber IMMER
+        // genau eine Instanz geschrieben, nie eine Zelle ausgelassen.
+        const CELL_RETRIES: u32 = 3;
+
         self.instances.clear();
         'grid: for gz in -half..=half {
             for gx in -half..=half {
@@ -83,18 +122,53 @@ impl GodrayField {
                     break 'grid;
                 }
 
-                let world_x = camera_position.x + gx as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
-                let world_z = camera_position.z + gz as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
-                // Direkt AUF der Oberflaeche (nur minimaler Epsilon-Versatz gegen Z-Fighting) statt
-                // frei schwebend - der Kantenerkennungs-Punkt (`sample_height` darueber) soll mit
-                // der tatsaechlichen Voxel-Silhouette an dieser Stelle interagieren koennen.
-                let surface_y = generator.height_at(world_x.floor() as i32, world_z.floor() as i32) as f32;
-                let base_y = surface_y + 1.05;
+                let mut best: Option<GodrayInstanceData> = None;
+                for _ in 0..CELL_RETRIES {
+                    let world_x =
+                        camera_position.x + gx as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
+                    let world_z =
+                        camera_position.z + gz as f32 * self.grid_spacing + next_jitter() * self.grid_spacing * 0.6;
+                    let column_x = world_x.floor() as i32;
+                    let column_z = world_z.floor() as i32;
+                    let surface_y = generator.height_at(column_x, column_z);
 
-                self.instances.push(GodrayInstanceData {
-                    position_intensity: [world_x, base_y, world_z, 0.0],
-                    size: [self.width, self.beam_length, self.sample_height, 0.0],
-                });
+                    // Hoehlenoeffnung gefunden: Basis DIREKT IM Luftpocket unter der Oberflaeche
+                    // platzieren, mit deutlich kleinerem Kantenerkennungs-Versatz (die Decke ist
+                    // nur wenige Bloecke ueber dem Pocket, nicht `sample_height` wie im Freien) -
+                    // das ist die eigentliche "Lichtschacht durch ein Loch in der Hoehlendecke".
+                    if let Some(air_y) = find_nearby_cave_opening(generator, column_x, column_z, surface_y) {
+                        best = Some(GodrayInstanceData {
+                            position_intensity: [world_x, air_y as f32 + 0.5, world_z, 0.0],
+                            size: [self.width, self.beam_length, (self.sample_height * 0.5).max(0.5), 0.0],
+                        });
+                        break;
+                    }
+
+                    // Keine Hoehle: nur bei echtem lokalem Relief (Klippenkante, Huegelkamm)
+                    // behalten - auf komplett flachem Land kann die GPU-Kantenerkennung ohnehin nie
+                    // triggern. `Some(_)` wird nur durch eine bessere/gleich gute Alternative in der
+                    // naechsten Iteration ersetzt, s.u.
+                    if local_relief(generator, column_x, column_z, surface_y) >= MIN_SURFACE_RELIEF {
+                        // Direkt AUF der Oberflaeche (nur minimaler Epsilon-Versatz gegen
+                        // Z-Fighting) statt frei schwebend - der Kantenerkennungs-Punkt
+                        // (`sample_height` darueber) soll mit der tatsaechlichen Voxel-Silhouette
+                        // an dieser Stelle interagieren koennen.
+                        best = Some(GodrayInstanceData {
+                            position_intensity: [world_x, surface_y as f32 + 1.05, world_z, 0.0],
+                            size: [self.width, self.beam_length, self.sample_height, 0.0],
+                        });
+                        break;
+                    }
+
+                    // Weder Hoehle noch Relief - als schwaechster Fallback merken, falls auch die
+                    // letzte Runde nichts Besseres findet (nie eine Zelle auslassen).
+                    best.get_or_insert(GodrayInstanceData {
+                        position_intensity: [world_x, surface_y as f32 + 1.05, world_z, 0.0],
+                        size: [self.width, self.beam_length, self.sample_height, 0.0],
+                    });
+                }
+
+                self.instances.push(best.expect("CELL_RETRIES > 0 garantiert mind. einen Fallback-Kandidaten"));
             }
         }
 
