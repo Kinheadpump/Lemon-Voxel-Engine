@@ -129,6 +129,16 @@ pub struct EngineConfig {
     pub terrain_dirt_layer_depth: i32,
     pub terrain_noise_origin_offset: f32,
 
+    /// Zellgroesse (Weltbloecke) des Baum-Spawn-Gitters - eine Zelle traegt hoechstens einen
+    /// gejitterten Kandidaten.
+    pub terrain_tree_grid_size: i32,
+    /// Wahrscheinlichkeit (nach Jitter, vor Biom-Check), dass eine Gitterzelle einen Baum traegt.
+    pub terrain_tree_spawn_chance: f32,
+    pub terrain_tree_trunk_height_min: i32,
+    pub terrain_tree_trunk_height_max: i32,
+    pub terrain_tree_crown_radius_min: i32,
+    pub terrain_tree_crown_radius_max: i32,
+
     pub player_half_width: f32,
     pub player_height: f32,
     pub player_eye_height: f32,
@@ -250,6 +260,15 @@ impl Default for EngineConfig {
             terrain_cave_region_threshold: 0.3,
             terrain_dirt_layer_depth: 3,
             terrain_noise_origin_offset: 10_000.0,
+
+            // ~8-Block-Gitter mit 12% Spawnchance -> im Schnitt ein Baum alle ~8 Zellen, natuerlich
+            // sparsam ohne Kronen-Ueberlappung (Kronenradius max. 3 << halbe Zellgroesse).
+            terrain_tree_grid_size: 8,
+            terrain_tree_spawn_chance: 0.12,
+            terrain_tree_trunk_height_min: 4,
+            terrain_tree_trunk_height_max: 7,
+            terrain_tree_crown_radius_min: 2,
+            terrain_tree_crown_radius_max: 3,
 
             player_half_width: 0.3,
             player_height: 1.8,
@@ -440,6 +459,12 @@ struct ConfigFile {
     terrain_cave_region_threshold: f32,
     terrain_dirt_layer_depth: i32,
     terrain_noise_origin_offset: f32,
+    terrain_tree_grid_size: i32,
+    terrain_tree_spawn_chance: f32,
+    terrain_tree_trunk_height_min: i32,
+    terrain_tree_trunk_height_max: i32,
+    terrain_tree_crown_radius_min: i32,
+    terrain_tree_crown_radius_max: i32,
 
     player_half_width: f32,
     player_height: f32,
@@ -540,6 +565,12 @@ impl From<EngineConfig> for ConfigFile {
             terrain_cave_region_threshold: c.terrain_cave_region_threshold,
             terrain_dirt_layer_depth: c.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: c.terrain_noise_origin_offset,
+            terrain_tree_grid_size: c.terrain_tree_grid_size,
+            terrain_tree_spawn_chance: c.terrain_tree_spawn_chance,
+            terrain_tree_trunk_height_min: c.terrain_tree_trunk_height_min,
+            terrain_tree_trunk_height_max: c.terrain_tree_trunk_height_max,
+            terrain_tree_crown_radius_min: c.terrain_tree_crown_radius_min,
+            terrain_tree_crown_radius_max: c.terrain_tree_crown_radius_max,
 
             player_half_width: c.player_half_width,
             player_height: c.player_height,
@@ -636,6 +667,12 @@ impl From<ConfigFile> for EngineConfig {
             terrain_cave_region_threshold: f.terrain_cave_region_threshold,
             terrain_dirt_layer_depth: f.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: f.terrain_noise_origin_offset,
+            terrain_tree_grid_size: f.terrain_tree_grid_size.max(1),
+            terrain_tree_spawn_chance: f.terrain_tree_spawn_chance.clamp(0.0, 1.0),
+            terrain_tree_trunk_height_min: f.terrain_tree_trunk_height_min.max(1),
+            terrain_tree_trunk_height_max: f.terrain_tree_trunk_height_max.max(f.terrain_tree_trunk_height_min.max(1)),
+            terrain_tree_crown_radius_min: f.terrain_tree_crown_radius_min.max(0),
+            terrain_tree_crown_radius_max: f.terrain_tree_crown_radius_max.max(f.terrain_tree_crown_radius_min.max(0)),
 
             player_half_width: f.player_half_width,
             player_height: f.player_height,

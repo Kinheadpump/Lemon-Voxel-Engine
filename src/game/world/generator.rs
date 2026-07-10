@@ -51,6 +51,15 @@ const ROCK_HEIGHT: f32 = 92.0;
 /// Warme Spalten brauchen mehr Hoehe fuer Fels, kalte weniger - dithert die Fels-Grenze mit dem
 /// (bereits gesampelten, glatten) Temperaturfeld statt einer harten Kontur.
 const ROCK_HEIGHT_TEMPERATURE_DITHER: f32 = 14.0;
+/// Sicherheitsmarge (Weltbloecke) fuer den Luft-Chunk-Fruehausstieg in `generate_chunk`: eine
+/// Baumkrone aus einer NACHBAR-Spalte (innerhalb des Baum-Suchradius, aber ausserhalb der eigenen
+/// 1024 Saeulen dieses Chunks) kann in einen Chunk hineinragen, dessen eigene lokale Saeulen alle
+/// niedriger liegen - besonders an Klippenkanten, wo die Regional-Kontrast-Karte auf wenigen
+/// Bloecken Distanz stark springen kann. Grosszuegig aus der maximalen Regional-Amplitude (Default
+/// 22, Range ca. +-44) plus Baum-Reichweite bemessen, nicht aus der exakten Baumhoehe abgeleitet -
+/// eine zu knappe Marge waere ein stiller Cross-Chunk-Bug (fehlende Blattvoxel), eine zu grosszuegige
+/// kostet nur ein paar zusaetzliche, aber billige Leerlauf-Chunks.
+const TREE_HEIGHT_SAFETY_MARGIN: i32 = 48;
 
 #[inline(always)]
 fn signed_pow(value: f32, exponent: f32) -> f32 {
@@ -60,6 +69,31 @@ fn signed_pow(value: f32, exponent: f32) -> f32 {
 #[inline(always)]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Deterministisches White-Noise-Hash fuer die Baum-Spawn-Entscheidung: reine Bit-Mischung ueber
+/// (Gitterzelle, Seed, Salt) - KEIN Gradientenrauschen (`noiz`), weil Spawn-Entscheidungen diskret
+/// sind (existiert der Baum in dieser Zelle oder nicht) und keine raeumliche Kontinuitaet zwischen
+/// Nachbarzellen brauchen. `salt` unterscheidet die verschiedenen pro Zelle abgeleiteten Werte
+/// (Jitter-X, Jitter-Z, Spawn-Wuerfel, Stammhoehe, Kronenradius) - dieselbe Zellkoordinate liefert
+/// pro Salt einen unabhaengigen, aber ueber Aufrufe hinweg REPRODUZIERBAREN Wert.
+#[inline(always)]
+fn tree_hash(seed: u32, cell_x: i32, cell_z: i32, salt: u32) -> u32 {
+    let mut h = (cell_x as u32).wrapping_mul(0x9E37_79B1)
+        ^ (cell_z as u32).wrapping_mul(0x85EB_CA6B)
+        ^ seed.wrapping_mul(0xC2B2_AE35)
+        ^ salt.wrapping_mul(0x27D4_EB2F);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x2971_25AC);
+    h ^ (h >> 15)
+}
+
+/// Bildet einen Hash auf `[0, 1)` ab (obere 24 Bit fuer gleichmaessige Streuung).
+#[inline(always)]
+fn hash_unit(h: u32) -> f32 {
+    (h >> 8) as f32 / (1u32 << 24) as f32
 }
 
 /// Direkt-gemapptes Memo fuer 2D-Spalten-Werte (`height_at`, `is_tunnel_region`) - Potenz von 2,
@@ -149,6 +183,24 @@ pub type BoundaryPlane = [[bool; PLANE_SIZE]; PLANE_SIZE];
 /// `solid_plane_*`-Funktionen, s. `TerrainGenerator::grid_slice`.
 type GridSlice = [[f32; CAVE_COLUMN_MAX_LAYERS]; CAVE_COLUMN_MAX_LAYERS];
 
+/// Deterministisch berechnete Struktur EINES Baum-Spawns - s. `TerrainGenerator::tree_candidate`.
+#[derive(Clone, Copy)]
+struct TreeSpawn {
+    world_x: i32,
+    world_z: i32,
+    /// Topmost solider Block der Spawn-Saeule (== `height_at`) - Stamm beginnt bei `ground_y + 1`.
+    ground_y: i32,
+    trunk_height: i32,
+    crown_radius: i32,
+}
+
+/// Obergrenze gleichzeitig im Suchradius gefundener Baum-Kandidaten - bei realistischen
+/// Spawn-Chancen (< 20%) liegen es fast immer 0-2, hier grosszuegig bemessen fuer extreme
+/// Test-Configs (`terrain_tree_spawn_chance = 1.0`). Ueberzaehlige Kandidaten (praktisch nie im
+/// echten Spiel) werden schlicht ignoriert statt zu reallozieren.
+const MAX_NEARBY_TREES: usize = 16;
+const EMPTY_TREE_SPAWN: TreeSpawn = TreeSpawn { world_x: 0, world_z: 0, ground_y: 0, trunk_height: 0, crown_radius: 0 };
+
 /// Alle 6 Rand-Ebenen EINES Chunks, s. `TerrainGenerator::boundary_planes`.
 pub struct BoundaryPlanes {
     pub neg_x: BoundaryPlane,
@@ -231,6 +283,15 @@ pub struct TerrainGenerator {
     /// degeneriert und liefert dort konstant 0.0 unabhaengig von der Position. Ein fixer Offset
     /// verschiebt jede Sample-Koordinate weit weg vom Ursprung und umgeht das vollstaendig.
     noise_origin_offset: f32,
+    /// Salt fuer den Baum-Spawn-Hash - kein `Noise<>`-Feld, Baeume brauchen keine Gradienten-
+    /// Kontinuitaet (White Noise reicht fuer diskrete Spawn-Entscheidungen), nur Determinismus.
+    tree_seed: u32,
+    tree_grid_size: i32,
+    tree_spawn_chance: f32,
+    tree_trunk_height_min: i32,
+    tree_trunk_height_max: i32,
+    tree_crown_radius_min: i32,
+    tree_crown_radius_max: i32,
 }
 
 impl TerrainGenerator {
@@ -303,6 +364,13 @@ impl TerrainGenerator {
             cave_region_threshold: config.terrain_cave_region_threshold,
             dirt_layer_depth: config.terrain_dirt_layer_depth,
             noise_origin_offset: config.terrain_noise_origin_offset,
+            tree_seed: config.terrain_seed.wrapping_add(0x4B72_E68F),
+            tree_grid_size: config.terrain_tree_grid_size.max(1),
+            tree_spawn_chance: config.terrain_tree_spawn_chance.clamp(0.0, 1.0),
+            tree_trunk_height_min: config.terrain_tree_trunk_height_min.max(1),
+            tree_trunk_height_max: config.terrain_tree_trunk_height_max.max(config.terrain_tree_trunk_height_min.max(1)),
+            tree_crown_radius_min: config.terrain_tree_crown_radius_min.max(0),
+            tree_crown_radius_max: config.terrain_tree_crown_radius_max.max(config.terrain_tree_crown_radius_min.max(0)),
         }
     }
 
@@ -530,25 +598,90 @@ impl TerrainGenerator {
         tunnel_diff < self.tunnel_threshold_at(world_y)
     }
 
+    /// Sammelt alle Baum-Kandidaten, die eine Position bei `(world_x, world_z)` ueberhaupt
+    /// erreichen KOENNTEN (unabhaengig von Y) - der Suchradius haengt nur von X/Z ab, nicht von Y.
+    /// Getrennt von `tree_occupies` extrahiert, damit Aufrufer mit einer FESTEN X- oder Z-Achse
+    /// (die drei `solid_plane_*`) diese Suche EINMAL pro Spalte statt einmal pro Voxel durchfuehren
+    /// koennen - ohne dieses Batching wiederholte eine 32-Bloecke-hohe Rand-Ebenen-Spalte dieselbe
+    /// Gitterzellen-Suche bis zu 32x, s. Kommentar an `solid_plane_x`.
+    fn nearby_tree_candidates(&self, world_x: i32, world_z: i32) -> ([TreeSpawn; MAX_NEARBY_TREES], usize) {
+        let search_radius = self.tree_grid_size + self.tree_crown_radius_max;
+        let cell_min_x = (world_x - search_radius).div_euclid(self.tree_grid_size);
+        let cell_max_x = (world_x + search_radius).div_euclid(self.tree_grid_size);
+        let cell_min_z = (world_z - search_radius).div_euclid(self.tree_grid_size);
+        let cell_max_z = (world_z + search_radius).div_euclid(self.tree_grid_size);
+
+        let mut trees = [EMPTY_TREE_SPAWN; MAX_NEARBY_TREES];
+        let mut count = 0;
+        'search: for cell_z in cell_min_z..=cell_max_z {
+            for cell_x in cell_min_x..=cell_max_x {
+                if let Some(tree) = self.tree_candidate(cell_x, cell_z) {
+                    trees[count] = tree;
+                    count += 1;
+                    if count >= MAX_NEARBY_TREES {
+                        break 'search;
+                    }
+                }
+            }
+        }
+        (trees, count)
+    }
+
+    /// Prueft eine bereits gesammelte Kandidatenliste (s. `nearby_tree_candidates`) gegen EINEN
+    /// Punkt - exakt dieselbe Trunk-Saeule/Kronen-Kugel-Geometrie wie `place_flora`, MUSS mit ihr
+    /// uebereinstimmen, sonst genau die Bulk/Fallback-Divergenz, die `is_carved` schon einmal
+    /// hatte (s. dortiger Kommentar).
+    fn tree_occupies_among(trees: &[TreeSpawn], world_x: i32, world_y: i32, world_z: i32) -> bool {
+        for tree in trees {
+            let trunk_top = tree.ground_y + tree.trunk_height;
+
+            if world_x == tree.world_x && world_z == tree.world_z && world_y > tree.ground_y && world_y <= trunk_top {
+                return true;
+            }
+
+            let dx = world_x - tree.world_x;
+            let dy = world_y - trunk_top;
+            let dz = world_z - tree.world_z;
+            if dx * dx + dy * dy + dz * dz <= tree.crown_radius * tree.crown_radius {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Einzelpunkt-Fallback fuer Baum-Belegung ("steht an dieser Weltposition Stamm oder Krone
+    /// irgendeines Baumes?"). Genutzt von `is_solid`/`is_physically_solid`, die (anders als der
+    /// Bulk-Pfad `place_flora`) kein lokales Chunk-Array haben, aus dem sie einfach lesen koennten.
+    fn tree_occupies(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        let (trees, count) = self.nearby_tree_candidates(world_x, world_z);
+        Self::tree_occupies_among(&trees[..count], world_x, world_y, world_z)
+    }
+
     /// Fallback-Quelle der Wahrheit fuer OKKLUSION ("belegt diese Position einen sichtbaren Block?",
     /// inklusive Wasser - opak gerendert) ausserhalb geladener Chunk-Daten - genutzt vom Mesher
     /// (Nachbar-Check ueber Chunk-Grenzen an noch nicht gemeshten Chunks). MUSS exakt `block != 0`
-    /// des spaeter generierten Chunks vorhersagen, also Wasser einschliessen - sonst entstehen an
-    /// Ozean-Chunk-Naehten dieselben dauerhaften Face-Fehler wie beim fruehen Hoehen-Bug.
+    /// des spaeter generierten Chunks vorhersagen, also Wasser UND Baeume einschliessen - sonst
+    /// entstehen an Chunk-Naehten dieselben dauerhaften Face-Fehler wie beim fruehen Hoehen-Bug.
     pub fn is_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let height = self.height_at(world_x, world_z);
         if Self::is_water_position(height, world_y) {
             return true;
         }
-        world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
+        if world_y <= height {
+            return !self.is_carved(world_x, world_y, world_z, height - world_y);
+        }
+        self.tree_occupies(world_x, world_y, world_z)
     }
 
     /// Physik-Variante: Wasser ist begehbar/durchschwimmbar, also NICHT solide - nur echtes Terrain
-    /// blockiert. Fallback fuer `ChunkManager::is_solid_at` (Kollision/Raycast), waehrend der Mesher
-    /// die Okklusions-Variante `is_solid` nutzt.
+    /// (inkl. Baeume) blockiert. Fallback fuer `ChunkManager::is_solid_at` (Kollision/Raycast),
+    /// waehrend der Mesher die Okklusions-Variante `is_solid` nutzt.
     pub fn is_physically_solid(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
         let height = self.height_at(world_x, world_z);
-        world_y <= height && !self.is_carved(world_x, world_y, world_z, height - world_y)
+        if world_y <= height {
+            return !self.is_carved(world_x, world_y, world_z, height - world_y);
+        }
+        self.tree_occupies(world_x, world_y, world_z)
     }
 
     /// Holt `corner(to_grid(i,j))` fuer `i in i_min..=i_max`, `j in j_min..=j_max` in
@@ -595,6 +728,13 @@ impl TerrainGenerator {
             *height = self.height_at(world_x, chunk_origin_z + z as i32);
         }
 
+        // Baum-Suchradius haengt nur von (world_x, world_z) ab, nicht von Y - hier ist Y aber die
+        // AEUSSERE Schleife und Z die innere: ohne dieses Vorab-Array pro Z-Wert wuerde dieselbe
+        // Gitterzellen-Suche fuer denselben (world_x, world_z) bis zu 32x wiederholt (einmal pro
+        // Y-Wert dieser Spalte).
+        let nearby_trees_by_z: [([TreeSpawn; MAX_NEARBY_TREES], usize); PLANE_SIZE] =
+            std::array::from_fn(|z| self.nearby_tree_candidates(world_x, chunk_origin_z + z as i32));
+
         let gx0 = world_x.div_euclid(CAVE_GRID_STRIDE);
         let tx = world_x.rem_euclid(CAVE_GRID_STRIDE) as f32 / CAVE_GRID_STRIDE as f32;
         let gy_min = chunk_origin_y.div_euclid(CAVE_GRID_STRIDE);
@@ -630,6 +770,8 @@ impl TerrainGenerator {
                     continue;
                 }
                 if world_y > height {
+                    let (trees, count) = &nearby_trees_by_z[z];
+                    *cell = Self::tree_occupies_among(&trees[..*count], world_x, world_y, world_z);
                     continue;
                 }
                 if height - world_y < MIN_CAVE_DEPTH {
@@ -724,6 +866,7 @@ impl TerrainGenerator {
                     continue;
                 }
                 if world_y > h {
+                    *cell = self.tree_occupies(world_x, world_y, world_z);
                     continue;
                 }
                 if h - world_y < MIN_CAVE_DEPTH {
@@ -796,6 +939,11 @@ impl TerrainGenerator {
             let (ix0, ix1) = ((gx0 - gx_min) as usize, (gx0 - gx_min + 1) as usize);
             let height = height_by_x[x];
 
+            // Baum-Suchradius haengt nur von (world_x, world_z) ab, nicht von Y - EINMAL pro
+            // Spalte geholt statt bis zu 32x (einmal pro Y-Wert), s. Kommentar an
+            // `nearby_tree_candidates`.
+            let (nearby_trees, nearby_tree_count) = self.nearby_tree_candidates(world_x, world_z);
+
             for (y, cell) in row.iter_mut().enumerate() {
                 let world_y = chunk_origin_y + y as i32;
 
@@ -804,6 +952,7 @@ impl TerrainGenerator {
                     continue;
                 }
                 if world_y > height {
+                    *cell = Self::tree_occupies_among(&nearby_trees[..nearby_tree_count], world_x, world_y, world_z);
                     continue;
                 }
                 if height - world_y < MIN_CAVE_DEPTH {
@@ -1011,9 +1160,10 @@ impl TerrainGenerator {
             }
         }
 
-        // Chunk liegt vollstaendig ueber Terrainoberflaeche UND Wasserspiegel - reine Luft,
-        // `chunk.clear()` oben reicht bereits. Spart die komplette Hoehlen-/Wasser-Auswertung.
-        if chunk_origin_y > chunk_max_height && chunk_origin_y > WATER_LEVEL {
+        // Chunk liegt vollstaendig ueber Terrainoberflaeche UND Wasserspiegel (PLUS Sicherheitsmarge
+        // fuer Baumkronen aus Nachbar-Spalten ausserhalb der eigenen 1024 Saeulen, s.
+        // `TREE_HEIGHT_SAFETY_MARGIN`) - reine Luft, `chunk.clear()` oben reicht bereits.
+        if chunk_origin_y > chunk_max_height + TREE_HEIGHT_SAFETY_MARGIN && chunk_origin_y > WATER_LEVEL {
             return;
         }
 
@@ -1181,6 +1331,146 @@ impl TerrainGenerator {
                 }
             }
         }
+
+        self.place_flora(chunk_x, chunk_y, chunk_z, chunk);
+    }
+
+    /// Deterministisch berechneter Baum-Spawn-Kandidat fuer EINE Gitterzelle des
+    /// `tree_grid_size`-Rasters, oder `None`, wenn die Zelle keinen Baum traegt (Spawn-Wuerfel
+    /// verfehlt ODER Untergrund ist Wasser/Strand/Wueste/Fels). Rein aus (`tree_seed`,
+    /// `cell_x`, `cell_z`) berechnet - IDENTISCHES Ergebnis unabhaengig davon, welcher Chunk gerade
+    /// generiert wird ("Pure Function"-Prinzip, keine Chunk-Nachbar-Reads noetig).
+    fn tree_candidate(&self, cell_x: i32, cell_z: i32) -> Option<TreeSpawn> {
+        if hash_unit(tree_hash(self.tree_seed, cell_x, cell_z, 2)) >= self.tree_spawn_chance {
+            return None;
+        }
+
+        let jitter_x = (hash_unit(tree_hash(self.tree_seed, cell_x, cell_z, 0)) * self.tree_grid_size as f32) as i32;
+        let jitter_z = (hash_unit(tree_hash(self.tree_seed, cell_x, cell_z, 1)) * self.tree_grid_size as f32) as i32;
+        let world_x = cell_x * self.tree_grid_size + jitter_x;
+        let world_z = cell_z * self.tree_grid_size + jitter_z;
+
+        let ground_y = self.height_at(world_x, world_z);
+        let surface = self.column_surface(world_x, world_z, ground_y);
+        if surface.is_underwater || surface.is_beach || surface.is_desert || surface.is_rock {
+            return None;
+        }
+
+        let trunk_span = (self.tree_trunk_height_max - self.tree_trunk_height_min + 1).max(1);
+        let trunk_height = self.tree_trunk_height_min
+            + (hash_unit(tree_hash(self.tree_seed, cell_x, cell_z, 3)) * trunk_span as f32) as i32;
+        let crown_span = (self.tree_crown_radius_max - self.tree_crown_radius_min + 1).max(1);
+        let crown_radius = self.tree_crown_radius_min
+            + (hash_unit(tree_hash(self.tree_seed, cell_x, cell_z, 4)) * crown_span as f32) as i32;
+
+        Some(TreeSpawn { world_x, world_z, ground_y, trunk_height, crown_radius })
+    }
+
+    /// Cross-Chunk-Baumplatzierung: iteriert nicht nur die eigenen 32x32 Saeulen, sondern das
+    /// Spawn-Gitter ueber einen um `tree_grid_size + tree_crown_radius_max` VERGROESSERTEN
+    /// X/Z-Radius (deckt jede Zelle ab, deren Jitter+Krone theoretisch in diesen Chunk reichen
+    /// kann). Fuer jeden gefundenen Kandidaten wird die VOLLE Baumstruktur berechnet, aber nur der
+    /// Teil, der tatsaechlich in diesen Chunk faellt, lokal geschrieben (`place_tree_voxel`
+    /// klemmt) - jeder betroffene Chunk kommt so unabhaengig zum selben Ergebnis, ohne je Daten
+    /// eines Nachbar-Chunks zu lesen oder zu senden.
+    fn place_flora(&self, chunk_x: i32, chunk_y: i32, chunk_z: i32, chunk: &mut Chunk) {
+        let chunk_origin_x = chunk_x * CHUNK_SIZE;
+        let chunk_origin_y = chunk_y * CHUNK_SIZE;
+        let chunk_origin_z = chunk_z * CHUNK_SIZE;
+
+        let search_radius = self.tree_grid_size + self.tree_crown_radius_max;
+        let cell_min_x = (chunk_origin_x - search_radius).div_euclid(self.tree_grid_size);
+        let cell_max_x = (chunk_origin_x + CHUNK_SIZE - 1 + search_radius).div_euclid(self.tree_grid_size);
+        let cell_min_z = (chunk_origin_z - search_radius).div_euclid(self.tree_grid_size);
+        let cell_max_z = (chunk_origin_z + CHUNK_SIZE - 1 + search_radius).div_euclid(self.tree_grid_size);
+
+        for cell_z in cell_min_z..=cell_max_z {
+            for cell_x in cell_min_x..=cell_max_x {
+                let Some(tree) = self.tree_candidate(cell_x, cell_z) else { continue };
+
+                let trunk_top = tree.ground_y + tree.trunk_height;
+                let footprint_min_y = tree.ground_y + 1;
+                let footprint_max_y = trunk_top + tree.crown_radius;
+                // Billige AABB-Ablehnung, bevor die Voxel des Baumes einzeln durchlaufen werden -
+                // die meisten Kandidaten im vergroesserten Suchradius treffen diesen Chunk gar
+                // nicht (weder horizontal noch vertikal).
+                if footprint_max_y < chunk_origin_y
+                    || footprint_min_y > chunk_origin_y + CHUNK_SIZE - 1
+                    || tree.world_x + tree.crown_radius < chunk_origin_x
+                    || tree.world_x - tree.crown_radius > chunk_origin_x + CHUNK_SIZE - 1
+                    || tree.world_z + tree.crown_radius < chunk_origin_z
+                    || tree.world_z - tree.crown_radius > chunk_origin_z + CHUNK_SIZE - 1
+                {
+                    continue;
+                }
+
+                // Stamm: gerader Holzstamm vom Boden bis zur Kronenbasis.
+                for world_y in footprint_min_y..=trunk_top {
+                    Self::place_tree_voxel(
+                        chunk,
+                        chunk_origin_x,
+                        chunk_origin_y,
+                        chunk_origin_z,
+                        tree.world_x,
+                        world_y,
+                        tree.world_z,
+                        blocks::LOG,
+                    );
+                }
+
+                // Krone: einfache Kugel um die Stammspitze (spaeter durch Space Colonization
+                // ersetzbar, ohne dass sich am Cross-Chunk-Mechanismus etwas aendert).
+                let radius_sq = (tree.crown_radius * tree.crown_radius) as f32;
+                for dy in -tree.crown_radius..=tree.crown_radius {
+                    for dz in -tree.crown_radius..=tree.crown_radius {
+                        for dx in -tree.crown_radius..=tree.crown_radius {
+                            if (dx * dx + dy * dy + dz * dz) as f32 > radius_sq {
+                                continue;
+                            }
+                            Self::place_tree_voxel(
+                                chunk,
+                                chunk_origin_x,
+                                chunk_origin_y,
+                                chunk_origin_z,
+                                tree.world_x + dx,
+                                trunk_top + dy,
+                                tree.world_z + dz,
+                                blocks::LEAVES,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Schreibt EINEN Baum-Voxel nur, wenn er in den aktuellen Chunk faellt (lokales Clamping) UND
+    /// die Zielposition dort noch Luft ist - so ueberschreibt ein Baum weder Terrain (z.B. eine
+    /// hoehere Nachbarsaeule, die in den Kronenradius hineinragt) noch bereits platzierte Voxel
+    /// eines anderen Baumes.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn place_tree_voxel(
+        chunk: &mut Chunk,
+        chunk_origin_x: i32,
+        chunk_origin_y: i32,
+        chunk_origin_z: i32,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u16,
+    ) {
+        let local_x = world_x - chunk_origin_x;
+        let local_y = world_y - chunk_origin_y;
+        let local_z = world_z - chunk_origin_z;
+        if !(0..CHUNK_SIZE).contains(&local_x) || !(0..CHUNK_SIZE).contains(&local_y) || !(0..CHUNK_SIZE).contains(&local_z)
+        {
+            return;
+        }
+        if chunk.get_block(local_x, local_y, local_z) != 0 {
+            return;
+        }
+        chunk.set_block(local_x, local_y, local_z, block_id);
     }
 
     /// Oberflaechen-Kontext einer Spalte: Hoehenband-Strand, Unterwasser-Boden und das strikte
@@ -1204,8 +1494,149 @@ impl TerrainGenerator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::engine::config::EngineConfig;
+
+    /// Akzeptanztest fuer das Cross-Chunk-Radius-Sampling: findet einen Baum-Kandidaten, dessen
+    /// Stamm+Kronen-Footprint mindestens eine Chunk-Grenze ueberschreitet, generiert NUR die
+    /// betroffenen Chunks (jeden unabhaengig, wie im echten `dispatch_pending`-Pfad - keiner liest
+    /// vom anderen), und verifiziert JEDEN erwarteten Baum-Voxel gegen den tatsaechlich generierten
+    /// Chunk. Erwartung wird gegen `is_solid` VOR der Platzierung abgeglichen (ein Voxel, das schon
+    /// durch Terrain/Wasser belegt ist, bleibt zurecht ausgespart, s. `place_tree_voxel`) - deckt
+    /// damit exakt das ab, was die Aufgabenstellung "Radius-Check (Cross-Chunk)" fordert: derselbe
+    /// Baum, unabhaengig generiert ueber mehrere Chunks hinweg, ergibt keine Luecken/Duplikate.
+    #[test]
+    fn tree_footprint_matches_across_independently_generated_chunks() {
+        let mut config = EngineConfig::default();
+        config.terrain_tree_spawn_chance = 1.0;
+        // Gitter deutlich groesser als der Isolations-Mindestabstand (2*crown_radius+1=9) - sonst
+        // ueberlappen selbst gejitterte Nachbarzellen fast immer und kein Kandidat besteht den
+        // Isolations-Check unten.
+        config.terrain_tree_grid_size = 20;
+        config.terrain_tree_trunk_height_min = 5;
+        config.terrain_tree_trunk_height_max = 5;
+        config.terrain_tree_crown_radius_min = 4;
+        config.terrain_tree_crown_radius_max = 4;
+        let generator = TerrainGenerator::new(&config);
+
+        // Reiner Terrain/Wasser-Belegungs-Check OHNE Baum-Wissen (anders als `is_solid`, das jetzt
+        // absichtlich auch `tree_occupies` einschliesst) - modelliert exakt, was `place_tree_voxel`
+        // in einem frisch generierten Chunk VOR jeder Baum-Platzierung als "nicht mehr Luft" sieht.
+        let terrain_occupied = |world_x: i32, world_y: i32, world_z: i32| {
+            let height = generator.height_at(world_x, world_z);
+            TerrainGenerator::is_water_position(height, world_y) || world_y <= height
+        };
+
+        let mut chunk_cache: HashMap<(i32, i32, i32), Chunk> = HashMap::new();
+        let mut best_touched = 0usize;
+
+        // Nicht jeder geometrisch grenzueberschreitende Kandidat bleibt das auch NACH dem
+        // Terrain-Occlusion-Check (Nachbarsaeulen koennen den ganzen Teil jenseits der Grenze
+        // verdecken) - iteriert deshalb ueber mehrere Kandidaten und nimmt den ersten, der
+        // tatsaechlich >= 2 unabhaengig generierte Chunks mit verifizierbaren Voxeln beruehrt UND
+        // isoliert genug von Nachbarbaeumen steht (sonst koennte ein frueher verarbeiteter
+        // Nachbarbaum Voxel "wegschnappen", was hier eine andere, aber KORREKTE Interaktion waere,
+        // die dieser Test bewusst nicht mitprueft).
+        'search: for cell_z in -20..20 {
+            for cell_x in -20..20 {
+                let Some(tree) = generator.tree_candidate(cell_x, cell_z) else { continue };
+                let crosses_x = (tree.world_x - tree.crown_radius).div_euclid(CHUNK_SIZE)
+                    != (tree.world_x + tree.crown_radius).div_euclid(CHUNK_SIZE);
+                let crosses_z = (tree.world_z - tree.crown_radius).div_euclid(CHUNK_SIZE)
+                    != (tree.world_z + tree.crown_radius).div_euclid(CHUNK_SIZE);
+                if !crosses_x && !crosses_z {
+                    continue;
+                }
+
+                let isolated = (-2..=2).all(|nz| {
+                    (-2..=2).all(|nx| {
+                        if nx == 0 && nz == 0 {
+                            return true;
+                        }
+                        match generator.tree_candidate(cell_x + nx, cell_z + nz) {
+                            None => true,
+                            Some(other) => {
+                                let min_gap = tree.crown_radius + other.crown_radius + 1;
+                                (tree.world_x - other.world_x).abs() > min_gap
+                                    || (tree.world_z - other.world_z).abs() > min_gap
+                            }
+                        }
+                    })
+                });
+                if !isolated {
+                    continue;
+                }
+
+                // Stamm ZUERST eingetragen und Krone nur `or_insert` - `place_flora` platziert in
+                // derselben Reihenfolge und ueberschreibt nichts bereits Belegtes (s.
+                // `place_tree_voxel`), die Stammspitze faellt sonst mit dem Kronen-Mittelpunkt
+                // (dx=dy=dz=0) zusammen und wuerde als widerspruechlicher Doppeleintrag enden.
+                let trunk_top = tree.ground_y + tree.trunk_height;
+                let mut expected: HashMap<(i32, i32, i32), u16> = HashMap::new();
+                for world_y in (tree.ground_y + 1)..=trunk_top {
+                    expected.insert((tree.world_x, world_y, tree.world_z), blocks::LOG);
+                }
+                let radius_sq = tree.crown_radius * tree.crown_radius;
+                for dy in -tree.crown_radius..=tree.crown_radius {
+                    for dz in -tree.crown_radius..=tree.crown_radius {
+                        for dx in -tree.crown_radius..=tree.crown_radius {
+                            if dx * dx + dy * dy + dz * dz <= radius_sq {
+                                expected
+                                    .entry((tree.world_x + dx, trunk_top + dy, tree.world_z + dz))
+                                    .or_insert(blocks::LEAVES);
+                            }
+                        }
+                    }
+                }
+
+                let mut touched_chunks = std::collections::HashSet::new();
+                let mut verified: Vec<(i32, i32, i32, u16, (i32, i32, i32))> = Vec::new();
+                for (&(world_x, world_y, world_z), &expected_block) in &expected {
+                    if terrain_occupied(world_x, world_y, world_z) {
+                        // Vorbelegt durch Terrain/Wasser einer Nachbarsaeule - `place_tree_voxel`
+                        // uebermalt das bewusst nicht, hier also keine Erwartung.
+                        continue;
+                    }
+                    let chunk_coord = (
+                        world_x.div_euclid(CHUNK_SIZE),
+                        world_y.div_euclid(CHUNK_SIZE),
+                        world_z.div_euclid(CHUNK_SIZE),
+                    );
+                    touched_chunks.insert(chunk_coord);
+                    verified.push((world_x, world_y, world_z, expected_block, chunk_coord));
+                }
+                best_touched = best_touched.max(touched_chunks.len());
+                if touched_chunks.len() < 2 {
+                    continue;
+                }
+
+                for (world_x, world_y, world_z, expected_block, chunk_coord) in verified {
+                    let chunk = chunk_cache.entry(chunk_coord).or_insert_with(|| {
+                        let mut c = Chunk::empty();
+                        generator.generate_chunk(chunk_coord.0, chunk_coord.1, chunk_coord.2, &mut c);
+                        c
+                    });
+                    let local_x = world_x.rem_euclid(CHUNK_SIZE);
+                    let local_y = world_y.rem_euclid(CHUNK_SIZE);
+                    let local_z = world_z.rem_euclid(CHUNK_SIZE);
+                    assert_eq!(
+                        chunk.get_block(local_x, local_y, local_z),
+                        expected_block,
+                        "Baum-Voxel Welt({world_x},{world_y},{world_z}) in Chunk {chunk_coord:?} lokal \
+                         ({local_x},{local_y},{local_z}): erwartet {expected_block}"
+                    );
+                }
+                break 'search;
+            }
+        }
+
+        assert!(
+            best_touched >= 2,
+            "kein Baum-Kandidat im Suchbereich beruehrte nach Terrain-Occlusion >= 2 Chunks (bester Fund: {best_touched})"
+        );
+    }
 
     /// `TerrainGenerator::is_solid` ist die Vorhersage, auf die sowohl der Mesher (Nachbar-Check an
     /// noch nicht geladenen Chunks) als auch `ChunkManager::is_solid_at` (Physik/Raycast waehrend

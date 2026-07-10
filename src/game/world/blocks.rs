@@ -1,5 +1,6 @@
 use crate::engine::render::textures::{
-    TEXTURE_LAYER_DIRT, TEXTURE_LAYER_GRASS, TEXTURE_LAYER_SAND, TEXTURE_LAYER_STONE, TEXTURE_LAYER_WATER,
+    TEXTURE_LAYER_DIRT, TEXTURE_LAYER_GRASS, TEXTURE_LAYER_LEAVES, TEXTURE_LAYER_LOG, TEXTURE_LAYER_SAND,
+    TEXTURE_LAYER_STONE, TEXTURE_LAYER_WATER,
 };
 
 pub const AIR: u16 = 0;
@@ -8,6 +9,8 @@ pub const DIRT: u16 = TEXTURE_LAYER_DIRT as u16;
 pub const STONE: u16 = TEXTURE_LAYER_STONE as u16;
 pub const SAND: u16 = TEXTURE_LAYER_SAND as u16;
 pub const WATER: u16 = TEXTURE_LAYER_WATER as u16;
+pub const LOG: u16 = TEXTURE_LAYER_LOG as u16;
+pub const LEAVES: u16 = TEXTURE_LAYER_LEAVES as u16;
 
 /// Oberflaechen-Kontext einer Spalte - einmal pro Spalte bestimmt (Biom-Rauschen, Hoehenband),
 /// dann fuer alle Voxel der Spalte wiederverwendet.
