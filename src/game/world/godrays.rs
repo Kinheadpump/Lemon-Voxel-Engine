@@ -67,16 +67,16 @@ fn local_relief(generator: &TerrainGenerator, world_x: i32, world_z: i32, height
 
 impl GodrayField {
     pub fn new(config: &EngineConfig) -> Self {
-        let grid_dim = (config.godray_count as f32).sqrt().ceil() as u32;
+        let grid_dim = (config.dev.godray_count as f32).sqrt().ceil() as u32;
         Self {
-            count: config.godray_count,
-            grid_spacing: config.godray_grid_spacing,
-            sample_height: config.godray_sample_height,
-            width: config.godray_width,
-            beam_length: config.godray_beam_length,
+            count: config.dev.godray_count,
+            grid_spacing: config.dev.godray_grid_spacing,
+            sample_height: config.dev.godray_sample_height,
+            width: config.dev.godray_width,
+            beam_length: config.dev.godray_beam_length,
             last_center: None,
-            regen_threshold: config.godray_grid_spacing * grid_dim as f32 * 0.5,
-            instances: Vec::with_capacity(config.godray_count as usize),
+            regen_threshold: config.dev.godray_grid_spacing * grid_dim as f32 * 0.5,
+            instances: Vec::with_capacity(config.dev.godray_count as usize),
         }
     }
 

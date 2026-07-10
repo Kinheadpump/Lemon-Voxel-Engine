@@ -6,8 +6,12 @@ use crate::game::math::cascades::MAX_SHADOW_CASCADES;
 
 pub const CONFIG_PATH: &str = "config.toml";
 
+/// Einstellungen, die ein SPIELER ueber ein Optionsmenue anpassen wuerde: Eingabe-Empfindlichkeit,
+/// Sichtfeld, Sicht-/Grafikqualitaet. Strikt getrennt von `DevSettings` - ein zukuenftiges
+/// In-Game-Optionsmenue muss nur DIESE Struct anfassen koennen, ohne versehentlich an Terrain-Seeds
+/// oder Performance-Budgets zu ruehren. `config.toml` spiegelt die Trennung als `[player]`-Tabelle.
 #[derive(Clone, Copy, Debug)]
-pub struct EngineConfig {
+pub struct PlayerSettings {
     pub movement_speed: f32,
     pub sprint_multiplier: f32,
     pub mouse_sensitivity: f32,
@@ -20,7 +24,6 @@ pub struct EngineConfig {
     /// horizontal (ein grosses render_distance_chunks soll nicht automatisch den Chunk-Pool und
     /// die Pro-Frame-Sichtbarkeitspruefung in Y explodieren lassen).
     pub vertical_render_distance_chunks: i32,
-    pub clear_color: wgpu::Color,
     pub hud_visible_default: bool,
     pub msaa_samples: u32,
     pub ssao_enabled: bool,
@@ -30,13 +33,28 @@ pub struct EngineConfig {
     /// Texel mit groesserer Tiefendifferenz gelten als andere Oberflaeche und fliessen nicht in den
     /// Blur ein - verhindert Ueberblenden ueber Geometriekanten hinweg.
     pub ssao_blur_depth_threshold: f32,
+    /// 3-4 Kaskaden: mehr Kaskaden = feinere Aufloesungs-Staffelung nahe der Kamera, aber ein
+    /// zusaetzlicher Shadow-Pass-Durchlauf pro Kaskade.
+    pub shadow_cascade_count: u32,
+    pub shadow_map_resolution: u32,
+    /// Distanz ab der Kamera, bis zu der ueberhaupt Schatten berechnet werden - unabhaengig von der
+    /// (potenziell unendlichen) Reverse-Z-Fernsicht der Hauptkamera.
+    pub shadow_max_distance: f32,
+    pub start_flying: bool,
+}
+
+/// Alles andere: Welt-Generierung, Physik-/Rendering-Internals, Performance-Budgets, Art Direction -
+/// Stellschrauben fuer den ENTWICKLER, nicht fuer den Spieler. `config.toml` spiegelt diese Trennung
+/// als `[dev]`-Tabelle wider.
+#[derive(Clone, Copy, Debug)]
+pub struct DevSettings {
+    pub clear_color: wgpu::Color,
     pub gravity: f32,
     pub jump_speed: f32,
     /// Maximale Fallgeschwindigkeit (Betrag, Bloecke/s). In der vertikal unbegrenzten Welt wuerde
     /// die Geschwindigkeit sonst bei tiefen Faellen unbegrenzt wachsen - der Lande-Frame muesste
     /// dann einen entsprechend riesigen Sweep-Kollisions-Scan abarbeiten (Frame-Drop bei Aufprall).
     pub terminal_velocity: f32,
-    pub start_flying: bool,
 
     /// Reale Sekunden fuer einen vollen Tag/Nacht-Zyklus (Sonnenwinkel 0..2*PI).
     pub sun_cycle_seconds: f32,
@@ -45,13 +63,6 @@ pub struct EngineConfig {
     pub ambient_light: f32,
     pub sun_intensity: f32,
 
-    /// 3-4 Kaskaden: mehr Kaskaden = feinere Aufloesungs-Staffelung nahe der Kamera, aber ein
-    /// zusaetzlicher Shadow-Pass-Durchlauf pro Kaskade.
-    pub shadow_cascade_count: u32,
-    pub shadow_map_resolution: u32,
-    /// Distanz ab der Kamera, bis zu der ueberhaupt Schatten berechnet werden - unabhaengig von der
-    /// (potenziell unendlichen) Reverse-Z-Fernsicht der Hauptkamera.
-    pub shadow_max_distance: f32,
     /// Mischung zwischen logarithmischer und linearer Kaskaden-Aufteilung (0 = linear, 1 = log).
     /// Log gewichtet mehr Aufloesung nahe der Kamera, was fuer Voxel-Kanten am wichtigsten ist.
     pub shadow_split_lambda: f32,
@@ -164,7 +175,13 @@ pub struct EngineConfig {
     pub max_chunk_unloads_per_frame: usize,
 }
 
-impl Default for EngineConfig {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineConfig {
+    pub player: PlayerSettings,
+    pub dev: DevSettings,
+}
+
+impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
             movement_speed: 12.0,
@@ -173,26 +190,33 @@ impl Default for EngineConfig {
             fov_y_radians: 60f32.to_radians(),
             render_distance_chunks: 4,
             vertical_render_distance_chunks: 4,
-            clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
             hud_visible_default: true,
             msaa_samples: 4,
             ssao_enabled: true,
             ssao_radius: 2.0,
             ssao_strength: 1.4,
             ssao_blur_depth_threshold: 0.0008,
+            shadow_cascade_count: 4,
+            shadow_map_resolution: 2048,
+            shadow_max_distance: 220.0,
+            start_flying: true,
+        }
+    }
+}
+
+impl Default for DevSettings {
+    fn default() -> Self {
+        Self {
+            clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 },
             gravity: 26.0,
             jump_speed: 9.0,
             terminal_velocity: 80.0,
-            start_flying: true,
 
             sun_cycle_seconds: 1200.0,
             sun_initial_time_of_day: 0.28,
             ambient_light: 0.2,
             sun_intensity: 1.0,
 
-            shadow_cascade_count: 4,
-            shadow_map_resolution: 2048,
-            shadow_max_distance: 220.0,
             shadow_split_lambda: 0.6,
             shadow_depth_bias: 2.0,
             shadow_depth_bias_slope_scale: 2.0,
@@ -325,20 +349,21 @@ impl EngineConfig {
     ///   Render-Distanz sichtbare Chunks kommentarlos aus dem Draw fallen ("kuenstlich limitierte
     ///   Sichtweite"). Kostet 2*16 Byte pro Slot ueber 6 Richtungen - vernachlaessigbar.
     fn normalized(mut self) -> Self {
-        let required = required_chunk_pool_size(self.render_distance_chunks, self.vertical_render_distance_chunks);
+        let required =
+            required_chunk_pool_size(self.player.render_distance_chunks, self.player.vertical_render_distance_chunks);
         if required > CHUNK_POOL_SAFETY_CAP {
             log::warn!(
                 "Render-Distanz {}x{} braeuchte {} Chunk-Pool-Slots, gedeckelt auf {} ({} GiB RAM) - \
                  Chunks am Rand der Render-Distanz werden nicht geladen",
-                self.render_distance_chunks,
-                self.vertical_render_distance_chunks,
+                self.player.render_distance_chunks,
+                self.player.vertical_render_distance_chunks,
                 required,
                 CHUNK_POOL_SAFETY_CAP,
                 CHUNK_POOL_SAFETY_CAP * 64 / 1024 / 1024,
             );
         }
-        self.chunk_pool_size = self.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
-        self.max_draws_per_direction = self.max_draws_per_direction.max(self.chunk_pool_size);
+        self.dev.chunk_pool_size = self.dev.chunk_pool_size.max(required.min(CHUNK_POOL_SAFETY_CAP));
+        self.dev.max_draws_per_direction = self.dev.max_draws_per_direction.max(self.dev.chunk_pool_size);
         self
     }
 
@@ -378,44 +403,42 @@ impl EngineConfig {
     }
 }
 
-/// Serde-serialisierbares Spiegelbild von [`EngineConfig`] mit editorfreundlichen Einheiten
-/// (FOV in Grad, Farbe als RGB-Array). Trennt das Datei-Format von der Laufzeit-Repraesentation.
-///
-/// BEWUSST ohne `deny_unknown_fields`: Ein einzelnes umbenanntes/entferntes Feld (z.B. bei einem
-/// Terrain-Schema-Wechsel) wuerde sonst den GESAMTEN Parse-Vorgang abbrechen und `load_or_create`
-/// faellt dann auf komplette Defaults zurueck - das setzt still ALLE anderen, unveraendert
-/// gebliebenen Einstellungen (Render-Distanz, Maus-Sensitivitaet, ...) zurueck, nicht nur die
-/// tatsaechlich verschobenen Felder. Unbekannte Felder in einer alten `config.toml` werden jetzt
-/// einfach ignoriert, alle anderen Felder bleiben erhalten.
-#[derive(Serialize, Deserialize)]
+/// Serde-serialisierbares Spiegelbild von [`PlayerSettings`] - eigene TOML-Tabelle `[player]`.
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
-struct ConfigFile {
+struct PlayerSettingsFile {
     movement_speed: f32,
     sprint_multiplier: f32,
     mouse_sensitivity: f32,
     fov_degrees: f32,
     render_distance_chunks: i32,
     vertical_render_distance_chunks: i32,
-    clear_color_rgb: [f64; 3],
     hud_visible_default: bool,
     msaa_samples: u32,
     ssao_enabled: bool,
     ssao_radius: f32,
     ssao_strength: f32,
     ssao_blur_depth_threshold: f32,
+    shadow_cascade_count: u32,
+    shadow_map_resolution: u32,
+    shadow_max_distance: f32,
+    start_flying: bool,
+}
+
+/// Serde-serialisierbares Spiegelbild von [`DevSettings`] - eigene TOML-Tabelle `[dev]`.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+struct DevSettingsFile {
+    clear_color_rgb: [f64; 3],
     gravity: f32,
     jump_speed: f32,
     terminal_velocity: f32,
-    start_flying: bool,
 
     sun_cycle_seconds: f32,
     sun_initial_time_of_day: f32,
     ambient_light: f32,
     sun_intensity: f32,
 
-    shadow_cascade_count: u32,
-    shadow_map_resolution: u32,
-    shadow_max_distance: f32,
     shadow_split_lambda: f32,
     shadow_depth_bias: f32,
     shadow_depth_bias_slope_scale: f32,
@@ -477,14 +500,38 @@ struct ConfigFile {
     max_faces_per_direction: usize,
     max_draws_per_direction: usize,
 
-    /// Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
-    /// Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden. Ohne diese Grenze
-    /// versucht der Main-Thread bei grossem `render_distance_chunks` (grosser Backlog beim
-    /// Welt-Start oder schnellem Fliegen), tausende Chunks in einem einzigen Frame zu dispatchen/
-    /// hochzuladen - das erzeugt Mehrsekunden-Freezes statt verteilter Frame-Zeit.
     max_chunk_dispatches_per_frame: usize,
     max_chunk_uploads_per_frame: usize,
     max_chunk_unloads_per_frame: usize,
+}
+
+/// Serde-serialisierbares Spiegelbild von [`EngineConfig`], zwei TOML-Tabellen `[player]`/`[dev]`
+/// mit editorfreundlichen Einheiten (FOV in Grad, Farben als RGB-Arrays). Trennt das Datei-Format
+/// von der Laufzeit-Repraesentation.
+///
+/// BEWUSST ohne `deny_unknown_fields` auf allen drei Ebenen: Ein einzelnes umbenanntes/entferntes
+/// Feld (z.B. bei einem Terrain-Schema-Wechsel) wuerde sonst den GESAMTEN Parse-Vorgang abbrechen
+/// und `load_or_create` faellt dann auf komplette Defaults zurueck - das setzt still ALLE anderen,
+/// unveraendert gebliebenen Einstellungen zurueck, nicht nur die tatsaechlich verschobenen Felder.
+/// Unbekannte Felder (oder eine fehlende `[player]`/`[dev]`-Tabelle in einer alten, noch flachen
+/// `config.toml`) werden einfach ignoriert bzw. defaulten feldweise, alle anderen bleiben erhalten.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct ConfigFile {
+    player: PlayerSettingsFile,
+    dev: DevSettingsFile,
+}
+
+impl Default for PlayerSettingsFile {
+    fn default() -> Self {
+        Self::from(PlayerSettings::default())
+    }
+}
+
+impl Default for DevSettingsFile {
+    fn default() -> Self {
+        Self::from(DevSettings::default())
+    }
 }
 
 impl Default for ConfigFile {
@@ -493,105 +540,31 @@ impl Default for ConfigFile {
     }
 }
 
-impl From<EngineConfig> for ConfigFile {
-    fn from(c: EngineConfig) -> Self {
+impl From<PlayerSettings> for PlayerSettingsFile {
+    fn from(p: PlayerSettings) -> Self {
         Self {
-            movement_speed: c.movement_speed,
-            sprint_multiplier: c.sprint_multiplier,
-            mouse_sensitivity: c.mouse_sensitivity,
-            fov_degrees: c.fov_y_radians.to_degrees(),
-            render_distance_chunks: c.render_distance_chunks,
-            vertical_render_distance_chunks: c.vertical_render_distance_chunks,
-            clear_color_rgb: [c.clear_color.r, c.clear_color.g, c.clear_color.b],
-            hud_visible_default: c.hud_visible_default,
-            msaa_samples: c.msaa_samples,
-            ssao_enabled: c.ssao_enabled,
-            ssao_radius: c.ssao_radius,
-            ssao_strength: c.ssao_strength,
-            ssao_blur_depth_threshold: c.ssao_blur_depth_threshold,
-            gravity: c.gravity,
-            jump_speed: c.jump_speed,
-            terminal_velocity: c.terminal_velocity,
-            start_flying: c.start_flying,
-
-            sun_cycle_seconds: c.sun_cycle_seconds,
-            sun_initial_time_of_day: c.sun_initial_time_of_day,
-            ambient_light: c.ambient_light,
-            sun_intensity: c.sun_intensity,
-
-            shadow_cascade_count: c.shadow_cascade_count,
-            shadow_map_resolution: c.shadow_map_resolution,
-            shadow_max_distance: c.shadow_max_distance,
-            shadow_split_lambda: c.shadow_split_lambda,
-            shadow_depth_bias: c.shadow_depth_bias,
-            shadow_depth_bias_slope_scale: c.shadow_depth_bias_slope_scale,
-
-            sky_zenith_day_color: c.sky_zenith_day_color,
-            sky_horizon_day_color: c.sky_horizon_day_color,
-            sky_night_color: c.sky_night_color,
-
-            godray_count: c.godray_count,
-            godray_grid_spacing: c.godray_grid_spacing,
-            godray_sample_height: c.godray_sample_height,
-            godray_width: c.godray_width,
-            godray_beam_length: c.godray_beam_length,
-            godray_temporal_blend: c.godray_temporal_blend,
-
-            terrain_seed: c.terrain_seed,
-            terrain_continental_frequency: c.terrain_continental_frequency,
-            terrain_continental_amplitude: c.terrain_continental_amplitude,
-            terrain_mountain_amplitude: c.terrain_mountain_amplitude,
-            terrain_mountain_exponent: c.terrain_mountain_exponent,
-            terrain_regional_frequency: c.terrain_regional_frequency,
-            terrain_regional_amplitude: c.terrain_regional_amplitude,
-            terrain_regional_octaves: c.terrain_regional_octaves,
-            terrain_regional_lacunarity: c.terrain_regional_lacunarity,
-            terrain_regional_gain: c.terrain_regional_gain,
-            terrain_cliff_mask_frequency: c.terrain_cliff_mask_frequency,
-            terrain_temperature_frequency: c.terrain_temperature_frequency,
-            terrain_humidity_frequency: c.terrain_humidity_frequency,
-            terrain_desert_temperature_min: c.terrain_desert_temperature_min,
-            terrain_desert_humidity_max: c.terrain_desert_humidity_max,
-            terrain_sea_compression_range: c.terrain_sea_compression_range,
-            terrain_sea_compression_exponent: c.terrain_sea_compression_exponent,
-            terrain_cheese_frequency: c.terrain_cheese_frequency,
-            terrain_cheese_threshold: c.terrain_cheese_threshold,
-            terrain_tunnel_frequency: c.terrain_tunnel_frequency,
-            terrain_tunnel_threshold: c.terrain_tunnel_threshold,
-            terrain_cave_widen_depth_range: c.terrain_cave_widen_depth_range,
-            terrain_cheese_widen_amount: c.terrain_cheese_widen_amount,
-            terrain_tunnel_widen_multiplier: c.terrain_tunnel_widen_multiplier,
-            terrain_cave_region_frequency: c.terrain_cave_region_frequency,
-            terrain_cave_region_threshold: c.terrain_cave_region_threshold,
-            terrain_dirt_layer_depth: c.terrain_dirt_layer_depth,
-            terrain_noise_origin_offset: c.terrain_noise_origin_offset,
-            terrain_tree_grid_size: c.terrain_tree_grid_size,
-            terrain_tree_spawn_chance: c.terrain_tree_spawn_chance,
-            terrain_tree_trunk_height_min: c.terrain_tree_trunk_height_min,
-            terrain_tree_trunk_height_max: c.terrain_tree_trunk_height_max,
-            terrain_tree_crown_radius_min: c.terrain_tree_crown_radius_min,
-            terrain_tree_crown_radius_max: c.terrain_tree_crown_radius_max,
-
-            player_half_width: c.player_half_width,
-            player_height: c.player_height,
-            player_eye_height: c.player_eye_height,
-            ground_probe_distance: c.ground_probe_distance,
-            fixed_timestep: c.fixed_timestep,
-            max_physics_steps_per_frame: c.max_physics_steps_per_frame,
-
-            chunk_pool_size: c.chunk_pool_size,
-            max_faces_per_direction: c.max_faces_per_direction,
-            max_draws_per_direction: c.max_draws_per_direction,
-
-            max_chunk_dispatches_per_frame: c.max_chunk_dispatches_per_frame,
-            max_chunk_uploads_per_frame: c.max_chunk_uploads_per_frame,
-            max_chunk_unloads_per_frame: c.max_chunk_unloads_per_frame,
+            movement_speed: p.movement_speed,
+            sprint_multiplier: p.sprint_multiplier,
+            mouse_sensitivity: p.mouse_sensitivity,
+            fov_degrees: p.fov_y_radians.to_degrees(),
+            render_distance_chunks: p.render_distance_chunks,
+            vertical_render_distance_chunks: p.vertical_render_distance_chunks,
+            hud_visible_default: p.hud_visible_default,
+            msaa_samples: p.msaa_samples,
+            ssao_enabled: p.ssao_enabled,
+            ssao_radius: p.ssao_radius,
+            ssao_strength: p.ssao_strength,
+            ssao_blur_depth_threshold: p.ssao_blur_depth_threshold,
+            shadow_cascade_count: p.shadow_cascade_count,
+            shadow_map_resolution: p.shadow_map_resolution,
+            shadow_max_distance: p.shadow_max_distance,
+            start_flying: p.start_flying,
         }
     }
 }
 
-impl From<ConfigFile> for EngineConfig {
-    fn from(f: ConfigFile) -> Self {
+impl From<PlayerSettingsFile> for PlayerSettings {
+    fn from(f: PlayerSettingsFile) -> Self {
         Self {
             movement_speed: f.movement_speed,
             sprint_multiplier: f.sprint_multiplier,
@@ -599,31 +572,119 @@ impl From<ConfigFile> for EngineConfig {
             fov_y_radians: f.fov_degrees.to_radians(),
             render_distance_chunks: f.render_distance_chunks.clamp(1, 32),
             vertical_render_distance_chunks: f.vertical_render_distance_chunks.clamp(1, 32),
-            clear_color: wgpu::Color {
-                r: f.clear_color_rgb[0],
-                g: f.clear_color_rgb[1],
-                b: f.clear_color_rgb[2],
-                a: 1.0,
-            },
             hud_visible_default: f.hud_visible_default,
             msaa_samples: f.msaa_samples.clamp(1, 8),
             ssao_enabled: f.ssao_enabled,
             ssao_radius: f.ssao_radius,
             ssao_strength: f.ssao_strength,
             ssao_blur_depth_threshold: f.ssao_blur_depth_threshold.max(0.0),
+            shadow_cascade_count: f.shadow_cascade_count.clamp(3, MAX_SHADOW_CASCADES as u32),
+            shadow_map_resolution: f.shadow_map_resolution.clamp(256, 8192),
+            shadow_max_distance: f.shadow_max_distance.max(16.0),
+            start_flying: f.start_flying,
+        }
+    }
+}
+
+impl From<DevSettings> for DevSettingsFile {
+    fn from(d: DevSettings) -> Self {
+        Self {
+            clear_color_rgb: [d.clear_color.r, d.clear_color.g, d.clear_color.b],
+            gravity: d.gravity,
+            jump_speed: d.jump_speed,
+            terminal_velocity: d.terminal_velocity,
+
+            sun_cycle_seconds: d.sun_cycle_seconds,
+            sun_initial_time_of_day: d.sun_initial_time_of_day,
+            ambient_light: d.ambient_light,
+            sun_intensity: d.sun_intensity,
+
+            shadow_split_lambda: d.shadow_split_lambda,
+            shadow_depth_bias: d.shadow_depth_bias,
+            shadow_depth_bias_slope_scale: d.shadow_depth_bias_slope_scale,
+
+            sky_zenith_day_color: d.sky_zenith_day_color,
+            sky_horizon_day_color: d.sky_horizon_day_color,
+            sky_night_color: d.sky_night_color,
+
+            godray_count: d.godray_count,
+            godray_grid_spacing: d.godray_grid_spacing,
+            godray_sample_height: d.godray_sample_height,
+            godray_width: d.godray_width,
+            godray_beam_length: d.godray_beam_length,
+            godray_temporal_blend: d.godray_temporal_blend,
+
+            terrain_seed: d.terrain_seed,
+            terrain_continental_frequency: d.terrain_continental_frequency,
+            terrain_continental_amplitude: d.terrain_continental_amplitude,
+            terrain_mountain_amplitude: d.terrain_mountain_amplitude,
+            terrain_mountain_exponent: d.terrain_mountain_exponent,
+            terrain_regional_frequency: d.terrain_regional_frequency,
+            terrain_regional_amplitude: d.terrain_regional_amplitude,
+            terrain_regional_octaves: d.terrain_regional_octaves,
+            terrain_regional_lacunarity: d.terrain_regional_lacunarity,
+            terrain_regional_gain: d.terrain_regional_gain,
+            terrain_cliff_mask_frequency: d.terrain_cliff_mask_frequency,
+            terrain_temperature_frequency: d.terrain_temperature_frequency,
+            terrain_humidity_frequency: d.terrain_humidity_frequency,
+            terrain_desert_temperature_min: d.terrain_desert_temperature_min,
+            terrain_desert_humidity_max: d.terrain_desert_humidity_max,
+            terrain_sea_compression_range: d.terrain_sea_compression_range,
+            terrain_sea_compression_exponent: d.terrain_sea_compression_exponent,
+            terrain_cheese_frequency: d.terrain_cheese_frequency,
+            terrain_cheese_threshold: d.terrain_cheese_threshold,
+            terrain_tunnel_frequency: d.terrain_tunnel_frequency,
+            terrain_tunnel_threshold: d.terrain_tunnel_threshold,
+            terrain_cave_widen_depth_range: d.terrain_cave_widen_depth_range,
+            terrain_cheese_widen_amount: d.terrain_cheese_widen_amount,
+            terrain_tunnel_widen_multiplier: d.terrain_tunnel_widen_multiplier,
+            terrain_cave_region_frequency: d.terrain_cave_region_frequency,
+            terrain_cave_region_threshold: d.terrain_cave_region_threshold,
+            terrain_dirt_layer_depth: d.terrain_dirt_layer_depth,
+            terrain_noise_origin_offset: d.terrain_noise_origin_offset,
+            terrain_tree_grid_size: d.terrain_tree_grid_size,
+            terrain_tree_spawn_chance: d.terrain_tree_spawn_chance,
+            terrain_tree_trunk_height_min: d.terrain_tree_trunk_height_min,
+            terrain_tree_trunk_height_max: d.terrain_tree_trunk_height_max,
+            terrain_tree_crown_radius_min: d.terrain_tree_crown_radius_min,
+            terrain_tree_crown_radius_max: d.terrain_tree_crown_radius_max,
+
+            player_half_width: d.player_half_width,
+            player_height: d.player_height,
+            player_eye_height: d.player_eye_height,
+            ground_probe_distance: d.ground_probe_distance,
+            fixed_timestep: d.fixed_timestep,
+            max_physics_steps_per_frame: d.max_physics_steps_per_frame,
+
+            chunk_pool_size: d.chunk_pool_size,
+            max_faces_per_direction: d.max_faces_per_direction,
+            max_draws_per_direction: d.max_draws_per_direction,
+
+            max_chunk_dispatches_per_frame: d.max_chunk_dispatches_per_frame,
+            max_chunk_uploads_per_frame: d.max_chunk_uploads_per_frame,
+            max_chunk_unloads_per_frame: d.max_chunk_unloads_per_frame,
+        }
+    }
+}
+
+impl From<DevSettingsFile> for DevSettings {
+    fn from(f: DevSettingsFile) -> Self {
+        Self {
+            clear_color: wgpu::Color {
+                r: f.clear_color_rgb[0],
+                g: f.clear_color_rgb[1],
+                b: f.clear_color_rgb[2],
+                a: 1.0,
+            },
             gravity: f.gravity,
             jump_speed: f.jump_speed,
             terminal_velocity: f.terminal_velocity.max(1.0),
-            start_flying: f.start_flying,
 
             sun_cycle_seconds: f.sun_cycle_seconds.max(1.0),
             sun_initial_time_of_day: f.sun_initial_time_of_day.rem_euclid(1.0),
             ambient_light: f.ambient_light.clamp(0.0, 1.0),
             sun_intensity: f.sun_intensity.max(0.0),
 
-            shadow_cascade_count: f.shadow_cascade_count.clamp(3, MAX_SHADOW_CASCADES as u32),
-            shadow_map_resolution: f.shadow_map_resolution.clamp(256, 8192),
-            shadow_max_distance: f.shadow_max_distance.max(16.0),
             shadow_split_lambda: f.shadow_split_lambda.clamp(0.0, 1.0),
             shadow_depth_bias: f.shadow_depth_bias,
             shadow_depth_bias_slope_scale: f.shadow_depth_bias_slope_scale,
@@ -689,6 +750,17 @@ impl From<ConfigFile> for EngineConfig {
             max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),
             max_chunk_unloads_per_frame: f.max_chunk_unloads_per_frame.max(1),
         }
-        .normalized()
+    }
+}
+
+impl From<EngineConfig> for ConfigFile {
+    fn from(c: EngineConfig) -> Self {
+        Self { player: PlayerSettingsFile::from(c.player), dev: DevSettingsFile::from(c.dev) }
+    }
+}
+
+impl From<ConfigFile> for EngineConfig {
+    fn from(f: ConfigFile) -> Self {
+        Self { player: PlayerSettings::from(f.player), dev: DevSettings::from(f.dev) }.normalized()
     }
 }

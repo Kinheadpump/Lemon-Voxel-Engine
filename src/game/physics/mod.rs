@@ -25,13 +25,13 @@ impl PlayerPhysics {
             grounded: false,
             flying: start_flying,
             accumulator: 0.0,
-            fixed_timestep: config.fixed_timestep,
-            max_steps_per_frame: config.max_physics_steps_per_frame,
-            player_half_width: config.player_half_width,
-            player_height: config.player_height,
-            player_eye_height: config.player_eye_height,
-            ground_probe_distance: config.ground_probe_distance,
-            terminal_velocity: config.terminal_velocity,
+            fixed_timestep: config.dev.fixed_timestep,
+            max_steps_per_frame: config.dev.max_physics_steps_per_frame,
+            player_half_width: config.dev.player_half_width,
+            player_height: config.dev.player_height,
+            player_eye_height: config.dev.player_eye_height,
+            ground_probe_distance: config.dev.ground_probe_distance,
+            terminal_velocity: config.dev.terminal_velocity,
         }
     }
 

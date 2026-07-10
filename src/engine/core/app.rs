@@ -49,11 +49,11 @@ impl App {
                 glam::Vec3::new(16.0, 40.0, 16.0),
                 0.0,
                 -0.6,
-                config.fov_y_radians,
+                config.player.fov_y_radians,
             ),
-            sun: Sun::new(config.sun_initial_time_of_day),
+            sun: Sun::new(config.dev.sun_initial_time_of_day),
             input: InputState::default(),
-            physics: PlayerPhysics::new(config.start_flying, &config),
+            physics: PlayerPhysics::new(config.player.start_flying, &config),
             chunk_manager: ChunkManager::new(&config),
             godray_field: GodrayField::new(&config),
             last_frame: Instant::now(),
@@ -73,15 +73,15 @@ impl App {
 
     fn apply_movement(&mut self, dt: f32) {
         let (dx, dy) = self.input.take_mouse_delta();
-        self.camera.rotate(dx * self.config.mouse_sensitivity, -dy * self.config.mouse_sensitivity);
+        self.camera.rotate(dx * self.config.player.mouse_sensitivity, -dy * self.config.player.mouse_sensitivity);
 
         let forward = self.camera.forward_flat();
         let right = self.camera.right();
 
         let speed = if self.input.is_sprinting() {
-            self.config.movement_speed * self.config.sprint_multiplier
+            self.config.player.movement_speed * self.config.player.sprint_multiplier
         } else {
-            self.config.movement_speed
+            self.config.player.movement_speed
         };
 
         let commands = self.input.active_commands();
@@ -128,8 +128,8 @@ impl App {
             &mut self.camera.position,
             horizontal,
             self.input.is_jump_or_ascend_held(),
-            self.config.gravity,
-            self.config.jump_speed,
+            self.config.dev.gravity,
+            self.config.dev.jump_speed,
         );
     }
 }
@@ -208,7 +208,7 @@ impl ApplicationHandler for App {
                 }
 
                 self.apply_movement(dt);
-                self.sun.advance(dt, self.config.sun_cycle_seconds);
+                self.sun.advance(dt, self.config.dev.sun_cycle_seconds);
 
                 let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
                 self.fps_ema =
@@ -225,16 +225,16 @@ impl ApplicationHandler for App {
                     &self.camera,
                     aspect,
                     self.sun.light_direction(),
-                    self.config.shadow_cascade_count,
-                    self.config.shadow_max_distance,
-                    self.config.shadow_split_lambda,
-                    self.config.shadow_map_resolution,
+                    self.config.player.shadow_cascade_count,
+                    self.config.player.shadow_max_distance,
+                    self.config.dev.shadow_split_lambda,
+                    self.config.player.shadow_map_resolution,
                 );
                 // Warmes Licht knapp ueber dem Horizont, neutrales Weiss im Zenit - rein
                 // aesthetische Interpolation, keine physikalische Simulation.
                 let sun_height = direction_to_sun.y.max(0.0);
                 let sun_color = glam::Vec3::new(1.0, 0.85 + 0.15 * sun_height, 0.7 + 0.3 * sun_height);
-                gpu.update_lighting(cascades, direction_to_sun, sun_color, self.config.sun_intensity, self.config.ambient_light);
+                gpu.update_lighting(cascades, direction_to_sun, sun_color, self.config.dev.sun_intensity, self.config.dev.ambient_light);
 
                 // Godrays vorerst deaktiviert - Platzierung/Kantenerkennung liefert noch nicht das
                 // gewuenschte Ergebnis. Code bleibt unangetastet fuer die spaetere Reaktivierung.
@@ -275,7 +275,7 @@ impl ApplicationHandler for App {
                     self.chunk_manager.update(
                         self.camera.position,
                         &cascades,
-                        self.config.shadow_cascade_count,
+                        self.config.player.shadow_cascade_count,
                         queue,
                         renderer,
                     );

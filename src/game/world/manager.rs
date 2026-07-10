@@ -163,11 +163,11 @@ pub struct ChunkManager {
 }
 
 impl ChunkManager {
-    /// `config.chunk_pool_size` ist bereits in `EngineConfig` auf das Ladevolumen der Render-Distanz
+    /// `config.dev.chunk_pool_size` ist bereits in `EngineConfig` auf das Ladevolumen der Render-Distanz
     /// normalisiert (s. `EngineConfig::normalized`) - Renderer-Buffer (`chunk_meta_buffer` etc.) und
     /// Pool arbeiten dadurch garantiert mit derselben Slot-Anzahl. Jeder Chunk belegt 64 KiB RAM.
     pub fn new(config: &EngineConfig) -> Self {
-        let pool_size = config.chunk_pool_size;
+        let pool_size = config.dev.chunk_pool_size;
         let pool = (0..pool_size).map(|_| Some(Box::new(Chunk::empty()))).collect();
         let pool_free_list = (0..pool_size).collect();
         let (result_tx, result_rx) = channel();
@@ -180,8 +180,8 @@ impl ChunkManager {
             generator: Arc::new(TerrainGenerator::new(config)),
             result_tx,
             result_rx,
-            render_distance_chunks: config.render_distance_chunks,
-            vertical_render_distance_chunks: config.vertical_render_distance_chunks,
+            render_distance_chunks: config.player.render_distance_chunks,
+            vertical_render_distance_chunks: config.player.vertical_render_distance_chunks,
             last_center: None,
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
@@ -190,9 +190,9 @@ impl ChunkManager {
             shadow_last_cascades: [(glam::Vec3::ZERO, 0.0); MAX_SHADOW_CASCADES],
             shadow_last_cascade_count: 0,
             shadow_set_dirty: true,
-            max_chunk_dispatches_per_frame: config.max_chunk_dispatches_per_frame,
-            max_chunk_uploads_per_frame: config.max_chunk_uploads_per_frame,
-            max_chunk_unloads_per_frame: config.max_chunk_unloads_per_frame,
+            max_chunk_dispatches_per_frame: config.dev.max_chunk_dispatches_per_frame,
+            max_chunk_uploads_per_frame: config.dev.max_chunk_uploads_per_frame,
+            max_chunk_unloads_per_frame: config.dev.max_chunk_unloads_per_frame,
         }
     }
 

@@ -133,14 +133,14 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
-        let msaa_samples = engine_config.msaa_samples.max(1);
+        let msaa_samples = engine_config.player.msaa_samples.max(1);
         let msaa_active = msaa_samples > 1;
 
         let shadow_pass = ShadowPass::new(
             &device,
-            engine_config.shadow_map_resolution,
-            engine_config.shadow_depth_bias,
-            engine_config.shadow_depth_bias_slope_scale,
+            engine_config.player.shadow_map_resolution,
+            engine_config.dev.shadow_depth_bias,
+            engine_config.dev.shadow_depth_bias_slope_scale,
         );
         let chunk_pipeline = pipeline::create(&device, &queue, config.format, msaa_samples);
         let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, initial_view_proj, engine_config, &shadow_pass);
@@ -158,7 +158,7 @@ impl GpuContext {
         if msaa_active {
             ssao.rebuild_bind_group(&device, &depth_view);
             blur.rebuild_bind_group(&device, &ao_view, &depth_view, &resolve_color_view);
-        } else if engine_config.ssao_enabled {
+        } else if engine_config.player.ssao_enabled {
             log::warn!("SSAO deaktiviert: benoetigt Multisampled Depth (msaa_samples > 1)");
         }
 
@@ -166,17 +166,17 @@ impl GpuContext {
             &device,
             config.format,
             msaa_active,
-            engine_config.sky_zenith_day_color,
-            engine_config.sky_horizon_day_color,
-            engine_config.sky_night_color,
+            engine_config.dev.sky_zenith_day_color,
+            engine_config.dev.sky_horizon_day_color,
+            engine_config.dev.sky_night_color,
         );
         skybox.rebuild_bind_group(&device, &depth_view);
 
         let mut godray =
-            GodrayPass::new(&device, config.format, msaa_active, engine_config.godray_count, &shadow_pass);
+            GodrayPass::new(&device, config.format, msaa_active, engine_config.dev.godray_count, &shadow_pass);
         godray.rebuild_render_bind_group(&device, &depth_view);
 
-        let hud = HudRenderer::new(&device, &queue, config.format, engine_config.hud_visible_default);
+        let hud = HudRenderer::new(&device, &queue, config.format, engine_config.player.hud_visible_default);
         let gpu_timer = GpuTimer::try_new(&device, &queue);
 
         if gpu_timer.is_none() {
@@ -196,27 +196,27 @@ impl GpuContext {
             depth_view,
             resolve_color_view,
             ao_view,
-            clear_color: engine_config.clear_color,
+            clear_color: engine_config.dev.clear_color,
             hud,
             gpu_timer,
             ssao,
             blur,
-            ssao_blur_depth_threshold: engine_config.ssao_blur_depth_threshold,
+            ssao_blur_depth_threshold: engine_config.player.ssao_blur_depth_threshold,
             shadow_pass,
             skybox,
             godray,
-            godray_temporal_blend: engine_config.godray_temporal_blend,
+            godray_temporal_blend: engine_config.dev.godray_temporal_blend,
             cascades: [Cascade::default(); MAX_SHADOW_CASCADES],
-            cascade_count: engine_config.shadow_cascade_count,
-            shadow_map_resolution: engine_config.shadow_map_resolution,
+            cascade_count: engine_config.player.shadow_cascade_count,
+            shadow_map_resolution: engine_config.player.shadow_map_resolution,
             last_view_proj: initial_view_proj,
             last_camera_pos: glam::Vec3::ZERO,
             last_camera_forward: glam::Vec3::Z,
             msaa_samples,
             msaa_active,
-            ssao_enabled: engine_config.ssao_enabled,
-            ssao_radius: engine_config.ssao_radius,
-            ssao_strength: engine_config.ssao_strength,
+            ssao_enabled: engine_config.player.ssao_enabled,
+            ssao_radius: engine_config.player.ssao_radius,
+            ssao_strength: engine_config.player.ssao_strength,
         }
     }
 

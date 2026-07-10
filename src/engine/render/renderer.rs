@@ -199,8 +199,8 @@ impl ChunkRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let chunk_pool_size = config.chunk_pool_size;
-        let max_draws_per_direction = config.max_draws_per_direction;
+        let chunk_pool_size = config.dev.chunk_pool_size;
+        let max_draws_per_direction = config.dev.max_draws_per_direction;
 
         let chunk_meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_meta_buffer"),
@@ -323,26 +323,26 @@ impl ChunkRenderer {
 
         let faces_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_faces_persistent"),
-            size: config.max_faces_per_direction as u64 * FACE_STRIDE_BYTES,
+            size: config.dev.max_faces_per_direction as u64 * FACE_STRIDE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let shadow_chunk_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_data_per_shadow_draw"),
-            size: config.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES,
+            size: config.dev.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let shadow_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_shadow_indirect_batch"),
-            size: (config.max_draws_per_direction * std::mem::size_of::<DrawIndirectArgs>()) as u64,
+            size: (config.dev.max_draws_per_direction * std::mem::size_of::<DrawIndirectArgs>()) as u64,
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let dir_chunk_data_size = config.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES;
+        let dir_chunk_data_size = config.dev.max_draws_per_direction as u64 * CHUNK_DATA_STRIDE_BYTES;
         let dir_chunk_data_offset = dir as u64 * chunk_data_dir_stride_bytes;
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -396,9 +396,9 @@ impl ChunkRenderer {
             shadow_bind_group,
             shadow_chunk_data_buffer,
             shadow_indirect_buffer,
-            allocator: SubAllocator::new(config.max_faces_per_direction as u32),
-            shadow_indirect_scratch: Vec::with_capacity(config.max_draws_per_direction),
-            shadow_chunk_data_scratch: Vec::with_capacity(config.max_draws_per_direction),
+            allocator: SubAllocator::new(config.dev.max_faces_per_direction as u32),
+            shadow_indirect_scratch: Vec::with_capacity(config.dev.max_draws_per_direction),
+            shadow_chunk_data_scratch: Vec::with_capacity(config.dev.max_draws_per_direction),
             shadow_draw_count: 0,
         }
     }

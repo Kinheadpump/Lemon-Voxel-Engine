@@ -247,80 +247,80 @@ pub struct TerrainGenerator {
 impl TerrainGenerator {
     pub fn new(config: &EngineConfig) -> Self {
         let mut continental = Noise::<common_noise::Perlin>::default();
-        continental.set_seed(config.terrain_seed);
+        continental.set_seed(config.dev.terrain_seed);
 
         let mut regional_smooth = Noise::from(LayeredNoise::new(
             Normed::default(),
-            Persistence(config.terrain_regional_gain),
+            Persistence(config.dev.terrain_regional_gain),
             FractalLayers {
                 layer: Octave(common_noise::Perlin::default()),
-                lacunarity: config.terrain_regional_lacunarity,
-                amount: config.terrain_regional_octaves,
+                lacunarity: config.dev.terrain_regional_lacunarity,
+                amount: config.dev.terrain_regional_octaves,
             },
         ));
-        regional_smooth.set_seed(config.terrain_seed.wrapping_add(0x9E37_79B9));
+        regional_smooth.set_seed(config.dev.terrain_seed.wrapping_add(0x9E37_79B9));
 
         let mut regional_cliff = Noise::<common_noise::Perlin>::default();
-        regional_cliff.set_seed(config.terrain_seed.wrapping_add(0x85EB_CA77));
+        regional_cliff.set_seed(config.dev.terrain_seed.wrapping_add(0x85EB_CA77));
 
         let mut cliff_mask = Noise::<common_noise::Perlin>::default();
-        cliff_mask.set_seed(config.terrain_seed.wrapping_add(0xC2B2_AE3D));
+        cliff_mask.set_seed(config.dev.terrain_seed.wrapping_add(0xC2B2_AE3D));
 
         let mut temperature = Noise::<common_noise::Perlin>::default();
-        temperature.set_seed(config.terrain_seed.wrapping_add(0x68E3_1DA4));
+        temperature.set_seed(config.dev.terrain_seed.wrapping_add(0x68E3_1DA4));
         let mut humidity = Noise::<common_noise::Perlin>::default();
-        humidity.set_seed(config.terrain_seed.wrapping_add(0xB529_7A4D));
+        humidity.set_seed(config.dev.terrain_seed.wrapping_add(0xB529_7A4D));
 
         let mut cheese = Noise::<common_noise::Perlin>::default();
-        cheese.set_seed(config.terrain_seed.wrapping_add(0x27D4_EB2F));
+        cheese.set_seed(config.dev.terrain_seed.wrapping_add(0x27D4_EB2F));
 
         let mut tunnel = Noise::<WorleyTunnel>::default();
-        tunnel.set_seed(config.terrain_seed.wrapping_add(0x9E3B_2265));
+        tunnel.set_seed(config.dev.terrain_seed.wrapping_add(0x9E3B_2265));
 
         let mut cave_region = Noise::<common_noise::Perlin>::default();
-        cave_region.set_seed(config.terrain_seed.wrapping_add(0x1656_67B1));
+        cave_region.set_seed(config.dev.terrain_seed.wrapping_add(0x1656_67B1));
 
         Self {
             continental,
-            continental_frequency: config.terrain_continental_frequency,
-            continental_amplitude: config.terrain_continental_amplitude,
-            mountain_amplitude: config.terrain_mountain_amplitude,
-            mountain_exponent: config.terrain_mountain_exponent,
+            continental_frequency: config.dev.terrain_continental_frequency,
+            continental_amplitude: config.dev.terrain_continental_amplitude,
+            mountain_amplitude: config.dev.terrain_mountain_amplitude,
+            mountain_exponent: config.dev.terrain_mountain_exponent,
             regional_smooth,
             regional_cliff,
-            regional_frequency: config.terrain_regional_frequency,
-            regional_amplitude: config.terrain_regional_amplitude,
+            regional_frequency: config.dev.terrain_regional_frequency,
+            regional_amplitude: config.dev.terrain_regional_amplitude,
             cliff_mask,
-            cliff_mask_frequency: config.terrain_cliff_mask_frequency,
-            sea_compression_range: config.terrain_sea_compression_range.max(1.0),
-            sea_compression_exponent: config.terrain_sea_compression_exponent,
+            cliff_mask_frequency: config.dev.terrain_cliff_mask_frequency,
+            sea_compression_range: config.dev.terrain_sea_compression_range.max(1.0),
+            sea_compression_exponent: config.dev.terrain_sea_compression_exponent,
             temperature,
-            temperature_frequency: config.terrain_temperature_frequency,
+            temperature_frequency: config.dev.terrain_temperature_frequency,
             humidity,
-            humidity_frequency: config.terrain_humidity_frequency,
-            desert_temperature_min: config.terrain_desert_temperature_min,
-            desert_humidity_max: config.terrain_desert_humidity_max,
+            humidity_frequency: config.dev.terrain_humidity_frequency,
+            desert_temperature_min: config.dev.terrain_desert_temperature_min,
+            desert_humidity_max: config.dev.terrain_desert_humidity_max,
             cheese,
-            cheese_frequency: config.terrain_cheese_frequency,
-            cheese_threshold: config.terrain_cheese_threshold,
+            cheese_frequency: config.dev.terrain_cheese_frequency,
+            cheese_threshold: config.dev.terrain_cheese_threshold,
             tunnel,
-            tunnel_frequency: config.terrain_tunnel_frequency,
-            tunnel_threshold: config.terrain_tunnel_threshold,
-            cave_widen_depth_range: config.terrain_cave_widen_depth_range.max(1.0),
-            cheese_widen_amount: config.terrain_cheese_widen_amount,
-            tunnel_widen_multiplier: config.terrain_tunnel_widen_multiplier,
+            tunnel_frequency: config.dev.terrain_tunnel_frequency,
+            tunnel_threshold: config.dev.terrain_tunnel_threshold,
+            cave_widen_depth_range: config.dev.terrain_cave_widen_depth_range.max(1.0),
+            cheese_widen_amount: config.dev.terrain_cheese_widen_amount,
+            tunnel_widen_multiplier: config.dev.terrain_tunnel_widen_multiplier,
             cave_region,
-            cave_region_frequency: config.terrain_cave_region_frequency,
-            cave_region_threshold: config.terrain_cave_region_threshold,
-            dirt_layer_depth: config.terrain_dirt_layer_depth,
-            noise_origin_offset: config.terrain_noise_origin_offset,
-            tree_seed: config.terrain_seed.wrapping_add(0x4B72_E68F),
-            tree_grid_size: config.terrain_tree_grid_size.max(1),
-            tree_spawn_chance: config.terrain_tree_spawn_chance.clamp(0.0, 1.0),
-            tree_trunk_height_min: config.terrain_tree_trunk_height_min.max(1),
-            tree_trunk_height_max: config.terrain_tree_trunk_height_max.max(config.terrain_tree_trunk_height_min.max(1)),
-            tree_crown_radius_min: config.terrain_tree_crown_radius_min.max(0),
-            tree_crown_radius_max: config.terrain_tree_crown_radius_max.max(config.terrain_tree_crown_radius_min.max(0)),
+            cave_region_frequency: config.dev.terrain_cave_region_frequency,
+            cave_region_threshold: config.dev.terrain_cave_region_threshold,
+            dirt_layer_depth: config.dev.terrain_dirt_layer_depth,
+            noise_origin_offset: config.dev.terrain_noise_origin_offset,
+            tree_seed: config.dev.terrain_seed.wrapping_add(0x4B72_E68F),
+            tree_grid_size: config.dev.terrain_tree_grid_size.max(1),
+            tree_spawn_chance: config.dev.terrain_tree_spawn_chance.clamp(0.0, 1.0),
+            tree_trunk_height_min: config.dev.terrain_tree_trunk_height_min.max(1),
+            tree_trunk_height_max: config.dev.terrain_tree_trunk_height_max.max(config.dev.terrain_tree_trunk_height_min.max(1)),
+            tree_crown_radius_min: config.dev.terrain_tree_crown_radius_min.max(0),
+            tree_crown_radius_max: config.dev.terrain_tree_crown_radius_max.max(config.dev.terrain_tree_crown_radius_min.max(0)),
         }
     }
 
@@ -1263,15 +1263,15 @@ mod tests {
     #[test]
     fn tree_footprint_matches_across_independently_generated_chunks() {
         let mut config = EngineConfig::default();
-        config.terrain_tree_spawn_chance = 1.0;
+        config.dev.terrain_tree_spawn_chance = 1.0;
         // Gitter deutlich groesser als der Isolations-Mindestabstand (2*crown_radius+1=9) - sonst
         // ueberlappen selbst gejitterte Nachbarzellen fast immer und kein Kandidat besteht den
         // Isolations-Check unten.
-        config.terrain_tree_grid_size = 20;
-        config.terrain_tree_trunk_height_min = 5;
-        config.terrain_tree_trunk_height_max = 5;
-        config.terrain_tree_crown_radius_min = 4;
-        config.terrain_tree_crown_radius_max = 4;
+        config.dev.terrain_tree_grid_size = 20;
+        config.dev.terrain_tree_trunk_height_min = 5;
+        config.dev.terrain_tree_trunk_height_max = 5;
+        config.dev.terrain_tree_crown_radius_min = 4;
+        config.dev.terrain_tree_crown_radius_max = 4;
         let generator = TerrainGenerator::new(&config);
 
         // Reiner Terrain/Wasser-Belegungs-Check OHNE Baum-Wissen (anders als `is_solid`, das jetzt
