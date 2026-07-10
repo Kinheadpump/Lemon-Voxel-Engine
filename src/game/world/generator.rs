@@ -1241,6 +1241,7 @@ impl TerrainGenerator {
             is_underwater: height < WATER_LEVEL,
             is_desert: temperature > self.desert_temperature_min && humidity < self.desert_humidity_max,
             is_rock: height as f32 > rock_height,
+            temperature,
         }
     }
 }
@@ -1322,23 +1323,47 @@ mod tests {
                     continue;
                 }
 
-                // Stamm ZUERST eingetragen und Krone nur `or_insert` - `place_flora` platziert in
-                // derselben Reihenfolge und ueberschreibt nichts bereits Belegtes (s.
-                // `place_tree_voxel`), die Stammspitze faellt sonst mit dem Kronen-Mittelpunkt
-                // (dx=dy=dz=0) zusammen und wuerde als widerspruechlicher Doppeleintrag enden.
+                // Stamm ZUERST eingetragen und Skelett (Aeste/Blaetter) nur `or_insert` - `place_flora`
+                // platziert in derselben Reihenfolge und ueberschreibt nichts bereits Belegtes (s.
+                // `place_tree_voxel`). Nutzt dieselben Formeln (`point_to_segment_distance`,
+                // `leaf_cluster_radius`) wie `place_flora`/`tree_occupies_among` statt sie zu
+                // duplizieren - dieser Test prueft die Cross-Chunk-Verteilung, nicht die Geometrie
+                // selbst (die deckt `is_solid_prediction_matches_generated_blocks_everywhere` ab).
                 let trunk_top = tree.ground_y + tree.trunk_height;
                 let mut expected: HashMap<(i32, i32, i32), u16> = HashMap::new();
                 for world_y in (tree.ground_y + 1)..=trunk_top {
                     expected.insert((tree.world_x, world_y, tree.world_z), blocks::LOG);
                 }
-                let radius_sq = tree.crown_radius * tree.crown_radius;
-                for dy in -tree.crown_radius..=tree.crown_radius {
-                    for dz in -tree.crown_radius..=tree.crown_radius {
-                        for dx in -tree.crown_radius..=tree.crown_radius {
-                            if dx * dx + dy * dy + dz * dz <= radius_sq {
-                                expected
-                                    .entry((tree.world_x + dx, trunk_top + dy, tree.world_z + dz))
-                                    .or_insert(blocks::LEAVES);
+                let root = glam::Vec3::new(tree.world_x as f32, trunk_top as f32, tree.world_z as f32);
+                let node_count = tree.node_count as usize;
+                for i in 1..node_count {
+                    let from = root + tree.nodes[tree.parents[i] as usize];
+                    let to = root + tree.nodes[i];
+                    let min = from.min(to) - glam::Vec3::splat(super::flora::BRANCH_RADIUS);
+                    let max = from.max(to) + glam::Vec3::splat(super::flora::BRANCH_RADIUS);
+                    for wy in min.y.floor() as i32..=max.y.ceil() as i32 {
+                        for wz in min.z.floor() as i32..=max.z.ceil() as i32 {
+                            for wx in min.x.floor() as i32..=max.x.ceil() as i32 {
+                                let p = glam::Vec3::new(wx as f32, wy as f32, wz as f32);
+                                if super::flora::point_to_segment_distance(p, from, to) <= super::flora::BRANCH_RADIUS {
+                                    expected.entry((wx, wy, wz)).or_insert(blocks::LOG);
+                                }
+                            }
+                        }
+                    }
+                }
+                let leaf_radius = super::flora::leaf_cluster_radius(tree.species, tree.crown_radius as f32);
+                for i in 0..node_count {
+                    let center = root + tree.nodes[i];
+                    let min = center - glam::Vec3::splat(leaf_radius);
+                    let max = center + glam::Vec3::splat(leaf_radius);
+                    for wy in min.y.floor() as i32..=max.y.ceil() as i32 {
+                        for wz in min.z.floor() as i32..=max.z.ceil() as i32 {
+                            for wx in min.x.floor() as i32..=max.x.ceil() as i32 {
+                                let p = glam::Vec3::new(wx as f32, wy as f32, wz as f32);
+                                if p.distance(center) <= leaf_radius {
+                                    expected.entry((wx, wy, wz)).or_insert(blocks::LEAVES);
+                                }
                             }
                         }
                     }

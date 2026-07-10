@@ -26,6 +26,10 @@ pub struct ColumnSurface {
     /// Hochgebirge: Spaltenhoehe ueber der Fels-Grenze - nackter Stein statt Gras/Erde, damit hohe
     /// Gipfel nicht komplett begruent wirken.
     pub is_rock: bool,
+    /// Rohes Temperatur-Sample (snorm, ungefaehr -1..1) - bereits fuer den Wuesten-Check berechnet,
+    /// hier zusaetzlich exponiert, damit `flora.rs` daraus die Baumart waehlen kann (z.B. Tanne in
+    /// kalten Regionen), ohne eine zweite Rauschprobe an derselben Position zu verschwenden.
+    pub temperature: f32,
 }
 
 /// Bestimmt die Block-ID einer Oberflaechen-Saeule aus Tiefe unter der Oberflaeche, lokaler
