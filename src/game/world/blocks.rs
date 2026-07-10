@@ -18,17 +18,24 @@ pub struct ColumnSurface {
     /// Spaltenoberflaeche liegt UNTER dem Wasserspiegel (Ozean-/Seeboden).
     pub is_underwater: bool,
     /// Wuesten-Biom: heiss UND trocken (striktes 2D-Temperatur/Feuchtigkeits-Mapping, s.
-    /// `TerrainGenerator::column_biome`) - Sand statt Gras/Erde, unabhaengig vom Hoehenband.
+    /// `TerrainGenerator::column_surface`) - Sand statt Gras/Erde, unabhaengig vom Hoehenband.
     pub is_desert: bool,
+    /// Hochgebirge: Spaltenhoehe ueber der Fels-Grenze - nackter Stein statt Gras/Erde, damit hohe
+    /// Gipfel nicht komplett begruent wirken.
+    pub is_rock: bool,
 }
 
 /// Bestimmt die Block-ID einer Oberflaechen-Saeule aus Tiefe unter der Oberflaeche, lokaler
 /// Hangneigung (max. Hoehenunterschied zu den 4 Nachbar-Saeulen) und dem Spalten-Kontext. Die
 /// Deckschicht wird mit steigender Neigung graduell duenner statt hart umzuschalten - an steilen
 /// Klippen (`slope >= dirt_depth`) bleibt blanker Fels stehen. Prioritaet der Deckschicht-Regeln:
-/// Unterwasser (nie Gras - Ozeanboden ist Sand am Ufer, sonst Erde) > Strand/Wueste (Sand) >
-/// Gras/Erde.
+/// Hochgebirge (Fels) > Unterwasser (nie Gras - Ozeanboden ist Sand am Ufer, sonst Erde) >
+/// Strand/Wueste (Sand) > Gras/Erde.
 pub fn surface_block(depth_from_surface: i32, slope: i32, dirt_depth: i32, surface: ColumnSurface) -> u16 {
+    if surface.is_rock {
+        return STONE;
+    }
+
     let eroded_dirt_depth = (dirt_depth - slope).max(0);
     let in_top_layer = depth_from_surface < dirt_depth;
 

@@ -196,27 +196,34 @@ impl Default for EngineConfig {
             godray_temporal_blend: 0.12,
 
             terrain_seed: 1337,
-            // Regional-Skala ~83 Bloecke/Feature, Kontinental-Skala 32x groesser (~2650 Bloecke) -
-            // haelt Land/Ozean auf kontinentaler Ebene auseinander statt regional zu flackern.
-            terrain_continental_frequency: 0.012 / 32.0,
-            terrain_continental_amplitude: 40.0,
-            // unorm(cont)^4 * 130: Ebenen (unorm~0.5 -> +8) bleiben flach, Kontinentalmaxima
-            // (unorm~1) schiessen auf +130 - "flach bleibt flach, Berge massiv hoch".
+            // Kontinental-Skala ~625 Bloecke: Land/Ozean-Wechsel innerhalb einer explorierbaren
+            // Distanz (fruehere ~2650-Block-Periode war lokal unsichtbar -> alles wirkte flach).
+            terrain_continental_frequency: 0.0016,
+            terrain_continental_amplitude: 55.0,
+            // unorm(cont)^5.5 * 130: hoher Exponent konzentriert die Berge auf die OBERSTEN
+            // Kontinental-Werte - das meiste Land bleibt sanftes Huegelland, nur die Kontinentalkerne
+            // tuermen sich zu (dann umso markanteren) Massiven auf. Kleiner Exponent liess frueher ein
+            // Viertel der Welt ueber Hoehe 80 liegen ("ueberall Berge").
             terrain_mountain_amplitude: 130.0,
-            terrain_mountain_exponent: 4.0,
-            terrain_regional_frequency: 0.012,
+            terrain_mountain_exponent: 5.5,
+            // Regional-Skala ~180 Bloecke, 4 Octaves: sanfte Huegel/Taeler statt hochfrequenter
+            // Zacken (frueher Periode 83 + 5 Octaves -> kleinteiliges Chaos auf der Sandebene).
+            terrain_regional_frequency: 0.0055,
             terrain_regional_amplitude: 22.0,
-            terrain_regional_octaves: 5,
+            terrain_regional_octaves: 4,
             terrain_regional_lacunarity: 2.0,
-            terrain_regional_gain: 0.5,
+            terrain_regional_gain: 0.45,
             terrain_cliff_mask_frequency: 0.008,
             // Biom-Features ~650 Bloecke - grosse zusammenhaengende Wuesten/Graslaender.
             terrain_temperature_frequency: 0.0015,
             terrain_humidity_frequency: 0.0017,
             terrain_desert_temperature_min: 0.25,
             terrain_desert_humidity_max: -0.05,
-            terrain_sea_compression_range: 20.0,
-            terrain_sea_compression_exponent: 2.2,
+            // SANFT und SCHMAL: glaettet nur die unmittelbare Wasserlinie (±6 Bloecke, Exp 1.3),
+            // statt wie zuvor (±20, Exp 2.2) das halbe Relief auf Meereshoehe zu quetschen und damit
+            // eine riesige flache Sandebene zu erzeugen.
+            terrain_sea_compression_range: 6.0,
+            terrain_sea_compression_exponent: 1.3,
             terrain_cave_frequency: 0.05,
             terrain_cave_threshold: 0.6,
             // Grosse Regionen (~500 Bloecke/Feature). Schwelle 0.3 empirisch kalibriert (s.

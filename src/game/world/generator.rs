@@ -22,16 +22,27 @@ const SEA_LEVEL: i32 = 0;
 /// geschlossen, s. `is_carved`).
 const WATER_LEVEL: i32 = SEA_LEVEL;
 
-/// Formt die "cliffy" Regional-Karte: Exponent < 1 auf `|noise|` drueckt die meisten Werte schnell
-/// Richtung +-1 (breite Plateaus), nur nahe der Nulldurchgaenge bleibt eine schmale, steile Rampe -
-/// das ist die "Erosion Discontinuity" aus Yosemite-artigen Klippen ohne echtes 3D-Dichtefeld.
-const CLIFF_CONTRAST_EXPONENT: f32 = 0.35;
+/// Formt die "cliffy" Regional-Karte: Exponent < 1 auf `|noise|` drueckt die meisten Werte Richtung
+/// +-1 (breite Plateaus), nur nahe der Nulldurchgaenge bleibt eine schmale, steile Rampe - das ist
+/// die "Erosion Discontinuity" aus Yosemite-artigen Klippen ohne echtes 3D-Dichtefeld. Nicht zu
+/// aggressiv (0.55 statt frueher 0.35), sonst wirken die Klippen ueberall statt nur gelegentlich.
+const CLIFF_CONTRAST_EXPONENT: f32 = 0.55;
 /// Formt die Blend-Maske zwischen sanftem und "cliffy" Hoehenfeld: kleiner Exponent = weicherer,
 /// aber dennoch kontrastreicher Uebergang zwischen den Regionen (kein hartes Ein/Aus).
 const MASK_CONTRAST_EXPONENT: f32 = 0.6;
 /// Der oberste Block einer Saeule wird nie von Hoehlen durchbrochen, sonst entstehen einzelne
 /// Ein-Block-Loecher direkt im Gras.
 const MIN_CAVE_DEPTH: i32 = 1;
+/// Halbe vertikale Breite (Bloecke) des Sand-Kuestenstreifens um den Wasserspiegel - schmal und
+/// FIX (nicht mehr an die Sea-Compression-Range gekoppelt, die frueher eine halbe Weltbreite Sand
+/// erzeugte). Bei sanft geneigten Kuesten entspricht das ein paar Bloecken horizontalem Strand.
+const BEACH_HALF_RANGE: i32 = 2;
+/// Basis-Hoehe, ab der Gipfel nackten Fels statt Gras zeigen. Wird pro Spalte um die Temperatur
+/// (`ROCK_HEIGHT_TEMPERATURE_DITHER`) verschoben, damit keine flache Höhenlinie entsteht.
+const ROCK_HEIGHT: f32 = 92.0;
+/// Warme Spalten brauchen mehr Hoehe fuer Fels, kalte weniger - dithert die Fels-Grenze mit dem
+/// (bereits gesampelten, glatten) Temperaturfeld statt einer harten Kontur.
+const ROCK_HEIGHT_TEMPERATURE_DITHER: f32 = 14.0;
 
 #[inline(always)]
 fn signed_pow(value: f32, exponent: f32) -> f32 {
@@ -667,13 +678,14 @@ impl TerrainGenerator {
     /// Block-ID (Sand vs. Gras), nie die Festigkeit - keine Konsistenzanforderung an den Fallback,
     /// keine zusaetzlichen Rauschproben im Mesher-/Physik-Hotpath.
     fn column_surface(&self, world_x: i32, world_z: i32, height: i32) -> ColumnSurface {
-        let beach_half_range = (self.sea_compression_range * 0.25).max(1.0) as i32;
         let temperature = self.sample2d(&self.temperature, self.temperature_frequency, world_x, world_z);
         let humidity = self.sample2d(&self.humidity, self.humidity_frequency, world_x, world_z);
+        let rock_height = ROCK_HEIGHT + temperature * ROCK_HEIGHT_TEMPERATURE_DITHER;
         ColumnSurface {
-            is_beach: (height - SEA_LEVEL).abs() <= beach_half_range,
+            is_beach: (height - WATER_LEVEL).abs() <= BEACH_HALF_RANGE,
             is_underwater: height < WATER_LEVEL,
             is_desert: temperature > self.desert_temperature_min && humidity < self.desert_humidity_max,
+            is_rock: height as f32 > rock_height,
         }
     }
 }
