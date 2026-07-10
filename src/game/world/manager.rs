@@ -206,13 +206,17 @@ pub struct ChunkManager {
     /// `apply_completed_generations`-Aufruf gebraucht.
     outer_radius_world_h: f32,
     outer_radius_world_v: f32,
-    /// Fenster-Zentrum (Kamera-Chunk-Koordinate) des letzten Rebuilds. Ob eine Koordinate zum
-    /// Ladefenster gehoert, ist ein O(1)-Arithmetik-Praedikat gegen dieses Zentrum
-    /// (`Self::in_window`) - es existiert bewusst KEINE materialisierte "Soll-Menge" mehr: das
-    /// fruehere `HashSet` mit O(Ladevolumen) Inserts pro Fenster-Rebuild (38k Hashes bei
-    /// render_distance=32, jedes Mal beim Ueberqueren einer Chunk-Grenze) war die Haupt-Stutter-
-    /// Quelle beim Bewegen.
-    last_center: Option<ChunkCoord>,
+    /// Kamera-Zelle (IMMER in LOD0-Granularitaet `CHUNK_SIZE`, NIE `CHUNK_SIZE*voxel_scale`) beim
+    /// letzten Rebuild - loest `rebuild_load_window` nur beim Ueberqueren einer 32-Block-Zelle aus,
+    /// statt jeden Frame komplett neu zu scannen. BEWUSST auf der feinsten Granularitaet fuer ALLE
+    /// Ringe (nicht der eigenen, bei Zusatz-Ringen viel groesseren Schrittweite) - sonst haengt ein
+    /// grober Ring der Kamera um bis zu seiner eigenen Schrittweite hinterher, waehrend der
+    /// naechst-feinere Ring (der haeufiger neu baut) sein Fenster schon weitergezogen hat. Die
+    /// Ausschlussgrenze des groben Rings bleibt dann zeitweise stehen, waehrend sich die Aussengrenze
+    /// des feinen Rings schon wegbewegt - eine Luecke dazwischen, die erst schliesst, wenn der grobe
+    /// Ring endlich seinen eigenen (seltenen) Rebuild ausloest ("Luecken, die beim Naehern
+    /// zurueckspringen").
+    last_trigger_cell: Option<ChunkCoord>,
     unload_scratch: Vec<ChunkCoord>,
     /// Noch nicht dispatchte, aber gewuenschte Chunks - absteigend nach Distanz zum Fenster-Zentrum
     /// sortiert, sodass `pop()` (Dispatch-Reihenfolge) immer den NAECHSTGELEGENEN Chunk zuerst
@@ -266,7 +270,7 @@ impl ChunkManager {
             inner_exclusion_world_v: ring.inner_exclusion_world_v as f32,
             outer_radius_world_h: (ring.render_distance_chunks * CHUNK_SIZE * ring.voxel_scale) as f32,
             outer_radius_world_v: (ring.vertical_render_distance_chunks * CHUNK_SIZE * ring.voxel_scale) as f32,
-            last_center: None,
+            last_trigger_cell: None,
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
             pending_set: CoordSet::default(),
@@ -427,34 +431,34 @@ impl ChunkManager {
     /// ist bewusst NICHT Teil dieser Methode (s. `update_shadow_visibility`) - nur LOD0 wirft
     /// Schatten, der Aufrufer (`WorldStreamer`) ruft sie deshalb gezielt nur fuer Ring 0 auf.
     pub fn update(&mut self, camera_position: glam::Vec3, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
-        // Nur zur AENDERUNGSERKENNUNG (loest `rebuild_load_window` nur beim Ueberqueren einer
-        // Gitterzelle DIESES Rings aus statt jeden Frame) - die eigentliche Lade-Entscheidung in
-        // `rebuild_load_window`/`drain_unloads`/`apply_completed_generations` misst ausschliesslich
-        // gegen die ECHTE `camera_position`, s. `in_ring_box`-Kommentar.
-        let step = CHUNK_SIZE * self.voxel_scale;
-        let center = (
-            (camera_position.x / step as f32).floor() as i32,
-            (camera_position.y / step as f32).floor() as i32,
-            (camera_position.z / step as f32).floor() as i32,
+        // Aenderungserkennung IMMER auf LOD0-Granularitaet (`CHUNK_SIZE`, NICHT
+        // `CHUNK_SIZE*self.voxel_scale`) - s. `last_trigger_cell`-Kommentar zum Rebuild-Lag-Bug,
+        // den das behebt. Die eigentliche Lade-Entscheidung in `rebuild_load_window`/
+        // `drain_unloads`/`apply_completed_generations` misst ohnehin ausschliesslich gegen die
+        // ECHTE `camera_position` (s. `in_ring_box`-Kommentar).
+        let trigger_cell = (
+            (camera_position.x / CHUNK_SIZE as f32).floor() as i32,
+            (camera_position.y / CHUNK_SIZE as f32).floor() as i32,
+            (camera_position.z / CHUNK_SIZE as f32).floor() as i32,
         );
 
         self.apply_completed_generations(camera_position, queue, renderer);
 
-        if self.last_center != Some(center) {
-            self.rebuild_load_window(center, camera_position);
-            self.last_center = Some(center);
+        if self.last_trigger_cell != Some(trigger_cell) {
+            self.rebuild_load_window(camera_position);
+            self.last_trigger_cell = Some(trigger_cell);
         }
 
         self.drain_unloads(camera_position, queue, renderer);
         self.dispatch_pending();
     }
 
-    /// Fenster-Rebuild beim Betreten einer neuen Gitterzelle DIESES Rings. `center` dient nur der
-    /// Enumeration der Kandidaten-Koordinaten (welcher Ausschnitt des unendlichen Koordinatenraums
-    /// ueberhaupt betrachtet wird) - jede tatsaechliche Lade-Entscheidung laeuft ueber
-    /// `in_ring_box` gegen die echte `camera_position` (s. dortigen Kommentar zum Gitter-
-    /// Quantisierungs-Bug, den das ersetzt).
-    fn rebuild_load_window(&mut self, center: ChunkCoord, camera_position: glam::Vec3) {
+    /// Fenster-Rebuild, ausgeloest beim Ueberqueren einer LOD0-Gitterzelle (s. `last_trigger_cell`) -
+    /// nicht beim Ueberqueren der (bei Zusatz-Ringen viel groesseren) EIGENEN Gitterzelle. `center`
+    /// (DIESES Rings eigene, aus der echten Kamera abgeleitete Gitterkoordinate) dient nur der
+    /// Enumeration der Kandidaten-Koordinaten; jede tatsaechliche Lade-Entscheidung laeuft ueber
+    /// `in_ring_box` gegen die echte `camera_position`.
+    fn rebuild_load_window(&mut self, camera_position: glam::Vec3) {
         let voxel_scale = self.voxel_scale;
         let inner_h = self.inner_exclusion_world_h;
         let inner_v = self.inner_exclusion_world_v;
@@ -462,6 +466,13 @@ impl ChunkManager {
         let outer_v = self.outer_radius_world_v;
         let r = self.render_distance_chunks;
         let rv = self.vertical_render_distance_chunks;
+
+        let step = (CHUNK_SIZE * voxel_scale) as f32;
+        let center = (
+            (camera_position.x / step).floor() as i32,
+            (camera_position.y / step).floor() as i32,
+            (camera_position.z / step).floor() as i32,
+        );
 
         for (coord, loaded) in self.loaded.iter_mut() {
             let outside = !in_ring_box(*coord, voxel_scale, camera_position, inner_h, inner_v, outer_h, outer_v);
