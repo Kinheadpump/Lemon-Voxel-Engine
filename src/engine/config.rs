@@ -6,6 +6,37 @@ use crate::game::math::cascades::MAX_SHADOW_CASCADES;
 
 pub const CONFIG_PATH: &str = "config.toml";
 
+/// Anzahl zusaetzlicher LOD-Ringe jenseits von LOD0 (LOD0 nutzt weiterhin
+/// `PlayerSettings::render_distance_chunks`/`vertical_render_distance_chunks` direkt). Fest statt
+/// `Vec`, damit `DevSettings`/`EngineConfig` `Copy` bleiben (wird ueberall per Wert durchgereicht).
+pub const MAX_EXTRA_LOD_RINGS: usize = 2;
+
+/// EIN zusaetzlicher LOD-Ring: EIN Voxel deckt `voxel_scale` Weltbloecke pro Achse ab (s.
+/// `game/world/generator/lod.rs`), `render_distance_chunks`/`vertical_render_distance_chunks` sind
+/// dabei in DIESES Rings eigenen (entsprechend groesseren) Chunk-Einheiten gemessen - ein Ring mit
+/// `voxel_scale=4, render_distance_chunks=12` deckt also `12*4=48` LOD0-aequivalente Chunks Radius
+/// ab, bei nur `(2*12+1)^2*...` statt `(2*48+1)^2*...` Pool-Slots.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LodRingSetting {
+    pub voxel_scale: i32,
+    pub render_distance_chunks: i32,
+    pub vertical_render_distance_chunks: i32,
+}
+
+/// Konkreter, aus `EngineConfig` abgeleiteter LOD-Ring inklusive seines Anteils am GEMEINSAMEN
+/// Chunk-Pool-Slot-Raum (`pool_slot_base..pool_slot_base+pool_size`) - `ChunkRenderer` haelt EINEN
+/// globalen `chunk_meta_buffer`, jeder Ring-`ChunkManager` schreibt nur in seinen eigenen
+/// Teilbereich (s. `EngineConfig::lod_ring_runtimes`).
+#[derive(Clone, Copy, Debug)]
+pub struct LodRingRuntime {
+    pub voxel_scale: i32,
+    pub render_distance_chunks: i32,
+    pub vertical_render_distance_chunks: i32,
+    pub pool_slot_base: usize,
+    pub pool_size: usize,
+}
+
 /// Einstellungen, die ein SPIELER ueber ein Optionsmenue anpassen wuerde: Eingabe-Empfindlichkeit,
 /// Sichtfeld, Sicht-/Grafikqualitaet. Strikt getrennt von `DevSettings` - ein zukuenftiges
 /// In-Game-Optionsmenue muss nur DIESE Struct anfassen koennen, ohne versehentlich an Terrain-Seeds
@@ -168,6 +199,11 @@ pub struct DevSettings {
     pub max_faces_per_direction: usize,
     pub max_draws_per_direction: usize,
 
+    /// Zusaetzliche LOD-Ringe jenseits von LOD0 - nur die ersten `lod_ring_count` Eintraege sind
+    /// gueltig (s. `EngineConfig::lod_ring_runtimes`).
+    pub lod_rings: [LodRingSetting; MAX_EXTRA_LOD_RINGS],
+    pub lod_ring_count: u32,
+
     /// Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
     /// Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden. Ohne diese Grenze
     /// versucht der Main-Thread bei grossem `render_distance_chunks` (grosser Backlog beim
@@ -329,6 +365,17 @@ impl Default for DevSettings {
             max_faces_per_direction: 3_000_000,
             max_draws_per_direction: 4300,
 
+            // Zwei zusaetzliche Ringe jenseits LOD0: Scale 4 deckt das 4-fache Weltvolumen pro
+            // Chunk ab (Hoehlen/Baeume entfallen dort komplett, s. `generator/lod.rs` - macht LOD1
+            // trotz groesserer Reichweite GUENSTIGER pro Chunk als LOD0), Scale 16 nochmal das
+            // 4-fache. Sichtweite waechst dadurch weit ueber das reine LOD0-Fenster hinaus, waehrend
+            // der Chunk-Pool nur linear (nicht quadratisch mit der Gesamtdistanz) mitwaechst.
+            lod_rings: [
+                LodRingSetting { voxel_scale: 4, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
+                LodRingSetting { voxel_scale: 16, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
+            ],
+            lod_ring_count: 2,
+
             // Vor dem Binary-Greedy-Meshing-Umbau war das Meshing selbst der Flaschenhals; jetzt
             // ist der Upload-/Dispatch-Takt (64/Frame) die haertere Bremse (bei ~18 FPS waehrend
             // des Ladens ergab das rechnerisch exakt die beobachtete ~1100-1300 Chunks/s
@@ -373,30 +420,62 @@ impl EngineConfig {
     ///   Render-Distanz sichtbare Chunks kommentarlos aus dem Draw fallen ("kuenstlich limitierte
     ///   Sichtweite"). Kostet 2*16 Byte pro Slot ueber 6 Richtungen - vernachlaessigbar.
     fn normalized(mut self) -> Self {
-        let required = required_chunk_pool_size(
-            self.player.render_distance_chunks,
-            self.player.vertical_render_distance_chunks,
-        );
-        if required > CHUNK_POOL_SAFETY_CAP {
+        let total_required: usize = self.lod_ring_runtimes().iter().map(|r| r.pool_size).sum();
+        if total_required > CHUNK_POOL_SAFETY_CAP {
             log::warn!(
-                "Render-Distanz {}x{} braeuchte {} Chunk-Pool-Slots, gedeckelt auf {} ({} GiB RAM) - \
-                 Chunks am Rand der Render-Distanz werden nicht geladen",
-                self.player.render_distance_chunks,
-                self.player.vertical_render_distance_chunks,
-                required,
-                CHUNK_POOL_SAFETY_CAP,
-                CHUNK_POOL_SAFETY_CAP * 64 / 1024 / 1024,
+                "LOD-Ringe brauchen zusammen {total_required} Chunk-Pool-Slots (jeder Ring einzeln \
+                 bereits auf {CHUNK_POOL_SAFETY_CAP} gedeckelt, die SUMME aber bewusst nicht weiter - \
+                 sonst wuerde die Pool-Slot-Partitionierung der Ringe inkonsistent) - das kostet ca. \
+                 {} GiB RAM",
+                total_required * 64 / 1024 / 1024,
             );
         }
-        self.dev.chunk_pool_size = self
-            .dev
-            .chunk_pool_size
-            .max(required.min(CHUNK_POOL_SAFETY_CAP));
+        self.dev.chunk_pool_size = self.dev.chunk_pool_size.max(total_required);
         self.dev.max_draws_per_direction = self
             .dev
             .max_draws_per_direction
             .max(self.dev.chunk_pool_size);
         self
+    }
+
+    /// Leitet aus LOD0 (`PlayerSettings::render_distance_chunks`/`vertical_render_distance_chunks`)
+    /// UND den `dev.lod_rings`-Eintraegen die vollstaendige Ring-Liste ab, inklusive der
+    /// `pool_slot_base`-Partitionierung im GEMEINSAMEN `chunk_meta_buffer`-Adressraum (Ring 0 = LOD0
+    /// zuerst, danach die konfigurierten Zusatz-Ringe in Reihenfolge). Jeder Ring wird EINZELN auf
+    /// `CHUNK_POOL_SAFETY_CAP` gedeckelt - die Summe kann diese Grenze bei mehreren Ringen
+    /// ueberschreiten, s. `normalized`-Warnung.
+    pub fn lod_ring_runtimes(&self) -> Vec<LodRingRuntime> {
+        let mut rings = Vec::with_capacity(1 + self.dev.lod_ring_count as usize);
+        let mut pool_slot_base = 0usize;
+
+        let lod0_size = required_chunk_pool_size(
+            self.player.render_distance_chunks,
+            self.player.vertical_render_distance_chunks,
+        )
+        .min(CHUNK_POOL_SAFETY_CAP);
+        rings.push(LodRingRuntime {
+            voxel_scale: 1,
+            render_distance_chunks: self.player.render_distance_chunks,
+            vertical_render_distance_chunks: self.player.vertical_render_distance_chunks,
+            pool_slot_base,
+            pool_size: lod0_size,
+        });
+        pool_slot_base += lod0_size;
+
+        for ring in &self.dev.lod_rings[..self.dev.lod_ring_count as usize] {
+            let pool_size = required_chunk_pool_size(ring.render_distance_chunks, ring.vertical_render_distance_chunks)
+                .min(CHUNK_POOL_SAFETY_CAP);
+            rings.push(LodRingRuntime {
+                voxel_scale: ring.voxel_scale.max(1),
+                render_distance_chunks: ring.render_distance_chunks,
+                vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
+                pool_slot_base,
+                pool_size,
+            });
+            pool_slot_base += pool_size;
+        }
+
+        rings
     }
 
     /// Laedt die Konfiguration aus `config.toml`. Existiert die Datei nicht, wird sie mit den
@@ -540,6 +619,9 @@ struct DevSettingsFile {
     chunk_pool_size: usize,
     max_faces_per_direction: usize,
     max_draws_per_direction: usize,
+
+    lod_rings: [LodRingSetting; MAX_EXTRA_LOD_RINGS],
+    lod_ring_count: u32,
 
     max_chunk_dispatches_per_frame: usize,
     max_chunk_uploads_per_frame: usize,
@@ -704,6 +786,9 @@ impl From<DevSettings> for DevSettingsFile {
             max_faces_per_direction: d.max_faces_per_direction,
             max_draws_per_direction: d.max_draws_per_direction,
 
+            lod_rings: d.lod_rings,
+            lod_ring_count: d.lod_ring_count,
+
             max_chunk_dispatches_per_frame: d.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: d.max_chunk_uploads_per_frame,
             max_chunk_unloads_per_frame: d.max_chunk_unloads_per_frame,
@@ -796,6 +881,13 @@ impl From<DevSettingsFile> for DevSettings {
             chunk_pool_size: f.chunk_pool_size.max(1),
             max_faces_per_direction: f.max_faces_per_direction.max(1),
             max_draws_per_direction: f.max_draws_per_direction.max(1),
+
+            lod_rings: std::array::from_fn(|i| LodRingSetting {
+                voxel_scale: f.lod_rings[i].voxel_scale.max(1),
+                render_distance_chunks: f.lod_rings[i].render_distance_chunks.clamp(1, 64),
+                vertical_render_distance_chunks: f.lod_rings[i].vertical_render_distance_chunks.clamp(1, 64),
+            }),
+            lod_ring_count: f.lod_ring_count.min(MAX_EXTRA_LOD_RINGS as u32),
 
             max_chunk_dispatches_per_frame: f.max_chunk_dispatches_per_frame.max(1),
             max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),

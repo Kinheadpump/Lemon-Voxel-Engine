@@ -17,7 +17,8 @@ use crate::game::math::cascades::compute_cascades;
 use crate::game::math::sun::Sun;
 use crate::game::physics::PlayerPhysics;
 use crate::game::world::godrays::GodrayField;
-use crate::game::world::manager::{ChunkManager, INTERACTION_REACH};
+use crate::game::world::manager::INTERACTION_REACH;
+use crate::game::world::streamer::WorldStreamer;
 
 /// Block-Typ, der beim Platzieren verwendet wird - "einfache" Interaktion ohne Inventar/Auswahl.
 const PLACE_BLOCK_ID: u16 = TEXTURE_LAYER_STONE as u16;
@@ -29,7 +30,7 @@ pub struct App {
     sun: Sun,
     input: InputState,
     physics: PlayerPhysics,
-    chunk_manager: ChunkManager,
+    world: WorldStreamer,
     // Godrays vorerst deaktiviert (s. Kommentar in `window_event`) - Feld bleibt fuer die
     // spaetere Reaktivierung erhalten.
     #[allow(dead_code)]
@@ -54,7 +55,7 @@ impl App {
             sun: Sun::new(config.dev.sun_initial_time_of_day),
             input: InputState::default(),
             physics: PlayerPhysics::new(config.player.start_flying, &config),
-            chunk_manager: ChunkManager::new(&config),
+            world: WorldStreamer::new(&config),
             godray_field: GodrayField::new(&config),
             last_frame: Instant::now(),
             last_stats_log: Instant::now(),
@@ -120,8 +121,8 @@ impl App {
 
         // Kollisionsabfrage respektiert geladene/editierte Chunk-Daten (nicht nur das prozedurale
         // Terrain), damit abgebaute/platzierte Bloecke sofort physikalisch wirksam sind.
-        let chunk_manager = &self.chunk_manager;
-        let is_solid = |x: i32, y: i32, z: i32| chunk_manager.is_solid_at(x, y, z);
+        let world = &self.world;
+        let is_solid = |x: i32, y: i32, z: i32| world.is_solid_at(x, y, z);
         self.physics.advance(
             dt,
             &is_solid,
@@ -239,7 +240,7 @@ impl ApplicationHandler for App {
                 // Godrays vorerst deaktiviert - Platzierung/Kantenerkennung liefert noch nicht das
                 // gewuenschte Ergebnis. Code bleibt unangetastet fuer die spaetere Reaktivierung.
                 // if let Some(instances) =
-                //     self.godray_field.update(self.camera.position, self.chunk_manager.generator())
+                //     self.godray_field.update(self.camera.position, self.world.generator())
                 // {
                 //     gpu.upload_godrays(instances);
                 // }
@@ -249,18 +250,18 @@ impl ApplicationHandler for App {
 
                     if self.input.take_mine_requested() {
                         if let Some(hit) =
-                            self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                            self.world.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
                         {
-                            self.chunk_manager.set_block(hit.block.x, hit.block.y, hit.block.z, 0, queue, renderer);
+                            self.world.set_block(hit.block.x, hit.block.y, hit.block.z, 0, queue, renderer);
                         }
                     }
                     if self.input.take_place_requested() {
                         if let Some(hit) =
-                            self.chunk_manager.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
+                            self.world.raycast(self.camera.position, self.camera.forward(), INTERACTION_REACH)
                         {
                             let target = hit.block + hit.normal;
                             if !self.physics.occupies_block(self.camera.position, target) {
-                                self.chunk_manager.set_block(
+                                self.world.set_block(
                                     target.x,
                                     target.y,
                                     target.z,
@@ -272,7 +273,7 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    self.chunk_manager.update(
+                    self.world.update(
                         self.camera.position,
                         &cascades,
                         self.config.player.shadow_cascade_count,
@@ -307,7 +308,7 @@ impl ApplicationHandler for App {
                 let _ = write!(
                     self.hud_text,
                     "\nCHUNKS: {}\nDRAW CALLS (GPU-CULLED): {}\nPOS: {:.1} / {:.1} / {:.1}\nMODE: {mode_text} (F=TOGGLE, F4=WIREFRAME)",
-                    self.chunk_manager.loaded_chunk_count(),
+                    self.world.loaded_chunk_count(),
                     gpu.renderer.draw_call_count(),
                     self.camera.position.x,
                     self.camera.position.y,
@@ -330,7 +331,7 @@ impl ApplicationHandler for App {
                         dt * 1000.0,
                         vram_text,
                         mode_text,
-                        self.chunk_manager.loaded_chunk_count(),
+                        self.world.loaded_chunk_count(),
                         gpu.renderer.draw_call_count(),
                         self.camera.position.x,
                         self.camera.position.y,

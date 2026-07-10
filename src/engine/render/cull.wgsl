@@ -172,6 +172,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         indirect_args[dir * max_draws + local_index] = DrawIndirectArgs(6u, slot.y, 0u, slot.x);
-        chunk_data[dir * chunk_data_stride + local_index] = ChunkData(vec4<f32>(box_min, 0.0));
+        chunk_data[dir * chunk_data_stride + local_index] = ChunkData(vec4<f32>(box_min, chunk.aabb_max.w));
     }
 }

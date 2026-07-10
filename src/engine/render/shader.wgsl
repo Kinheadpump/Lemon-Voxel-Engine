@@ -72,15 +72,20 @@ fn vs_main(
     let width = f32(((packed >> 22u) & 0x1Fu) + 1u);
     let height = f32(((packed >> 27u) & 0x1Fu) + 1u);
 
-    let local_pos = vec3<f32>(local_x, local_y, local_z);
-    let plane_offset = max(direction.normal.xyz, vec3<f32>(0.0));
+    // `origin.w` = voxel_scale (LOD-Ring-Faktor, s. `ChunkMetaGpu`-Kommentar in `cull_pipeline.rs`) -
+    // 1 fuer LOD0. EIN Voxel dieses Chunks deckt `voxel_scale` Weltbloecke pro Achse ab, also
+    // skaliert die GESAMTE lokale Geometrie (Position, Face-Breite/-Hoehe) damit - die Textur-UVs
+    // bleiben bewusst unskaliert (grobe LOD-Chunks brauchen keine Pro-Block-Texturschaerfe).
+    let voxel_scale = chunk_data[draw_index].origin.w;
+    let local_pos = vec3<f32>(local_x, local_y, local_z) * voxel_scale;
+    let plane_offset = max(direction.normal.xyz, vec3<f32>(0.0)) * voxel_scale;
     let chunk_origin = chunk_data[draw_index].origin.xyz;
     let origin = chunk_origin + local_pos + plane_offset;
 
     let corner = CORNER_OFFSETS[vertex_index % 6u];
     let world_pos = origin
-        + direction.u_axis.xyz * corner.x * width
-        + direction.v_axis.xyz * corner.y * height;
+        + direction.u_axis.xyz * corner.x * width * voxel_scale
+        + direction.v_axis.xyz * corner.y * height * voxel_scale;
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);

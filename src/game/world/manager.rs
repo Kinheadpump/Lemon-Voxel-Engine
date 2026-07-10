@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use glam::IVec3;
 
-use crate::engine::config::EngineConfig;
+use crate::engine::config::{EngineConfig, LodRingRuntime};
 use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk};
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
@@ -79,8 +79,12 @@ struct GenerationResult {
     is_empty: bool,
 }
 
-fn chunk_origin(coord: ChunkCoord) -> glam::Vec3 {
-    glam::Vec3::new((coord.0 * CHUNK_SIZE) as f32, (coord.1 * CHUNK_SIZE) as f32, (coord.2 * CHUNK_SIZE) as f32)
+/// Welt-Ursprung eines Chunks IN DIESEM Ring - `voxel_scale=1` fuer LOD0 (identisch zum bisherigen
+/// Verhalten), bei LOD-Ringen deckt sowohl die Chunk-Koordinate als auch jeder lokale Schritt
+/// `voxel_scale` Weltbloecke ab (s. `generator/lod.rs`).
+fn chunk_origin_scaled(coord: ChunkCoord, voxel_scale: i32) -> glam::Vec3 {
+    let step = (CHUNK_SIZE * voxel_scale) as f32;
+    glam::Vec3::new(coord.0 as f32 * step, coord.1 as f32 * step, coord.2 as f32 * step)
 }
 
 fn sphere_intersects_aabb(center: glam::Vec3, radius: f32, min: glam::Vec3, max: glam::Vec3) -> bool {
@@ -130,6 +134,14 @@ pub struct ChunkManager {
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
     vertical_render_distance_chunks: i32,
+    /// 1 fuer LOD0, sonst der Weltblock-Faktor dieses Rings (s. `generator/lod.rs`/
+    /// `LodRingRuntime`) - bestimmt Generierungspfad (`generate_chunk` vs. `generate_lod_chunk`)
+    /// UND die Chunk-Weltgroesse (`CHUNK_SIZE * voxel_scale`).
+    voxel_scale: i32,
+    /// Offset dieses Rings im GEMEINSAMEN `chunk_meta_buffer`-Adressraum des `ChunkRenderer` - lokale
+    /// `pool`-Indices (0..pool_size) werden nur bei GPU-Aufrufen (`update_chunk_meta`/
+    /// `clear_chunk_meta`) um diesen Wert verschoben, sonst bleibt der Ring komplett unabhaengig.
+    pool_slot_base: usize,
     /// Fenster-Zentrum (Kamera-Chunk-Koordinate) des letzten Rebuilds. Ob eine Koordinate zum
     /// Ladefenster gehoert, ist ein O(1)-Arithmetik-Praedikat gegen dieses Zentrum
     /// (`Self::in_window`) - es existiert bewusst KEINE materialisierte "Soll-Menge" mehr: das
@@ -163,11 +175,13 @@ pub struct ChunkManager {
 }
 
 impl ChunkManager {
-    /// `config.dev.chunk_pool_size` ist bereits in `EngineConfig` auf das Ladevolumen der Render-Distanz
-    /// normalisiert (s. `EngineConfig::normalized`) - Renderer-Buffer (`chunk_meta_buffer` etc.) und
-    /// Pool arbeiten dadurch garantiert mit derselben Slot-Anzahl. Jeder Chunk belegt 64 KiB RAM.
-    pub fn new(config: &EngineConfig) -> Self {
-        let pool_size = config.dev.chunk_pool_size;
+    /// `ring.pool_size` ist bereits in `EngineConfig::lod_ring_runtimes` auf das Ladevolumen DIESES
+    /// Rings normalisiert, `ring.pool_slot_base` auf seinen Anteil am gemeinsamen
+    /// `ChunkRenderer`-Adressraum - beide garantiert konsistent mit den Renderer-Buffern
+    /// (`chunk_meta_buffer` etc.), die exakt `EngineConfig::total_chunk_pool_size` gross sind. Jeder
+    /// Chunk belegt 64 KiB RAM, unabhaengig von `voxel_scale` (identische `[u16; 32768]`-Groesse).
+    pub fn new(config: &EngineConfig, ring: &LodRingRuntime) -> Self {
+        let pool_size = ring.pool_size;
         let pool = (0..pool_size).map(|_| Some(Box::new(Chunk::empty()))).collect();
         let pool_free_list = (0..pool_size).collect();
         let (result_tx, result_rx) = channel();
@@ -180,8 +194,10 @@ impl ChunkManager {
             generator: Arc::new(TerrainGenerator::new(config)),
             result_tx,
             result_rx,
-            render_distance_chunks: config.player.render_distance_chunks,
-            vertical_render_distance_chunks: config.player.vertical_render_distance_chunks,
+            render_distance_chunks: ring.render_distance_chunks,
+            vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
+            voxel_scale: ring.voxel_scale,
+            pool_slot_base: ring.pool_slot_base,
             last_center: None,
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
@@ -202,6 +218,11 @@ impl ChunkManager {
 
     pub fn generator(&self) -> &Arc<TerrainGenerator> {
         &self.generator
+    }
+
+    #[inline(always)]
+    fn chunk_origin(&self, coord: ChunkCoord) -> glam::Vec3 {
+        chunk_origin_scaled(coord, self.voxel_scale)
     }
 
     #[inline(always)]
@@ -312,12 +333,13 @@ impl ChunkManager {
         renderer.free_chunk(&old_handle);
         let new_handle = renderer.alloc_chunk(queue, &mesh);
 
+        let gpu_pool_slot = self.pool_slot_base + pool_slot;
         if is_empty {
-            renderer.clear_chunk_meta(queue, pool_slot);
+            renderer.clear_chunk_meta(queue, gpu_pool_slot);
         } else {
-            let min = chunk_origin(coord);
-            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
-            renderer.update_chunk_meta(queue, pool_slot, min, max, &new_handle);
+            let min = self.chunk_origin(coord);
+            let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
+            renderer.update_chunk_meta(queue, gpu_pool_slot, min, max, self.voxel_scale as f32, &new_handle);
         }
 
         if let Some(loaded) = self.loaded.get_mut(&coord) {
@@ -327,19 +349,15 @@ impl ChunkManager {
         self.shadow_set_dirty = true;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn update(
-        &mut self,
-        camera_position: glam::Vec3,
-        cascades: &[Cascade; MAX_SHADOW_CASCADES],
-        cascade_count: u32,
-        queue: &wgpu::Queue,
-        renderer: &mut ChunkRenderer,
-    ) {
+    /// Streaming-Update fuer EINEN Ring: Pool/Ladefenster/Dispatch/Entladen. Schatten-Sichtbarkeit
+    /// ist bewusst NICHT Teil dieser Methode (s. `update_shadow_visibility`) - nur LOD0 wirft
+    /// Schatten, der Aufrufer (`WorldStreamer`) ruft sie deshalb gezielt nur fuer Ring 0 auf.
+    pub fn update(&mut self, camera_position: glam::Vec3, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
+        let step = CHUNK_SIZE * self.voxel_scale;
         let center = (
-            (camera_position.x / CHUNK_SIZE as f32).floor() as i32,
-            (camera_position.y / CHUNK_SIZE as f32).floor() as i32,
-            (camera_position.z / CHUNK_SIZE as f32).floor() as i32,
+            (camera_position.x / step as f32).floor() as i32,
+            (camera_position.y / step as f32).floor() as i32,
+            (camera_position.z / step as f32).floor() as i32,
         );
 
         self.apply_completed_generations(center, queue, renderer);
@@ -351,7 +369,6 @@ impl ChunkManager {
 
         self.drain_unloads(center, queue, renderer);
         self.dispatch_pending();
-        self.update_shadow_visibility(cascades, cascade_count, queue, renderer);
     }
 
     /// Fenster-Rebuild beim Betreten eines neuen Kamera-Chunks. Neu zu ladende Chunks werden
@@ -474,9 +491,18 @@ impl ChunkManager {
 
             let generator = Arc::clone(&self.generator);
             let tx = self.result_tx.clone();
+            let voxel_scale = self.voxel_scale;
 
             rayon::spawn(move || {
-                generator.generate_chunk(coord.0, coord.1, coord.2, &mut chunk);
+                // LOD-Ringe (voxel_scale > 1) nutzen den schlanken `generate_lod_chunk`-Pfad (keine
+                // Hoehlen/Baeume, s. `generator/lod.rs`) - der teure `boundary_planes`-Batch lohnt
+                // sich dort nicht, `is_solid_lod` ist bereits guenstig genug fuer den direkten
+                // Mesher-Fallback-Aufruf.
+                if voxel_scale == 1 {
+                    generator.generate_chunk(coord.0, coord.1, coord.2, &mut chunk);
+                } else {
+                    generator.generate_lod_chunk(coord.0, coord.1, coord.2, voxel_scale, &mut chunk);
+                }
 
                 // Reine Luft-Chunks (z.B. weit oberhalb des Terrains) erzeugen ohnehin keine
                 // Faces - das teure Greedy-Meshing (6 Richtungen * 32 Ebenen) lohnt sich dafuer
@@ -484,7 +510,7 @@ impl ChunkManager {
                 let is_empty = chunk.is_empty();
                 let mesh = if is_empty {
                     DirectionalMesh::default()
-                } else {
+                } else if voxel_scale == 1 {
                     // Keine Nachbar-Referenzen moeglich (anderer Thread, s. Kommentar an
                     // `ChunkManager::neighbor_chunk_refs`) - `compute_exposure` faellt fuer ALLE 6
                     // Seiten auf die prozedurale Welt-Vorhersage zurueck. Statt bis zu 6144
@@ -512,6 +538,15 @@ impl ChunkManager {
                             planes.pos_z[(world_x - ox) as usize][(world_y - oy) as usize]
                         }
                     })
+                } else {
+                    // LOD-Randabfrage: mesher-lokale Koordinaten sind hier "Chunk-Koordinate *
+                    // CHUNK_SIZE + Offset" in NATIVEN (voxel_scale-freien) Einheiten - mit
+                    // `voxel_scale` multipliziert ergeben sie exakt die echte Weltkoordinate (die
+                    // Chunk-Ursprungs-Skalierung UND der lokale Schritt sind beide affin in
+                    // `voxel_scale`, die Multiplikation verteilt sich also korrekt).
+                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, [None; 6], move |wx, wy, wz| {
+                        generator.is_solid_lod(wx * voxel_scale, wy * voxel_scale, wz * voxel_scale)
+                    })
                 };
 
                 let _ = tx.send(GenerationResult { coord, pool_slot, chunk, mesh, is_empty });
@@ -525,7 +560,7 @@ impl ChunkManager {
     /// Chunk-Menge geaendert hat oder eine Kaskaden-Kugel weiter als ihren Slack gewandert ist -
     /// dazwischen bleibt die zuletzt hochgeladene (dank Aufblaehung garantiert vollstaendige)
     /// Obermenge einfach stehen, der Main-Thread fasst pro Frame keinen einzigen Chunk an.
-    fn update_shadow_visibility(
+    pub fn update_shadow_visibility(
         &mut self,
         cascades: &[Cascade; MAX_SHADOW_CASCADES],
         cascade_count: u32,
@@ -549,8 +584,8 @@ impl ChunkManager {
             if loaded.is_empty {
                 continue;
             }
-            let min = chunk_origin(*coord);
-            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            let min = self.chunk_origin(*coord);
+            let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
             let relevant = active
                 .iter()
                 .any(|c| sphere_intersects_aabb(c.center, c.radius + shadow_cascade_slack(c.radius), min, max));
@@ -587,13 +622,14 @@ impl ChunkManager {
             }
 
             let gpu_handle = renderer.alloc_chunk(queue, &result.mesh);
+            let gpu_pool_slot = self.pool_slot_base + result.pool_slot;
 
             if result.is_empty {
-                renderer.clear_chunk_meta(queue, result.pool_slot);
+                renderer.clear_chunk_meta(queue, gpu_pool_slot);
             } else {
-                let min = chunk_origin(result.coord);
-                let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
-                renderer.update_chunk_meta(queue, result.pool_slot, min, max, &gpu_handle);
+                let min = self.chunk_origin(result.coord);
+                let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
+                renderer.update_chunk_meta(queue, gpu_pool_slot, min, max, self.voxel_scale as f32, &gpu_handle);
             }
 
             self.pool[result.pool_slot] = Some(result.chunk);
@@ -618,7 +654,7 @@ impl ChunkManager {
         };
 
         renderer.free_chunk(&loaded.gpu_handle);
-        renderer.clear_chunk_meta(queue, loaded.pool_slot);
+        renderer.clear_chunk_meta(queue, self.pool_slot_base + loaded.pool_slot);
 
         // Kein `chunk.clear()` hier: `generate_chunk` beginnt selbst mit `clear()`, und zwischen
         // Freigabe und Neuvergabe liest niemand den Pool-Slot (`is_solid_at` prueft `loaded`
@@ -650,7 +686,12 @@ mod tests {
 
     #[test]
     fn chunk_origin_matches_chunk_coord_times_size() {
-        assert_eq!(chunk_origin((1, -1, 2)), glam::Vec3::new(32.0, -32.0, 64.0));
+        assert_eq!(chunk_origin_scaled((1, -1, 2), 1), glam::Vec3::new(32.0, -32.0, 64.0));
+    }
+
+    #[test]
+    fn chunk_origin_scales_with_voxel_scale() {
+        assert_eq!(chunk_origin_scaled((1, -1, 2), 4), glam::Vec3::new(128.0, -128.0, 256.0));
     }
 
     #[test]
