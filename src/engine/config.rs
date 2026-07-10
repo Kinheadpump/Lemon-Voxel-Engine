@@ -106,23 +106,26 @@ pub struct EngineConfig {
     pub terrain_desert_humidity_max: f32,
     pub terrain_sea_compression_range: f32,
     pub terrain_sea_compression_exponent: f32,
-    pub terrain_cave_frequency: f32,
-    /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) werden zu Hoehlen.
-    pub terrain_cave_threshold: f32,
-    /// Frequenz des 2D-Gates, das entscheidet, ob eine Region ueberhaupt Worley-Tunnel bekommt.
+    /// Niedrige Frequenz fuer grosse, ausgedehnte Cheese Caves statt kleiner Blasen.
+    pub terrain_cheese_frequency: f32,
+    /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) werden zu Cheese-Cave-Hohlraum.
+    pub terrain_cheese_threshold: f32,
+    pub terrain_tunnel_frequency: f32,
+    /// `WorleyDifference`-Werte (unorm, ueblicherweise klein) unterhalb dieser Schwelle werden zu
+    /// Tunnel - s. `calibrate_cave_thresholds` zum empirischen Kalibrieren.
+    pub terrain_tunnel_threshold: f32,
+    /// Bloecke unterhalb `SEA_LEVEL`, ueber die BEIDE Hoehlensysteme ihre maximale Verbreiterung
+    /// erreichen - ein gemeinsamer Tiefenfaktor fuer Cheese Caves UND Tunnel.
+    pub terrain_cave_widen_depth_range: f32,
+    /// Um wie viel `terrain_cheese_threshold` in maximaler Tiefe sinkt (groessere Kavernen).
+    pub terrain_cheese_widen_amount: f32,
+    /// Faktor, um den `terrain_tunnel_threshold` in maximaler Tiefe multipliziert wird (breitere
+    /// Roehren).
+    pub terrain_tunnel_widen_multiplier: f32,
+    /// Frequenz des 2D-Gates, das entscheidet, ob eine Region ueberhaupt Tunnel bekommt.
     pub terrain_cave_region_frequency: f32,
     /// Perlin-Werte oberhalb dieser Schwelle (Bereich -1..1) gelten als "Hoehlen-aktive" Region.
     pub terrain_cave_region_threshold: f32,
-    pub terrain_tunnel_frequency: f32,
-    /// `WorleyDifference`-Werte (unorm 0..1) unterhalb dieser Schwelle werden zu Tunnel.
-    pub terrain_tunnel_threshold: f32,
-    /// Bloecke unterhalb `SEA_LEVEL`, ueber die die Tunnel-Verbreiterung ihr Maximum erreicht.
-    pub terrain_tunnel_widen_depth_range: f32,
-    /// Faktor, um den `terrain_tunnel_threshold` in maximaler Tiefe multipliziert wird.
-    pub terrain_tunnel_widen_max_multiplier: f32,
-    /// Frequenz des feineren Verbindungs-Tunnelsystems (hoeher als `terrain_tunnel_frequency`).
-    pub terrain_connector_frequency: f32,
-    pub terrain_connector_threshold: f32,
     pub terrain_dirt_layer_depth: i32,
     pub terrain_noise_origin_offset: f32,
 
@@ -224,27 +227,27 @@ impl Default for EngineConfig {
             // eine riesige flache Sandebene zu erzeugen.
             terrain_sea_compression_range: 6.0,
             terrain_sea_compression_exponent: 1.3,
-            terrain_cave_frequency: 0.05,
-            terrain_cave_threshold: 0.6,
-            // Grosse Regionen (~500 Bloecke/Feature). Schwelle 0.3 empirisch kalibriert (s.
-            // `TerrainGenerator::tests::calibrate_tunnel_thresholds`) auf ca. das obere Viertel der
-            // Perlin-Verteilung - haelt Tunnelnetze regional konzentriert statt ueberall gleich
-            // dicht UND spart die teure Worley-Auswertung im Rest des Untergrunds komplett.
+            // Niedrige Frequenz (~50 Bloecke/Feature, gegenueber vorher 20) fuer grosse, ausgedehnte
+            // Kavernen statt kleiner Blasen. Schwelle empirisch kalibriert, s.
+            // `calibrate_cave_thresholds`.
+            terrain_cheese_frequency: 0.02,
+            terrain_cheese_threshold: 0.62,
+            // Feature-Groesse ~35 Bloecke. `WorleyDifference` ist NICHT uniform verteilt (kleine
+            // Werte = nahe Zellgrenze sind selten, Median liegt bei ~0.046!) - Schwelle empirisch
+            // kalibriert, s. `calibrate_cave_thresholds` (p1=0.0007, p2=0.0015, p5=0.0037), NICHT
+            // geraten. 0.0012 (~p1.5) haelt Tunnel duenn statt den kompletten Zellraum auszuhoehlen.
+            terrain_tunnel_frequency: 0.028,
+            terrain_tunnel_threshold: 0.0012,
+            // Gemeinsamer Tiefenfaktor fuer beide Systeme - ab hier (Bloecke unter Meeresspiegel)
+            // volle Verbreiterung.
+            terrain_cave_widen_depth_range: 150.0,
+            terrain_cheese_widen_amount: 0.12,
+            terrain_tunnel_widen_multiplier: 1.5,
+            // Grosse Regionen (~500 Bloecke/Feature). Schwelle 0.3 haelt Tunnelnetze regional
+            // konzentriert (Karstgebiet-Charakter) statt ueberall gleich dicht UND spart die teure
+            // Worley-Auswertung im Rest des Untergrunds komplett.
             terrain_cave_region_frequency: 0.002,
             terrain_cave_region_threshold: 0.3,
-            // Feature-Groesse ~35 Bloecke fuers Hauptnetz. Schwellen empirisch gegen die
-            // tatsaechliche Verteilung von `max(|a|,|b|)` zweier 3D-Perlin-Karten kalibriert (s.
-            // `calibrate_tunnel_thresholds`: p2=0.069, p5=0.121) - 0.08 (~p2.5) ergibt duenne,
-            // wurmartige Roehren; die Tiefenverbreiterung (x2.5 in maximaler Tiefe) oeffnet sie
-            // unten zu begehbaren Kavernen (~p10).
-            terrain_tunnel_frequency: 0.028,
-            terrain_tunnel_threshold: 0.08,
-            terrain_tunnel_widen_depth_range: 150.0,
-            terrain_tunnel_widen_max_multiplier: 1.5,
-            // Hoehere Frequenz (~17 Bloecke) fuers Verbindungsnetz - kuerzere, engere Wuermer als
-            // Querverbindungen und Oberflaecheneingaenge, bewusst duenner (~p1.5) als das Hauptnetz.
-            terrain_connector_frequency: 0.06,
-            terrain_connector_threshold: 0.05,
             terrain_dirt_layer_depth: 3,
             terrain_noise_origin_offset: 10_000.0,
 
@@ -426,16 +429,15 @@ struct ConfigFile {
     terrain_desert_humidity_max: f32,
     terrain_sea_compression_range: f32,
     terrain_sea_compression_exponent: f32,
-    terrain_cave_frequency: f32,
-    terrain_cave_threshold: f32,
-    terrain_cave_region_frequency: f32,
-    terrain_cave_region_threshold: f32,
+    terrain_cheese_frequency: f32,
+    terrain_cheese_threshold: f32,
     terrain_tunnel_frequency: f32,
     terrain_tunnel_threshold: f32,
-    terrain_tunnel_widen_depth_range: f32,
-    terrain_tunnel_widen_max_multiplier: f32,
-    terrain_connector_frequency: f32,
-    terrain_connector_threshold: f32,
+    terrain_cave_widen_depth_range: f32,
+    terrain_cheese_widen_amount: f32,
+    terrain_tunnel_widen_multiplier: f32,
+    terrain_cave_region_frequency: f32,
+    terrain_cave_region_threshold: f32,
     terrain_dirt_layer_depth: i32,
     terrain_noise_origin_offset: f32,
 
@@ -527,16 +529,15 @@ impl From<EngineConfig> for ConfigFile {
             terrain_desert_humidity_max: c.terrain_desert_humidity_max,
             terrain_sea_compression_range: c.terrain_sea_compression_range,
             terrain_sea_compression_exponent: c.terrain_sea_compression_exponent,
-            terrain_cave_frequency: c.terrain_cave_frequency,
-            terrain_cave_threshold: c.terrain_cave_threshold,
-            terrain_cave_region_frequency: c.terrain_cave_region_frequency,
-            terrain_cave_region_threshold: c.terrain_cave_region_threshold,
+            terrain_cheese_frequency: c.terrain_cheese_frequency,
+            terrain_cheese_threshold: c.terrain_cheese_threshold,
             terrain_tunnel_frequency: c.terrain_tunnel_frequency,
             terrain_tunnel_threshold: c.terrain_tunnel_threshold,
-            terrain_tunnel_widen_depth_range: c.terrain_tunnel_widen_depth_range,
-            terrain_tunnel_widen_max_multiplier: c.terrain_tunnel_widen_max_multiplier,
-            terrain_connector_frequency: c.terrain_connector_frequency,
-            terrain_connector_threshold: c.terrain_connector_threshold,
+            terrain_cave_widen_depth_range: c.terrain_cave_widen_depth_range,
+            terrain_cheese_widen_amount: c.terrain_cheese_widen_amount,
+            terrain_tunnel_widen_multiplier: c.terrain_tunnel_widen_multiplier,
+            terrain_cave_region_frequency: c.terrain_cave_region_frequency,
+            terrain_cave_region_threshold: c.terrain_cave_region_threshold,
             terrain_dirt_layer_depth: c.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: c.terrain_noise_origin_offset,
 
@@ -624,16 +625,15 @@ impl From<ConfigFile> for EngineConfig {
             terrain_desert_humidity_max: f.terrain_desert_humidity_max,
             terrain_sea_compression_range: f.terrain_sea_compression_range.max(1.0),
             terrain_sea_compression_exponent: f.terrain_sea_compression_exponent.max(1.0),
-            terrain_cave_frequency: f.terrain_cave_frequency,
-            terrain_cave_threshold: f.terrain_cave_threshold,
-            terrain_cave_region_frequency: f.terrain_cave_region_frequency,
-            terrain_cave_region_threshold: f.terrain_cave_region_threshold,
+            terrain_cheese_frequency: f.terrain_cheese_frequency,
+            terrain_cheese_threshold: f.terrain_cheese_threshold,
             terrain_tunnel_frequency: f.terrain_tunnel_frequency,
             terrain_tunnel_threshold: f.terrain_tunnel_threshold,
-            terrain_tunnel_widen_depth_range: f.terrain_tunnel_widen_depth_range.max(1.0),
-            terrain_tunnel_widen_max_multiplier: f.terrain_tunnel_widen_max_multiplier.max(0.0),
-            terrain_connector_frequency: f.terrain_connector_frequency,
-            terrain_connector_threshold: f.terrain_connector_threshold,
+            terrain_cave_widen_depth_range: f.terrain_cave_widen_depth_range.max(1.0),
+            terrain_cheese_widen_amount: f.terrain_cheese_widen_amount.max(0.0),
+            terrain_tunnel_widen_multiplier: f.terrain_tunnel_widen_multiplier.max(0.0),
+            terrain_cave_region_frequency: f.terrain_cave_region_frequency,
+            terrain_cave_region_threshold: f.terrain_cave_region_threshold,
             terrain_dirt_layer_depth: f.terrain_dirt_layer_depth,
             terrain_noise_origin_offset: f.terrain_noise_origin_offset,
 
