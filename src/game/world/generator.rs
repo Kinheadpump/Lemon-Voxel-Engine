@@ -176,6 +176,10 @@ pub struct TerrainGenerator {
     /// Strikte 2D-Biom-Achsen: Wueste nur bei hoher Temperatur UND geringer Feuchtigkeit.
     desert_temperature_min: f32,
     desert_humidity_max: f32,
+    /// Schwelle fuer die Schneedecke im Hochgebirge (`ColumnSurface::is_snow`): NUR Spalten
+    /// oberhalb der Fels-Grenze (`is_rock`) UND kaelter als dieser Wert bekommen Schnee statt
+    /// blankem Fels - warme Hochgebirge (z.B. Wuesten-Massive) bleiben Stein.
+    snow_temperature_max: f32,
     /// Grosse Cheese Caves: 3D-Perlin-Cutoff mit niedriger Frequenz (ausgedehnte Kavernen statt
     /// kleiner Blasen). Ungegatet - ueberall im Untergrund praesent.
     cheese: Noise<common_noise::Perlin>,
@@ -246,6 +250,7 @@ impl TerrainGenerator {
             pyramid: TerrainPyramid::new(config),
             desert_temperature_min: config.dev.terrain_desert_temperature_min,
             desert_humidity_max: config.dev.terrain_desert_humidity_max,
+            snow_temperature_max: config.dev.terrain_snow_temperature_max,
             cheese,
             cheese_frequency: config.dev.terrain_cheese_frequency,
             cheese_threshold: config.dev.terrain_cheese_threshold,
@@ -1555,12 +1560,14 @@ impl TerrainGenerator {
     fn column_surface(&self, world_x: i32, world_z: i32, height: i32) -> ColumnSurface {
         let sample = self.pyramid.sample(world_x, world_z);
         let rock_height = ROCK_HEIGHT + sample.temperature * ROCK_HEIGHT_TEMPERATURE_DITHER;
+        let is_rock = height as f32 > rock_height;
         ColumnSurface {
             is_beach: (height - WATER_LEVEL).abs() <= BEACH_HALF_RANGE,
             is_underwater: height < WATER_LEVEL,
             is_desert: sample.temperature > self.desert_temperature_min
                 && sample.humidity < self.desert_humidity_max,
-            is_rock: height as f32 > rock_height,
+            is_rock,
+            is_snow: is_rock && sample.temperature < self.snow_temperature_max,
             temperature: sample.temperature,
         }
     }
@@ -1894,6 +1901,57 @@ mod tests {
 
     /// Rauschverteilung trotzdem den Grossteil des Volumens aushoehlen). Manuell ausfuehren mit:
     /// `cargo test --release --lib -- --ignored --nocapture calibrate_cave_thresholds`
+    /// Verifiziert den Schnee-Mechanismus END-TO-END im echten Generator (nicht nur in
+    /// `blocks::surface_block`s isolierten Unit-Tests) - entkoppelt von der Frage, ob die
+    /// DEFAULT-Config zufaellig hohe genug Gipfel erzeugt (reine Balancing-Frage, kein
+    /// Korrektheits-Kriterium): Kontinental-/Bergamplitude werden hier bewusst hochgedreht und
+    /// die Kontinentalskala verkuerzt, damit garantiert ueber `ROCK_HEIGHT` liegende Gipfel in
+    /// einem kleinen Suchfenster auftauchen, und die Schneeschwelle auf "immer" gesetzt.
+    #[test]
+    fn snow_appears_on_cold_high_mountains_in_generated_chunks() {
+        let mut config = EngineConfig::default();
+        config.dev.terrain_continent_scale_blocks = 64.0;
+        config.dev.terrain_continental_amplitude = 500.0;
+        config.dev.terrain_mountain_amplitude = 1000.0;
+        config.dev.terrain_mountain_exponent = 1.0;
+        config.dev.terrain_snow_temperature_max = 2.0;
+        let generator = TerrainGenerator::new(&config);
+
+        let mut found = None;
+        'search: for chunk_z in -8..8 {
+            for chunk_x in -8..8 {
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        let world_x = chunk_x * CHUNK_SIZE + local_x;
+                        let world_z = chunk_z * CHUNK_SIZE + local_z;
+                        let height = generator.height_at(world_x, world_z);
+                        let surface = generator.column_surface(world_x, world_z, height);
+                        if surface.is_snow {
+                            found = Some((world_x, height, world_z));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some((world_x, height, world_z)) = found else {
+            panic!("Keine verschneite Spalte in einem 512x512-Weltblock-Fenster gefunden trotz hochgedrehter Bergamplitude");
+        };
+
+        let chunk_y = height.div_euclid(CHUNK_SIZE);
+        let mut chunk = Chunk::empty();
+        generator.generate_chunk(world_x.div_euclid(CHUNK_SIZE), chunk_y, world_z.div_euclid(CHUNK_SIZE), &mut chunk);
+        let local_x = world_x.rem_euclid(CHUNK_SIZE);
+        let local_y = height - chunk_y * CHUNK_SIZE;
+        let local_z = world_z.rem_euclid(CHUNK_SIZE);
+        assert_eq!(
+            chunk.get_block(local_x, local_y, local_z),
+            blocks::SNOW,
+            "Spalte bei ({world_x},{height},{world_z}) war als is_snow markiert, generierte aber keinen SNOW-Block"
+        );
+    }
+
     #[test]
     #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
     fn calibrate_cave_thresholds() {

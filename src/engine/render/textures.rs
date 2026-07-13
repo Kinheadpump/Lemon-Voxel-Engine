@@ -1,5 +1,5 @@
 pub const TEXTURE_SIZE: u32 = 16;
-pub const TEXTURE_LAYER_COUNT: u32 = 8;
+pub const TEXTURE_LAYER_COUNT: u32 = 9;
 
 pub const TEXTURE_LAYER_ERROR: u32 = 0;
 pub const TEXTURE_LAYER_GRASS: u32 = 1;
@@ -9,6 +9,7 @@ pub const TEXTURE_LAYER_SAND: u32 = 4;
 pub const TEXTURE_LAYER_WATER: u32 = 5;
 pub const TEXTURE_LAYER_LOG: u32 = 6;
 pub const TEXTURE_LAYER_LEAVES: u32 = 7;
+pub const TEXTURE_LAYER_SNOW: u32 = 8;
 
 fn hash2(x: u32, y: u32, seed: u32) -> u32 {
     let mut h = x
@@ -52,6 +53,7 @@ pub fn generate_texture_atlas() -> Vec<u8> {
     generate_layer(&mut data, |x, y| speckle([38, 92, 168], 10, x, y, 5));
     generate_layer(&mut data, |x, y| speckle([92, 64, 38], 10, x, y, 6));
     generate_layer(&mut data, |x, y| speckle([46, 110, 42], 20, x, y, 7));
+    generate_layer(&mut data, |x, y| speckle([235, 240, 245], 8, x, y, 8));
 
     data
 }

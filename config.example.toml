@@ -137,6 +137,9 @@ terrain_climate_scale_blocks = 1024.0
 # Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
 terrain_desert_temperature_min = 0.25
 terrain_desert_humidity_max = -0.05
+# Schneedecke im Hochgebirge NUR wenn Temperatur (snorm -1..1) unter diesem Wert liegt - hoehere
+# Werte lassen mehr Gipfel verschneit wirken, statt blankem Fels.
+terrain_snow_temperature_max = 0.0
 # Draengt Hoehen nahe der Wasserlinie sanft Richtung Meereshoehe (flache Straende), laesst
 # Werte jenseits der Range linear weiterlaufen (Gebirge/Tiefsee werden nicht gedeckelt).
 terrain_sea_compression_range = 6.0

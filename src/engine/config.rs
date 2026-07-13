@@ -137,6 +137,9 @@ pub struct DevSettings {
     /// Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
     pub terrain_desert_temperature_min: f32,
     pub terrain_desert_humidity_max: f32,
+    /// Schneedecke im Hochgebirge NUR wenn Temperatur (snorm -1..1) unter diesem Wert liegt -
+    /// s. `ColumnSurface::is_snow`. Hoehere Werte lassen mehr Gipfel verschneit wirken.
+    pub terrain_snow_temperature_max: f32,
     pub terrain_sea_compression_range: f32,
     pub terrain_sea_compression_exponent: f32,
     /// Niedrige Frequenz fuer grosse, ausgedehnte Cheese Caves statt kleiner Blasen.
@@ -302,6 +305,9 @@ impl Default for DevSettings {
             terrain_climate_scale_blocks: 1024.0,
             terrain_desert_temperature_min: 0.25,
             terrain_desert_humidity_max: -0.05,
+            // Etwas unter dem Mittelwert (0.0) - kaeltere Haelfte der Hochgebirgs-Spalten wird
+            // verschneit, waermere bleibt blanker Fels (z.B. Wuesten-Massive).
+            terrain_snow_temperature_max: 0.0,
             // SANFT und SCHMAL: glaettet nur die unmittelbare Wasserlinie (±6 Bloecke, Exp 1.3),
             // statt wie zuvor (±20, Exp 2.2) das halbe Relief auf Meereshoehe zu quetschen und damit
             // eine riesige flache Sandebene zu erzeugen.
@@ -530,6 +536,7 @@ struct DevSettingsFile {
     terrain_climate_scale_blocks: f32,
     terrain_desert_temperature_min: f32,
     terrain_desert_humidity_max: f32,
+    terrain_snow_temperature_max: f32,
     terrain_sea_compression_range: f32,
     terrain_sea_compression_exponent: f32,
     terrain_cheese_frequency: f32,
@@ -695,6 +702,7 @@ impl From<DevSettings> for DevSettingsFile {
             terrain_climate_scale_blocks: d.terrain_climate_scale_blocks,
             terrain_desert_temperature_min: d.terrain_desert_temperature_min,
             terrain_desert_humidity_max: d.terrain_desert_humidity_max,
+            terrain_snow_temperature_max: d.terrain_snow_temperature_max,
             terrain_sea_compression_range: d.terrain_sea_compression_range,
             terrain_sea_compression_exponent: d.terrain_sea_compression_exponent,
             terrain_cheese_frequency: d.terrain_cheese_frequency,
@@ -786,6 +794,7 @@ impl From<DevSettingsFile> for DevSettings {
             terrain_climate_scale_blocks: f.terrain_climate_scale_blocks.max(64.0),
             terrain_desert_temperature_min: f.terrain_desert_temperature_min,
             terrain_desert_humidity_max: f.terrain_desert_humidity_max,
+            terrain_snow_temperature_max: f.terrain_snow_temperature_max,
             terrain_sea_compression_range: f.terrain_sea_compression_range.max(1.0),
             terrain_sea_compression_exponent: f.terrain_sea_compression_exponent.max(1.0),
             terrain_cheese_frequency: f.terrain_cheese_frequency,
