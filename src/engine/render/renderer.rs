@@ -495,19 +495,17 @@ impl ChunkRenderer {
     /// Schreibt/aktualisiert den Cull-Metadaten-Eintrag eines Chunks - Index ist der `pool_slot`
     /// aus `ChunkManager`, NICHT ein kompaktierter Zaehler (Alloc/Free adressieren so direkt per
     /// Index statt eine GPU-seitige Liste pflegen zu muessen).
-    #[allow(clippy::too_many_arguments)]
     pub fn update_chunk_meta(
         &self,
         queue: &wgpu::Queue,
         pool_slot: usize,
         aabb_min: glam::Vec3,
         aabb_max: glam::Vec3,
-        voxel_scale: f32,
         handle: &ChunkGpuHandle,
     ) {
         let meta = ChunkMetaGpu {
             aabb_min: [aabb_min.x, aabb_min.y, aabb_min.z, 1.0],
-            aabb_max: [aabb_max.x, aabb_max.y, aabb_max.z, voxel_scale],
+            aabb_max: [aabb_max.x, aabb_max.y, aabb_max.z, 0.0],
             slots: std::array::from_fn(|dir| [handle.slots[dir].offset, handle.slots[dir].count]),
         };
         queue.write_buffer(&self.chunk_meta_buffer, pool_slot as u64 * CHUNK_META_STRIDE_BYTES, bytemuck::bytes_of(&meta));

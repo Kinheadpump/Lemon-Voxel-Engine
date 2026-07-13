@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use glam::IVec3;
 
-use crate::engine::config::{EngineConfig, LodRingRuntime};
+use crate::engine::config::EngineConfig;
 use crate::engine::core::mesher::{DirectionalMesh, NEIGHBOR_OFFSETS, mesh_chunk};
 use crate::engine::render::renderer::{ChunkGpuHandle, ChunkRenderer};
 use crate::game::math::cascades::{Cascade, MAX_SHADOW_CASCADES};
@@ -79,64 +79,28 @@ struct GenerationResult {
     is_empty: bool,
 }
 
-/// Welt-Ursprung eines Chunks IN DIESEM Ring - `voxel_scale=1` fuer LOD0 (identisch zum bisherigen
-/// Verhalten), bei LOD-Ringen deckt sowohl die Chunk-Koordinate als auch jeder lokale Schritt
-/// `voxel_scale` Weltbloecke ab (s. `generator/lod.rs`).
-fn chunk_origin_scaled(coord: ChunkCoord, voxel_scale: i32) -> glam::Vec3 {
-    let step = (CHUNK_SIZE * voxel_scale) as f32;
+fn chunk_origin(coord: ChunkCoord) -> glam::Vec3 {
+    let step = CHUNK_SIZE as f32;
     glam::Vec3::new(coord.0 as f32 * step, coord.1 as f32 * step, coord.2 as f32 * step)
 }
 
-/// Ladefenster-Praedikat EINES Rings: eine quadratische SCHALE (`outer_h`/`outer_v` nach aussen,
-/// `inner_h`/`inner_v` nach innen ausgestanzt) um die ECHTE (nicht auf ein Chunk-Gitter
-/// gerundete) Kamera-Position - NICHT ein voller Kubus, sonst wuerden sich alle LOD-Ringe im
-/// Kamera-Nahbereich komplett ueberlappen.
-///
-/// KRITISCH: alle Radien sind Weltbloecke, nicht ring-lokale Chunk-Indizes. Eine fruehere Version
-/// masz den inneren/aeusseren Radius relativ zum GITTER-QUANTISIERTEN Zentrum jedes Rings
-/// (`floor(kamera / (CHUNK_SIZE*voxel_scale))`) - LOD0 (Schrittweite 32) und LOD1 (Schrittweite
-/// 128) runden die Kameraposition dabei auf UNTERSCHIEDLICHE Gitter, ihre quantisierten Zentren
-/// koennen um bis zu `schrittweite-1` Weltbloecke auseinanderlaufen. Die Ausschlussgrenze eines
-/// Rings und die Aussengrenze seines Nachbarn stimmten dadurch nie exakt ueberein - je nachdem, wo
-/// die Kamera gerade innerhalb ihrer jeweiligen Gitterzelle stand, entstand eine sichtbare Luecke
-/// ODER eine Ueberlappung ("massive Chunk-Luecken"). Mit einer einzigen, kontinuierlichen
-/// Kamera-Position UND `inner_*` eines Rings == `outer_*` des naechst-feineren Rings (identische
-/// Formel, s. `EngineConfig::lod_ring_runtimes`) schliessen sich die Ringe exakt aneinander an.
+/// Ladefenster-Praedikat: Chunk-AABB schneidet den Quader (`outer_h` horizontal, `outer_v`
+/// vertikal, IN WELTBLOECKEN) um die ECHTE (nicht auf ein Chunk-Gitter gerundete) Kamera-Position.
 ///
 /// Freie Funktion statt Methode, damit sie auch dort aufrufbar ist, wo `self.loaded`/
 /// `self.pending_set` bereits mutably geborgt sind (`rebuild_load_window`).
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn in_ring_box(
-    coord: ChunkCoord,
-    voxel_scale: i32,
-    camera: glam::Vec3,
-    inner_h: f32,
-    inner_v: f32,
-    outer_h: f32,
-    outer_v: f32,
-) -> bool {
-    let min = chunk_origin_scaled(coord, voxel_scale);
-    let step = (CHUNK_SIZE * voxel_scale) as f32;
-    let max = min + glam::Vec3::splat(step);
+fn in_load_window(coord: ChunkCoord, camera: glam::Vec3, outer_h: f32, outer_v: f32) -> bool {
+    let min = chunk_origin(coord);
+    let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
 
-    let intersects_outer = |min_a: f32, max_a: f32, camera_a: f32, radius: f32| {
+    let intersects = |min_a: f32, max_a: f32, camera_a: f32, radius: f32| {
         min_a < camera_a + radius && max_a > camera_a - radius
     };
-    let fully_inside_inner = |min_a: f32, max_a: f32, camera_a: f32, radius: f32| {
-        min_a >= camera_a - radius && max_a <= camera_a + radius
-    };
 
-    let outer = intersects_outer(min.x, max.x, camera.x, outer_h)
-        && intersects_outer(min.y, max.y, camera.y, outer_v)
-        && intersects_outer(min.z, max.z, camera.z, outer_h);
-    if !outer {
-        return false;
-    }
-    let inner = fully_inside_inner(min.x, max.x, camera.x, inner_h)
-        && fully_inside_inner(min.y, max.y, camera.y, inner_v)
-        && fully_inside_inner(min.z, max.z, camera.z, inner_h);
-    !inner
+    intersects(min.x, max.x, camera.x, outer_h)
+        && intersects(min.y, max.y, camera.y, outer_v)
+        && intersects(min.z, max.z, camera.z, outer_h)
 }
 
 fn sphere_intersects_aabb(center: glam::Vec3, radius: f32, min: glam::Vec3, max: glam::Vec3) -> bool {
@@ -186,36 +150,13 @@ pub struct ChunkManager {
     result_rx: Receiver<GenerationResult>,
     render_distance_chunks: i32,
     vertical_render_distance_chunks: i32,
-    /// 1 fuer LOD0, sonst der Weltblock-Faktor dieses Rings (s. `generator/lod.rs`/
-    /// `LodRingRuntime`) - bestimmt Generierungspfad (`generate_chunk` vs. `generate_lod_chunk`)
-    /// UND die Chunk-Weltgroesse (`CHUNK_SIZE * voxel_scale`).
-    voxel_scale: i32,
-    /// Offset dieses Rings im GEMEINSAMEN `chunk_meta_buffer`-Adressraum des `ChunkRenderer` - lokale
-    /// `pool`-Indices (0..pool_size) werden nur bei GPU-Aufrufen (`update_chunk_meta`/
-    /// `clear_chunk_meta`) um diesen Wert verschoben, sonst bleibt der Ring komplett unabhaengig.
-    pool_slot_base: usize,
-    /// Macht aus dem Ladefenster eine quadratische SCHALE statt eines vollen Kubus - Weltbloecke
-    /// innerhalb dieses Radius um die Kamera sind bereits vom naechst-feineren Ring abgedeckt und
-    /// werden NICHT geladen. IN WELTBLOECKEN (nicht ring-lokalen Chunk-Einheiten!) und identisch
-    /// zum `outer_radius_world_*` des naechst-feineren Rings - nur so schliessen die Ringe exakt
-    /// aneinander an, s. `in_ring_box`-Kommentar. 0 fuer LOD0.
-    inner_exclusion_world_h: f32,
-    inner_exclusion_world_v: f32,
     /// `render_distance_chunks`/`vertical_render_distance_chunks` in Weltbloecken - einmal
     /// vorberechnet, da bei jedem `rebuild_load_window`/`drain_unloads`/
     /// `apply_completed_generations`-Aufruf gebraucht.
     outer_radius_world_h: f32,
     outer_radius_world_v: f32,
-    /// Kamera-Zelle (IMMER in LOD0-Granularitaet `CHUNK_SIZE`, NIE `CHUNK_SIZE*voxel_scale`) beim
-    /// letzten Rebuild - loest `rebuild_load_window` nur beim Ueberqueren einer 32-Block-Zelle aus,
-    /// statt jeden Frame komplett neu zu scannen. BEWUSST auf der feinsten Granularitaet fuer ALLE
-    /// Ringe (nicht der eigenen, bei Zusatz-Ringen viel groesseren Schrittweite) - sonst haengt ein
-    /// grober Ring der Kamera um bis zu seiner eigenen Schrittweite hinterher, waehrend der
-    /// naechst-feinere Ring (der haeufiger neu baut) sein Fenster schon weitergezogen hat. Die
-    /// Ausschlussgrenze des groben Rings bleibt dann zeitweise stehen, waehrend sich die Aussengrenze
-    /// des feinen Rings schon wegbewegt - eine Luecke dazwischen, die erst schliesst, wenn der grobe
-    /// Ring endlich seinen eigenen (seltenen) Rebuild ausloest ("Luecken, die beim Naehern
-    /// zurueckspringen").
+    /// Kamera-Zelle beim letzten Rebuild - loest `rebuild_load_window` nur beim Ueberqueren einer
+    /// Chunk-Gitterzelle aus, statt jeden Frame komplett neu zu scannen.
     last_trigger_cell: Option<ChunkCoord>,
     unload_scratch: Vec<ChunkCoord>,
     /// Noch nicht dispatchte, aber gewuenschte Chunks - absteigend nach Distanz zum Fenster-Zentrum
@@ -243,13 +184,11 @@ pub struct ChunkManager {
 }
 
 impl ChunkManager {
-    /// `ring.pool_size` ist bereits in `EngineConfig::lod_ring_runtimes` auf das Ladevolumen DIESES
-    /// Rings normalisiert, `ring.pool_slot_base` auf seinen Anteil am gemeinsamen
-    /// `ChunkRenderer`-Adressraum - beide garantiert konsistent mit den Renderer-Buffern
-    /// (`chunk_meta_buffer` etc.), die exakt `EngineConfig::total_chunk_pool_size` gross sind. Jeder
-    /// Chunk belegt 64 KiB RAM, unabhaengig von `voxel_scale` (identische `[u16; 32768]`-Groesse).
-    pub fn new(config: &EngineConfig, ring: &LodRingRuntime) -> Self {
-        let pool_size = ring.pool_size;
+    /// `config.dev.chunk_pool_size` ist bereits via `EngineConfig::normalized` auf mindestens das
+    /// Ladevolumen der Render-Distanz angehoben und garantiert konsistent mit den Renderer-Buffern
+    /// (`chunk_meta_buffer` etc.). Jeder Chunk belegt 64 KiB RAM (`[u16; 32768]`).
+    pub fn new(config: &EngineConfig) -> Self {
+        let pool_size = config.dev.chunk_pool_size;
         let pool = (0..pool_size).map(|_| Some(Box::new(Chunk::empty()))).collect();
         let pool_free_list = (0..pool_size).collect();
         let (result_tx, result_rx) = channel();
@@ -262,14 +201,10 @@ impl ChunkManager {
             generator: Arc::new(TerrainGenerator::new(config)),
             result_tx,
             result_rx,
-            render_distance_chunks: ring.render_distance_chunks,
-            vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
-            voxel_scale: ring.voxel_scale,
-            pool_slot_base: ring.pool_slot_base,
-            inner_exclusion_world_h: ring.inner_exclusion_world_h as f32,
-            inner_exclusion_world_v: ring.inner_exclusion_world_v as f32,
-            outer_radius_world_h: (ring.render_distance_chunks * CHUNK_SIZE * ring.voxel_scale) as f32,
-            outer_radius_world_v: (ring.vertical_render_distance_chunks * CHUNK_SIZE * ring.voxel_scale) as f32,
+            render_distance_chunks: config.player.render_distance_chunks,
+            vertical_render_distance_chunks: config.player.vertical_render_distance_chunks,
+            outer_radius_world_h: (config.player.render_distance_chunks * CHUNK_SIZE) as f32,
+            outer_radius_world_v: (config.player.vertical_render_distance_chunks * CHUNK_SIZE) as f32,
             last_trigger_cell: None,
             unload_scratch: Vec::new(),
             pending_scratch: Vec::new(),
@@ -293,21 +228,8 @@ impl ChunkManager {
     }
 
     #[inline(always)]
-    fn chunk_origin(&self, coord: ChunkCoord) -> glam::Vec3 {
-        chunk_origin_scaled(coord, self.voxel_scale)
-    }
-
-    #[inline(always)]
     fn in_window(&self, coord: ChunkCoord, camera_position: glam::Vec3) -> bool {
-        in_ring_box(
-            coord,
-            self.voxel_scale,
-            camera_position,
-            self.inner_exclusion_world_h,
-            self.inner_exclusion_world_v,
-            self.outer_radius_world_h,
-            self.outer_radius_world_v,
-        )
+        in_load_window(coord, camera_position, self.outer_radius_world_h, self.outer_radius_world_v)
     }
 
     /// PHYSIKALISCHE Voxel-Festigkeit (Kollision/Raycast) unter Beruecksichtigung geladener/
@@ -411,13 +333,12 @@ impl ChunkManager {
         renderer.free_chunk(&old_handle);
         let new_handle = renderer.alloc_chunk(queue, &mesh);
 
-        let gpu_pool_slot = self.pool_slot_base + pool_slot;
         if is_empty {
-            renderer.clear_chunk_meta(queue, gpu_pool_slot);
+            renderer.clear_chunk_meta(queue, pool_slot);
         } else {
-            let min = self.chunk_origin(coord);
-            let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
-            renderer.update_chunk_meta(queue, gpu_pool_slot, min, max, self.voxel_scale as f32, &new_handle);
+            let min = chunk_origin(coord);
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            renderer.update_chunk_meta(queue, pool_slot, min, max, &new_handle);
         }
 
         if let Some(loaded) = self.loaded.get_mut(&coord) {
@@ -427,15 +348,9 @@ impl ChunkManager {
         self.shadow_set_dirty = true;
     }
 
-    /// Streaming-Update fuer EINEN Ring: Pool/Ladefenster/Dispatch/Entladen. Schatten-Sichtbarkeit
-    /// ist bewusst NICHT Teil dieser Methode (s. `update_shadow_visibility`) - nur LOD0 wirft
-    /// Schatten, der Aufrufer (`WorldStreamer`) ruft sie deshalb gezielt nur fuer Ring 0 auf.
+    /// Streaming-Update: Pool/Ladefenster/Dispatch/Entladen. Schatten-Sichtbarkeit ist bewusst
+    /// NICHT Teil dieser Methode (s. `update_shadow_visibility`).
     pub fn update(&mut self, camera_position: glam::Vec3, queue: &wgpu::Queue, renderer: &mut ChunkRenderer) {
-        // Aenderungserkennung IMMER auf LOD0-Granularitaet (`CHUNK_SIZE`, NICHT
-        // `CHUNK_SIZE*self.voxel_scale`) - s. `last_trigger_cell`-Kommentar zum Rebuild-Lag-Bug,
-        // den das behebt. Die eigentliche Lade-Entscheidung in `rebuild_load_window`/
-        // `drain_unloads`/`apply_completed_generations` misst ohnehin ausschliesslich gegen die
-        // ECHTE `camera_position` (s. `in_ring_box`-Kommentar).
         let trigger_cell = (
             (camera_position.x / CHUNK_SIZE as f32).floor() as i32,
             (camera_position.y / CHUNK_SIZE as f32).floor() as i32,
@@ -453,21 +368,17 @@ impl ChunkManager {
         self.dispatch_pending();
     }
 
-    /// Fenster-Rebuild, ausgeloest beim Ueberqueren einer LOD0-Gitterzelle (s. `last_trigger_cell`) -
-    /// nicht beim Ueberqueren der (bei Zusatz-Ringen viel groesseren) EIGENEN Gitterzelle. `center`
-    /// (DIESES Rings eigene, aus der echten Kamera abgeleitete Gitterkoordinate) dient nur der
-    /// Enumeration der Kandidaten-Koordinaten; jede tatsaechliche Lade-Entscheidung laeuft ueber
-    /// `in_ring_box` gegen die echte `camera_position`.
+    /// Fenster-Rebuild, ausgeloest beim Ueberqueren einer Chunk-Gitterzelle (s.
+    /// `last_trigger_cell`). `center` dient nur der Enumeration der Kandidaten-Koordinaten; jede
+    /// tatsaechliche Lade-Entscheidung laeuft ueber `in_load_window` gegen die echte
+    /// `camera_position`.
     fn rebuild_load_window(&mut self, camera_position: glam::Vec3) {
-        let voxel_scale = self.voxel_scale;
-        let inner_h = self.inner_exclusion_world_h;
-        let inner_v = self.inner_exclusion_world_v;
         let outer_h = self.outer_radius_world_h;
         let outer_v = self.outer_radius_world_v;
         let r = self.render_distance_chunks;
         let rv = self.vertical_render_distance_chunks;
 
-        let step = (CHUNK_SIZE * voxel_scale) as f32;
+        let step = CHUNK_SIZE as f32;
         let center = (
             (camera_position.x / step).floor() as i32,
             (camera_position.y / step).floor() as i32,
@@ -475,7 +386,7 @@ impl ChunkManager {
         );
 
         for (coord, loaded) in self.loaded.iter_mut() {
-            let outside = !in_ring_box(*coord, voxel_scale, camera_position, inner_h, inner_v, outer_h, outer_v);
+            let outside = !in_load_window(*coord, camera_position, outer_h, outer_v);
             if outside && !loaded.queued_for_unload {
                 loaded.queued_for_unload = true;
                 self.unload_scratch.push(*coord);
@@ -486,7 +397,7 @@ impl ChunkManager {
         // der Pending-Liste verschwinden - sonst wuerde spaeter fuer eine laengst irrelevante
         // Position noch ein Generierungs-Job gestartet.
         self.pending_set
-            .retain(|&coord| in_ring_box(coord, voxel_scale, camera_position, inner_h, inner_v, outer_h, outer_v));
+            .retain(|&coord| in_load_window(coord, camera_position, outer_h, outer_v));
         let pending_set = &self.pending_set;
         self.pending_scratch.retain(|coord| pending_set.contains(coord));
 
@@ -494,7 +405,7 @@ impl ChunkManager {
             for dx in -r..=r {
                 for dy in -rv..=rv {
                     let coord = (center.0 + dx, center.1 + dy, center.2 + dz);
-                    if !in_ring_box(coord, voxel_scale, camera_position, inner_h, inner_v, outer_h, outer_v) {
+                    if !in_load_window(coord, camera_position, outer_h, outer_v) {
                         continue;
                     }
                     if self.loaded.contains_key(&coord) || self.in_flight.contains(&coord) {
@@ -577,18 +488,9 @@ impl ChunkManager {
 
             let generator = Arc::clone(&self.generator);
             let tx = self.result_tx.clone();
-            let voxel_scale = self.voxel_scale;
 
             rayon::spawn(move || {
-                // LOD-Ringe (voxel_scale > 1) nutzen den schlanken `generate_lod_chunk`-Pfad (keine
-                // Hoehlen/Baeume, s. `generator/lod.rs`) - der teure `boundary_planes`-Batch lohnt
-                // sich dort nicht, `is_solid_lod` ist bereits guenstig genug fuer den direkten
-                // Mesher-Fallback-Aufruf.
-                if voxel_scale == 1 {
-                    generator.generate_chunk(coord.0, coord.1, coord.2, &mut chunk);
-                } else {
-                    generator.generate_lod_chunk(coord.0, coord.1, coord.2, voxel_scale, &mut chunk);
-                }
+                generator.generate_chunk(coord.0, coord.1, coord.2, &mut chunk);
 
                 // Reine Luft-Chunks (z.B. weit oberhalb des Terrains) erzeugen ohnehin keine
                 // Faces - das teure Greedy-Meshing (6 Richtungen * 32 Ebenen) lohnt sich dafuer
@@ -596,7 +498,7 @@ impl ChunkManager {
                 let is_empty = chunk.is_empty();
                 let mesh = if is_empty {
                     DirectionalMesh::default()
-                } else if voxel_scale == 1 {
+                } else {
                     // Keine Nachbar-Referenzen moeglich (anderer Thread, s. Kommentar an
                     // `ChunkManager::neighbor_chunk_refs`) - `compute_exposure` faellt fuer ALLE 6
                     // Seiten auf die prozedurale Welt-Vorhersage zurueck. Statt bis zu 6144
@@ -623,15 +525,6 @@ impl ChunkManager {
                         } else {
                             planes.pos_z[(world_x - ox) as usize][(world_y - oy) as usize]
                         }
-                    })
-                } else {
-                    // LOD-Randabfrage: mesher-lokale Koordinaten sind hier "Chunk-Koordinate *
-                    // CHUNK_SIZE + Offset" in NATIVEN (voxel_scale-freien) Einheiten - mit
-                    // `voxel_scale` multipliziert ergeben sie exakt die echte Weltkoordinate (die
-                    // Chunk-Ursprungs-Skalierung UND der lokale Schritt sind beide affin in
-                    // `voxel_scale`, die Multiplikation verteilt sich also korrekt).
-                    mesh_chunk(&chunk, coord.0, coord.1, coord.2, [None; 6], move |wx, wy, wz| {
-                        generator.is_solid_lod(wx * voxel_scale, wy * voxel_scale, wz * voxel_scale)
                     })
                 };
 
@@ -670,8 +563,8 @@ impl ChunkManager {
             if loaded.is_empty {
                 continue;
             }
-            let min = self.chunk_origin(*coord);
-            let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
+            let min = chunk_origin(*coord);
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
             let relevant = active
                 .iter()
                 .any(|c| sphere_intersects_aabb(c.center, c.radius + shadow_cascade_slack(c.radius), min, max));
@@ -708,14 +601,13 @@ impl ChunkManager {
             }
 
             let gpu_handle = renderer.alloc_chunk(queue, &result.mesh);
-            let gpu_pool_slot = self.pool_slot_base + result.pool_slot;
 
             if result.is_empty {
-                renderer.clear_chunk_meta(queue, gpu_pool_slot);
+                renderer.clear_chunk_meta(queue, result.pool_slot);
             } else {
-                let min = self.chunk_origin(result.coord);
-                let max = min + glam::Vec3::splat((CHUNK_SIZE * self.voxel_scale) as f32);
-                renderer.update_chunk_meta(queue, gpu_pool_slot, min, max, self.voxel_scale as f32, &gpu_handle);
+                let min = chunk_origin(result.coord);
+                let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+                renderer.update_chunk_meta(queue, result.pool_slot, min, max, &gpu_handle);
             }
 
             self.pool[result.pool_slot] = Some(result.chunk);
@@ -740,7 +632,7 @@ impl ChunkManager {
         };
 
         renderer.free_chunk(&loaded.gpu_handle);
-        renderer.clear_chunk_meta(queue, self.pool_slot_base + loaded.pool_slot);
+        renderer.clear_chunk_meta(queue, loaded.pool_slot);
 
         // Kein `chunk.clear()` hier: `generate_chunk` beginnt selbst mit `clear()`, und zwischen
         // Freigabe und Neuvergabe liest niemand den Pool-Slot (`is_solid_at` prueft `loaded`
@@ -772,43 +664,23 @@ mod tests {
 
     #[test]
     fn chunk_origin_matches_chunk_coord_times_size() {
-        assert_eq!(chunk_origin_scaled((1, -1, 2), 1), glam::Vec3::new(32.0, -32.0, 64.0));
+        assert_eq!(chunk_origin((1, -1, 2)), glam::Vec3::new(32.0, -32.0, 64.0));
     }
 
     #[test]
-    fn chunk_origin_scales_with_voxel_scale() {
-        assert_eq!(chunk_origin_scaled((1, -1, 2), 4), glam::Vec3::new(128.0, -128.0, 256.0));
-    }
-
-    #[test]
-    fn ring_box_without_exclusion_behaves_like_a_full_cube() {
+    fn load_window_covers_a_camera_centered_cube() {
         let camera = glam::Vec3::ZERO;
         // outer=100 Weltbloecke deckt Chunks 0..3 (Boxen bis Weltblock 128) an-, aber nicht mehr ab.
-        assert!(in_ring_box((0, 0, 0), 1, camera, 0.0, 0.0, 100.0, 100.0));
-        assert!(in_ring_box((3, 0, 0), 1, camera, 0.0, 0.0, 100.0, 100.0));
-        assert!(!in_ring_box((4, 0, 0), 1, camera, 0.0, 0.0, 100.0, 100.0));
+        assert!(in_load_window((0, 0, 0), camera, 100.0, 100.0));
+        assert!(in_load_window((3, 0, 0), camera, 100.0, 100.0));
+        assert!(!in_load_window((4, 0, 0), camera, 100.0, 100.0));
     }
 
     #[test]
-    fn ring_box_excludes_area_covered_by_finer_ring() {
-        let camera = glam::Vec3::ZERO;
-        // inner=64 Weltbloecke (2 LOD0-Chunks) muss Chunk 0 und 1 (Boxen [0,64)) ausschliessen,
-        // Chunk 2 (Box [64,96)) aber nicht mehr, da sie ueber den inneren Radius hinausragt.
-        assert!(!in_ring_box((0, 0, 0), 1, camera, 64.0, 64.0, 200.0, 200.0));
-        assert!(!in_ring_box((1, 0, 0), 1, camera, 64.0, 64.0, 200.0, 200.0));
-        assert!(in_ring_box((2, 0, 0), 1, camera, 64.0, 64.0, 200.0, 200.0));
-        assert!(!in_ring_box((7, 0, 0), 1, camera, 64.0, 64.0, 200.0, 200.0));
-    }
-
-    #[test]
-    fn ring_box_boundary_tracks_continuous_camera_position_not_a_grid() {
-        // Regressionstest fuer den Gitter-Quantisierungs-Bug ("massive Chunk-Luecken"): die
-        // Fenstergrenze haengt an der ECHTEN Kameraposition, nicht an einem auf `voxel_scale`
-        // gerundeten Zentrum - sonst liefen die Grenzen verschiedener Ringe je nach
-        // Kamera-Teilposition innerhalb ihrer jeweiligen Gitterzelle auseinander.
+    fn load_window_boundary_tracks_continuous_camera_position_not_a_grid() {
         let coord = (2, 0, 0); // Weltbereich [64, 96)
-        assert!(in_ring_box(coord, 1, glam::Vec3::new(50.0, 0.0, 0.0), 0.0, 0.0, 40.0, 40.0));
-        assert!(!in_ring_box(coord, 1, glam::Vec3::new(0.0, 0.0, 0.0), 0.0, 0.0, 40.0, 40.0));
+        assert!(in_load_window(coord, glam::Vec3::new(50.0, 0.0, 0.0), 40.0, 40.0));
+        assert!(!in_load_window(coord, glam::Vec3::new(0.0, 0.0, 0.0), 40.0, 40.0));
     }
 
     #[test]

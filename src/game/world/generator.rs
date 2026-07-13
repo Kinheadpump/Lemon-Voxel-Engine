@@ -11,7 +11,6 @@ use super::blocks::{self, ColumnSurface};
 use super::chunk::{CHUNK_SIZE, Chunk};
 
 mod flora;
-mod lod;
 use flora::{MAX_NEARBY_TREES, TREE_HEIGHT_SAFETY_MARGIN, TreeSpawn};
 
 /// Fraktales Perlin (fBm) fuer die Regional-Heightmap - mehrere Octaves mit konfigurierbarer

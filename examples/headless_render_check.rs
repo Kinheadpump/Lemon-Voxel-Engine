@@ -92,7 +92,7 @@ async fn render_top_down_green_ratio() -> f32 {
     let handle = renderer.alloc_chunk(&queue, &mesh);
     let aabb_min = glam::Vec3::new((CHUNK_X * CHUNK_SIZE) as f32, 0.0, (CHUNK_Z * CHUNK_SIZE) as f32);
     let aabb_max = aabb_min + glam::Vec3::splat(CHUNK_SIZE as f32);
-    renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, 1.0, &handle);
+    renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, &handle);
 
     let msaa_color = create_msaa_color_view(&device, SIZE, SIZE, SAMPLES, FORMAT);
     let depth = create_depth_view(&device, SIZE, SIZE, SAMPLES);

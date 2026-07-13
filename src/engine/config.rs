@@ -3,57 +3,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::game::math::cascades::MAX_SHADOW_CASCADES;
-use crate::game::world::chunk::CHUNK_SIZE;
 
 pub const CONFIG_PATH: &str = "config.toml";
-
-/// Anzahl zusaetzlicher LOD-Ringe jenseits von LOD0 (LOD0 nutzt weiterhin
-/// `PlayerSettings::render_distance_chunks`/`vertical_render_distance_chunks` direkt). Fest statt
-/// `Vec`, damit `DevSettings`/`EngineConfig` `Copy` bleiben (wird ueberall per Wert durchgereicht).
-pub const MAX_EXTRA_LOD_RINGS: usize = 2;
-
-/// EIN zusaetzlicher LOD-Ring: EIN Voxel deckt `voxel_scale` Weltbloecke pro Achse ab (s.
-/// `game/world/generator/lod.rs`), `render_distance_chunks`/`vertical_render_distance_chunks` sind
-/// dabei in DIESES Rings eigenen (entsprechend groesseren) Chunk-Einheiten gemessen - ein Ring mit
-/// `voxel_scale=4, render_distance_chunks=12` deckt also `12*4=48` LOD0-aequivalente Chunks Radius
-/// ab, bei nur `(2*12+1)^2*...` statt `(2*48+1)^2*...` Pool-Slots.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LodRingSetting {
-    pub voxel_scale: i32,
-    pub render_distance_chunks: i32,
-    pub vertical_render_distance_chunks: i32,
-}
-
-/// Konkreter, aus `EngineConfig` abgeleiteter LOD-Ring inklusive seines Anteils am GEMEINSAMEN
-/// Chunk-Pool-Slot-Raum (`pool_slot_base..pool_slot_base+pool_size`) - `ChunkRenderer` haelt EINEN
-/// globalen `chunk_meta_buffer`, jeder Ring-`ChunkManager` schreibt nur in seinen eigenen
-/// Teilbereich (s. `EngineConfig::lod_ring_runtimes`).
-#[derive(Clone, Copy, Debug)]
-pub struct LodRingRuntime {
-    pub voxel_scale: i32,
-    pub render_distance_chunks: i32,
-    pub vertical_render_distance_chunks: i32,
-    /// Ringe sind KEINE vollen Kuben um die Kamera, sondern quadratische Schalen: Weltbloecke
-    /// innerhalb dieses Radius um die Kamera sind bereits vom naechst-feineren Ring abgedeckt und
-    /// werden von DIESEM Ring nicht geladen - sonst ueberlappen sich alle Ringe komplett im
-    /// Kamera-Nahbereich (riesige LOD-Voxel direkt neben/statt der LOD0-Feingeometrie).
-    ///
-    /// IN WELTBLOECKEN, nicht in ring-lokalen Chunk-Einheiten - und exakt gleich dem
-    /// `render_distance_chunks * CHUNK_SIZE * voxel_scale` des naechst-feineren Rings (identische
-    /// Formel auf beiden Seiten, s. `lod_ring_runtimes`). Eine fruehere Version rechnete den
-    /// Ausschluss in DIESES Rings eigenen (per `floor(kamera/schrittweite)` quantisierten)
-    /// Chunk-Einheiten - LOD0 (Schrittweite 32) und ein Zusatz-Ring (z.B. Schrittweite 128)
-    /// runden die Kameraposition dabei auf UNTERSCHIEDLICHE Gitter, wodurch Innen- und
-    /// Aussengrenze zweier Ringe je nach Kameraposition innerhalb ihrer jeweiligen Gitterzelle um
-    /// bis zu einer Schrittweite auseinanderlaufen konnten - sichtbar als Luecken ODER
-    /// Ueberlappungen. Weltblock-Radien sind gitter-unabhaengig und schliessen exakt aneinander an.
-    /// 0 fuer LOD0 (kein innerer Ring).
-    pub inner_exclusion_world_h: i32,
-    pub inner_exclusion_world_v: i32,
-    pub pool_slot_base: usize,
-    pub pool_size: usize,
-}
 
 /// Einstellungen, die ein SPIELER ueber ein Optionsmenue anpassen wuerde: Eingabe-Empfindlichkeit,
 /// Sichtfeld, Sicht-/Grafikqualitaet. Strikt getrennt von `DevSettings` - ein zukuenftiges
@@ -217,11 +168,6 @@ pub struct DevSettings {
     pub max_faces_per_direction: usize,
     pub max_draws_per_direction: usize,
 
-    /// Zusaetzliche LOD-Ringe jenseits von LOD0 - nur die ersten `lod_ring_count` Eintraege sind
-    /// gueltig (s. `EngineConfig::lod_ring_runtimes`).
-    pub lod_rings: [LodRingSetting; MAX_EXTRA_LOD_RINGS],
-    pub lod_ring_count: u32,
-
     /// Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
     /// Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden. Ohne diese Grenze
     /// versucht der Main-Thread bei grossem `render_distance_chunks` (grosser Backlog beim
@@ -383,20 +329,6 @@ impl Default for DevSettings {
             max_faces_per_direction: 3_000_000,
             max_draws_per_direction: 4300,
 
-            // Zwei zusaetzliche Ringe jenseits LOD0: Scale 4 deckt das 4-fache Weltvolumen pro
-            // Chunk ab (Hoehlen/Baeume entfallen dort komplett, s. `generator/lod.rs` - macht LOD1
-            // trotz groesserer Reichweite GUENSTIGER pro Chunk als LOD0), Scale 8 nochmal das
-            // Doppelte - bewusst NUR verdoppelt statt vervierfacht (1-4-16 sprang beim Uebergang
-            // LOD1->LOD2 visuell zu hart, 16x16x16-Weltblock-Voxel wirkten direkt am Ring-Rand wie
-            // grobe Wuerfel statt Terrain). Sichtweite waechst trotzdem weit ueber das reine
-            // LOD0-Fenster hinaus, waehrend der Chunk-Pool nur linear (nicht quadratisch mit der
-            // Gesamtdistanz) mitwaechst.
-            lod_rings: [
-                LodRingSetting { voxel_scale: 4, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
-                LodRingSetting { voxel_scale: 8, render_distance_chunks: 12, vertical_render_distance_chunks: 3 },
-            ],
-            lod_ring_count: 2,
-
             // Vor dem Binary-Greedy-Meshing-Umbau war das Meshing selbst der Flaschenhals; jetzt
             // ist der Upload-/Dispatch-Takt (64/Frame) die haertere Bremse (bei ~18 FPS waehrend
             // des Ladens ergab das rechnerisch exakt die beobachtete ~1100-1300 Chunks/s
@@ -441,79 +373,17 @@ impl EngineConfig {
     ///   Render-Distanz sichtbare Chunks kommentarlos aus dem Draw fallen ("kuenstlich limitierte
     ///   Sichtweite"). Kostet 2*16 Byte pro Slot ueber 6 Richtungen - vernachlaessigbar.
     fn normalized(mut self) -> Self {
-        let total_required: usize = self.lod_ring_runtimes().iter().map(|r| r.pool_size).sum();
-        if total_required > CHUNK_POOL_SAFETY_CAP {
-            log::warn!(
-                "LOD-Ringe brauchen zusammen {total_required} Chunk-Pool-Slots (jeder Ring einzeln \
-                 bereits auf {CHUNK_POOL_SAFETY_CAP} gedeckelt, die SUMME aber bewusst nicht weiter - \
-                 sonst wuerde die Pool-Slot-Partitionierung der Ringe inkonsistent) - das kostet ca. \
-                 {} GiB RAM",
-                total_required * 64 / 1024 / 1024,
-            );
-        }
-        self.dev.chunk_pool_size = self.dev.chunk_pool_size.max(total_required);
+        let required = required_chunk_pool_size(
+            self.player.render_distance_chunks,
+            self.player.vertical_render_distance_chunks,
+        )
+        .min(CHUNK_POOL_SAFETY_CAP);
+        self.dev.chunk_pool_size = self.dev.chunk_pool_size.max(required);
         self.dev.max_draws_per_direction = self
             .dev
             .max_draws_per_direction
             .max(self.dev.chunk_pool_size);
         self
-    }
-
-    /// Leitet aus LOD0 (`PlayerSettings::render_distance_chunks`/`vertical_render_distance_chunks`)
-    /// UND den `dev.lod_rings`-Eintraegen die vollstaendige Ring-Liste ab, inklusive der
-    /// `pool_slot_base`-Partitionierung im GEMEINSAMEN `chunk_meta_buffer`-Adressraum (Ring 0 = LOD0
-    /// zuerst, danach die konfigurierten Zusatz-Ringe in Reihenfolge). Jeder Ring wird EINZELN auf
-    /// `CHUNK_POOL_SAFETY_CAP` gedeckelt - die Summe kann diese Grenze bei mehreren Ringen
-    /// ueberschreiten, s. `normalized`-Warnung.
-    pub fn lod_ring_runtimes(&self) -> Vec<LodRingRuntime> {
-        let mut rings = Vec::with_capacity(1 + self.dev.lod_ring_count as usize);
-        let mut pool_slot_base = 0usize;
-
-        let lod0_size = required_chunk_pool_size(
-            self.player.render_distance_chunks,
-            self.player.vertical_render_distance_chunks,
-        )
-        .min(CHUNK_POOL_SAFETY_CAP);
-        rings.push(LodRingRuntime {
-            voxel_scale: 1,
-            render_distance_chunks: self.player.render_distance_chunks,
-            vertical_render_distance_chunks: self.player.vertical_render_distance_chunks,
-            inner_exclusion_world_h: 0,
-            inner_exclusion_world_v: 0,
-            pool_slot_base,
-            pool_size: lod0_size,
-        });
-        pool_slot_base += lod0_size;
-
-        // Weltblock-Aussenradius des zuletzt hinzugefuegten (naeheren, feineren) Rings - jeder
-        // weitere Ring schliesst GENAU diesen Radius als seinen inneren Ausschluss aus (identische
-        // Formel auf beiden Seiten der Ring-Grenze, s. `LodRingRuntime::inner_exclusion_world_h`-
-        // Kommentar) - dadurch schliessen die Ringe exakt aneinander an, ohne Luecke oder
-        // Ueberlappung.
-        let mut prev_outer_world_h = self.player.render_distance_chunks * CHUNK_SIZE;
-        let mut prev_outer_world_v = self.player.vertical_render_distance_chunks * CHUNK_SIZE;
-
-        for ring in &self.dev.lod_rings[..self.dev.lod_ring_count as usize] {
-            let voxel_scale = ring.voxel_scale.max(1);
-
-            let pool_size = required_chunk_pool_size(ring.render_distance_chunks, ring.vertical_render_distance_chunks)
-                .min(CHUNK_POOL_SAFETY_CAP);
-            rings.push(LodRingRuntime {
-                voxel_scale,
-                render_distance_chunks: ring.render_distance_chunks,
-                vertical_render_distance_chunks: ring.vertical_render_distance_chunks,
-                inner_exclusion_world_h: prev_outer_world_h,
-                inner_exclusion_world_v: prev_outer_world_v,
-                pool_slot_base,
-                pool_size,
-            });
-            pool_slot_base += pool_size;
-
-            prev_outer_world_h = ring.render_distance_chunks * CHUNK_SIZE * voxel_scale;
-            prev_outer_world_v = ring.vertical_render_distance_chunks * CHUNK_SIZE * voxel_scale;
-        }
-
-        rings
     }
 
     /// Laedt die Konfiguration aus `config.toml`. Existiert die Datei nicht, wird sie mit den
@@ -657,9 +527,6 @@ struct DevSettingsFile {
     chunk_pool_size: usize,
     max_faces_per_direction: usize,
     max_draws_per_direction: usize,
-
-    lod_rings: [LodRingSetting; MAX_EXTRA_LOD_RINGS],
-    lod_ring_count: u32,
 
     max_chunk_dispatches_per_frame: usize,
     max_chunk_uploads_per_frame: usize,
@@ -824,9 +691,6 @@ impl From<DevSettings> for DevSettingsFile {
             max_faces_per_direction: d.max_faces_per_direction,
             max_draws_per_direction: d.max_draws_per_direction,
 
-            lod_rings: d.lod_rings,
-            lod_ring_count: d.lod_ring_count,
-
             max_chunk_dispatches_per_frame: d.max_chunk_dispatches_per_frame,
             max_chunk_uploads_per_frame: d.max_chunk_uploads_per_frame,
             max_chunk_unloads_per_frame: d.max_chunk_unloads_per_frame,
@@ -920,13 +784,6 @@ impl From<DevSettingsFile> for DevSettings {
             max_faces_per_direction: f.max_faces_per_direction.max(1),
             max_draws_per_direction: f.max_draws_per_direction.max(1),
 
-            lod_rings: std::array::from_fn(|i| LodRingSetting {
-                voxel_scale: f.lod_rings[i].voxel_scale.max(1),
-                render_distance_chunks: f.lod_rings[i].render_distance_chunks.clamp(1, 64),
-                vertical_render_distance_chunks: f.lod_rings[i].vertical_render_distance_chunks.clamp(1, 64),
-            }),
-            lod_ring_count: f.lod_ring_count.min(MAX_EXTRA_LOD_RINGS as u32),
-
             max_chunk_dispatches_per_frame: f.max_chunk_dispatches_per_frame.max(1),
             max_chunk_uploads_per_frame: f.max_chunk_uploads_per_frame.max(1),
             max_chunk_unloads_per_frame: f.max_chunk_unloads_per_frame.max(1),
@@ -957,48 +814,14 @@ impl From<ConfigFile> for EngineConfig {
 mod tests {
     use super::*;
 
-    /// Regressionstest fuer den "LOD-Ringe ueberlappen komplett"-Bug UND den nachfolgenden Gitter-
-    /// Quantisierungs-Bug ("massive Chunk-Luecken"): der innere Ausschluss-Radius eines Rings muss
-    /// EXAKT dem Weltblock-Aussenradius des naechst-feineren Rings entsprechen (nicht bloss `<=`) -
-    /// nur exakte Gleichheit auf beiden Seiten der Grenze garantiert weder Luecke noch Ueberlappung,
-    /// unabhaengig von den (bei unterschiedlichen `voxel_scale`-Werten unterschiedlichen) Gitter-
-    /// Schrittweiten der beiden Ringe.
     #[test]
-    fn lod_rings_form_an_exactly_nested_sequence() {
+    fn normalized_pool_covers_the_full_load_window() {
         let config = EngineConfig::default().normalized();
-        let rings = config.lod_ring_runtimes();
-        assert!(rings.len() >= 2, "Default-Config sollte mindestens LOD0 + einen Zusatz-Ring haben");
-
-        for pair in rings.windows(2) {
-            let [inner, outer] = pair else { unreachable!() };
-            let inner_outer_world_h = inner.render_distance_chunks * CHUNK_SIZE * inner.voxel_scale;
-            let inner_outer_world_v = inner.vertical_render_distance_chunks * CHUNK_SIZE * inner.voxel_scale;
-
-            assert_eq!(
-                outer.inner_exclusion_world_h, inner_outer_world_h,
-                "Ring mit voxel_scale={} schliesst einen anderen Weltblock-Radius aus als der innere Ring \
-                 abdeckt - das waere eine Luecke oder Ueberlappung an der Ring-Grenze",
-                outer.voxel_scale,
-            );
-            assert_eq!(
-                outer.inner_exclusion_world_v, inner_outer_world_v,
-                "vertikal: Ring mit voxel_scale={} schliesst einen anderen Weltblock-Radius aus als der \
-                 innere Ring abdeckt",
-                outer.voxel_scale,
-            );
-            assert!(outer.inner_exclusion_world_h > 0, "Zusatz-Ring ohne inneren Ausschluss ueberlappt vollstaendig");
-        }
-    }
-
-    #[test]
-    fn lod_ring_pool_slots_are_contiguous_and_non_overlapping() {
-        let config = EngineConfig::default().normalized();
-        let rings = config.lod_ring_runtimes();
-
-        let mut expected_base = 0usize;
-        for ring in &rings {
-            assert_eq!(ring.pool_slot_base, expected_base);
-            expected_base += ring.pool_size;
-        }
+        let required = required_chunk_pool_size(
+            config.player.render_distance_chunks,
+            config.player.vertical_render_distance_chunks,
+        );
+        assert!(config.dev.chunk_pool_size >= required);
+        assert!(config.dev.max_draws_per_direction >= config.dev.chunk_pool_size);
     }
 }

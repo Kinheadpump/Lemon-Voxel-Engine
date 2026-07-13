@@ -26,9 +26,7 @@ pub struct CullUniformData {
 pub struct ChunkMetaGpu {
     /// w = 1.0 aktiv / 0.0 unbelegt-oder-Luft-Chunk (ueberspringt Frustum/Occlusion-Test komplett).
     pub aabb_min: [f32; 4],
-    /// w = `voxel_scale` (LOD-Ring-Faktor: 1 = LOD0, >1 = wie viele Weltbloecke EIN Voxel dieses
-    /// Chunks pro Achse abdeckt, s. `game/world/generator/lod.rs`) - vom Cull-Shader unveraendert in
-    /// `ChunkData.origin.w` durchgereicht, dort skaliert `shader.wgsl` die gesamte Face-Geometrie.
+    /// w = ungenutztes Padding (vec4-Alignment).
     pub aabb_max: [f32; 4],
     /// Pro Richtung (x = Face-Buffer-Offset, y = Face-Count) - identisch zu `ChunkGpuHandle::slots`.
     pub slots: [[u32; 2]; 6],
