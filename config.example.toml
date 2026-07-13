@@ -1,7 +1,15 @@
 # Voxel-Engine Konfiguration (Vorlage).
 # Beim ersten Start erzeugt die Engine automatisch eine `config.toml` mit diesen Defaults.
 # `config.toml` ist maschinenlokal und wird nicht versioniert - diese Datei dient als Referenz.
+#
+# Zwei Tabellen, [player] und [dev]:
+# [player] sind Einstellungen, die ein Spieler ueber ein Optionsmenue anpassen wuerde
+# (Eingabe, Sichtfeld, Sicht-/Grafikqualitaet). [dev] ist alles andere: Welt-Generierung,
+# Physik-/Rendering-Internals, Performance-Budgets, Art Direction.
+# Unbekannte oder fehlende Felder werden beim Laden einzeln ignoriert bzw. defaulten -
+# ein veraltetes Feld bricht das Parsen nicht ab und reisst nicht die ganze Datei zurueck.
 
+[player]
 # Basis-Fluggeschwindigkeit in Bloecken/Sekunde.
 movement_speed = 12.0
 # Faktor auf die Geschwindigkeit, solange Shift gehalten wird (Sprint).
@@ -10,11 +18,12 @@ sprint_multiplier = 4.0
 mouse_sensitivity = 0.0025
 # Vertikales Sichtfeld in Grad.
 fov_degrees = 60.0
-# Chunk-Radius um den Spieler (1..32). 4 => 9x9 Chunks, 16 => 33x33 (1089), 32 => 65x65 (4225).
+# Horizontaler Chunk-Radius um den Spieler (1..32). 4 => 9x9 Chunks, 16 => 33x33 (1089).
 # Geometrie wird persistent auf der GPU gehalten; hohe Werte kosten v.a. RAM (64 KiB pro Chunk).
 render_distance_chunks = 4
-# Hintergrund-/Himmelfarbe als linearer RGB-Wert (0.0..1.0).
-clear_color_rgb = [0.02, 0.02, 0.02]
+# Vertikale Ladedistanz in Chunks (1..32), zentriert auf die aktuelle Chunk-Y-Position der
+# Kamera statt auf einen festen Weltboden - das Ladefenster wandert beim Bauen/Graben einfach mit.
+vertical_render_distance_chunks = 4
 # Debug-HUD (F3) beim Start sichtbar.
 hud_visible_default = true
 # MSAA-Samplezahl (1, 2, 4, 8).
@@ -23,10 +32,149 @@ msaa_samples = 4
 ssao_enabled = true
 ssao_radius = 2.0
 ssao_strength = 1.4
-# Fallbeschleunigung in Bloecken/Sekunde^2 (nur wirksam wenn nicht im Flugmodus, siehe unten).
-gravity = 26.0
-# Sprunggeschwindigkeit in Bloecken/Sekunde.
-jump_speed = 9.0
+# Bilateral-Blur-Kantenschwelle (NDC-Tiefendifferenz) fuer den SSAO-Denoise-Pass.
+ssao_blur_depth_threshold = 0.0008
+# Anzahl Shadow-Kaskaden (3-4): mehr = feinere Aufloesungs-Staffelung nahe der Kamera, aber ein
+# zusaetzlicher Shadow-Pass-Durchlauf pro Kaskade.
+shadow_cascade_count = 4
+shadow_map_resolution = 2048
+# Distanz ab der Kamera, bis zu der ueberhaupt Schatten berechnet werden.
+shadow_max_distance = 220.0
 # Startmodus: true = Flug (kein Fallen/Kollision), false = Laufen (Gravitation + Kollision).
 # Mit "F" jederzeit im Spiel umschaltbar.
 start_flying = true
+
+[dev]
+# Hintergrund-/Himmelfarbe als linearer RGB-Wert (0.0..1.0).
+clear_color_rgb = [0.02, 0.02, 0.02]
+# Fallbeschleunigung in Bloecken/Sekunde^2 (nur wirksam wenn nicht im Flugmodus).
+gravity = 26.0
+# Sprunggeschwindigkeit in Bloecken/Sekunde.
+jump_speed = 9.0
+# Maximale Fallgeschwindigkeit (Betrag, Bloecke/s) - verhindert unbegrenzt wachsende
+# Aufprallgeschwindigkeit bei tiefen Faellen in der vertikal unbegrenzten Welt.
+terminal_velocity = 80.0
+
+# Reale Sekunden fuer einen vollen Tag/Nacht-Zyklus (Sonnenwinkel 0..2*PI).
+sun_cycle_seconds = 1200.0
+# Startpunkt im Zyklus, 0.0 = Sonnenaufgang, 0.25 = Zenit, 0.5 = Sonnenuntergang.
+sun_initial_time_of_day = 0.28
+ambient_light = 0.2
+sun_intensity = 1.0
+
+# Mischung zwischen logarithmischer und linearer Kaskaden-Aufteilung (0 = linear, 1 = log).
+# Log gewichtet mehr Aufloesung nahe der Kamera, was fuer Voxel-Kanten am wichtigsten ist.
+shadow_split_lambda = 0.6
+shadow_depth_bias = 2.0
+shadow_depth_bias_slope_scale = 2.0
+
+sky_zenith_day_color = [0.21, 0.47, 0.81]
+sky_horizon_day_color = [0.64, 0.72, 0.81]
+sky_night_color = [0.01, 0.015, 0.03]
+
+# Maximale Anzahl gleichzeitiger Godray-Billboards (feste SSBO-Kapazitaet).
+godray_count = 512
+# Gitterabstand der Godray-Kandidaten-Positionen in Weltbloecken.
+godray_grid_spacing = 6.0
+# Hoehe des Kantenerkennungs-Punkts ueber der Terrainoberflaeche.
+godray_sample_height = 1.5
+# Sample-Radius der Kantenerkennung UND sichtbare Billboard-Breite, in Weltbloecken.
+godray_width = 3.5
+# Sichtbare Strahllaenge entlang der tatsaechlichen Lichtrichtung.
+godray_beam_length = 12.0
+# Mischfaktor pro Frame zwischen alter und neu berechneter Intensity (0 = einfriert, 1 = kein
+# Glaetten). Klein halten, sonst flackert es bei Kamerabewegung.
+godray_temporal_blend = 0.12
+
+terrain_seed = 1337
+# Terrain-Hoehe/-Klima stammen aus einer hierarchischen Fenster-Pyramide (InfiniteDiffusion-
+# Schema, s. src/game/world/generator/pyramid.rs): eine Kaskade progressiv feinerer Ebenen,
+# jede erzeugt ueberlappende Fenster, die per Gewichtskernel nahtlos gemittelt werden. Jede
+# Ebene verfeinert die vorherige um Faktor 4 - die zwei Skalen unten setzen NUR die groebste
+# (erste) Ebene, die feineren Detailbaender (Wellenlaengen 384/96/24 Bloecke) sind intern fix.
+
+# Wellenlaenge (Weltbloecke) der Kontinental-Basisebene - Land/Ozean-Wechsel auf dieser Skala.
+terrain_continent_scale_blocks = 2048.0
+terrain_continental_amplitude = 55.0
+# Detail-Budget der Verfeinerungs-Ebenen, moduliert durch die Bergmaske: unorm(kontinentalhoehe)
+# ^exponent * amplitude - der Exponent (>1) haelt Ebenen flach, nur Kontinentalmaxima werden zu
+# markanten Massiven.
+terrain_mountain_amplitude = 130.0
+terrain_mountain_exponent = 5.5
+# Wellenlaenge (Weltbloecke) der Temperatur-/Feuchtigkeitsfelder - grosse zusammenhaengende
+# Biome. Die Hoehen-Lapse-Kopplung (kaeltere Gipfel) sitzt fest in der Pyramide.
+terrain_climate_scale_blocks = 1024.0
+# Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
+terrain_desert_temperature_min = 0.25
+terrain_desert_humidity_max = -0.05
+# Draengt Hoehen nahe der Wasserlinie sanft Richtung Meereshoehe (flache Straende), laesst
+# Werte jenseits der Range linear weiterlaufen (Gebirge/Tiefsee werden nicht gedeckelt).
+terrain_sea_compression_range = 6.0
+terrain_sea_compression_exponent = 1.3
+
+# Grosse, ausgedehnte Cheese Caves (3D-Perlin-Cutoff, ungegatet - ueberall im Untergrund
+# praesent). Niedrige Frequenz fuer weite Kavernen statt kleiner Blasen.
+terrain_cheese_frequency = 0.02
+# Perlin-Werte oberhalb dieser Schwelle (-1..1) werden zu Cheese-Cave-Hohlraum.
+terrain_cheese_threshold = 0.62
+# Primaeres Tunnelsystem: lange, verbundene Roehren via Worley-Zellgrenzen.
+terrain_tunnel_frequency = 0.028
+# WorleyDifference-Werte (unorm, meist klein) unterhalb dieser Schwelle werden zu Tunnel -
+# empirisch kalibriert, s. Diagnose-Test `calibrate_cave_thresholds`.
+terrain_tunnel_threshold = 0.0012
+# Zweites, unabhaengiges Worley-Tunnelsystem (andere Frequenz/Seed) - verbindet isolierte
+# Sackgassen des primaeren Systems, da sich zwei unabhaengige Voronoi-Netze an anderen Stellen
+# ueberschneiden.
+terrain_connector_frequency = 0.045
+terrain_connector_threshold = 0.0008
+terrain_connector_widen_multiplier = 1.0
+# Bloecke unterhalb Meereshoehe, ueber die BEIDE Hoehlensysteme ihre maximale Verbreiterung
+# erreichen - ein gemeinsamer Tiefenfaktor fuer Cheese Caves UND Tunnel.
+terrain_cave_widen_depth_range = 150.0
+# Um wie viel terrain_cheese_threshold in maximaler Tiefe sinkt (groessere Kavernen).
+terrain_cheese_widen_amount = 0.12
+# Faktor, um den terrain_tunnel_threshold in maximaler Tiefe multipliziert wird (breitere Roehren).
+terrain_tunnel_widen_multiplier = 1.5
+# Frequenz des 2D-Gates, das entscheidet, ob eine Region ueberhaupt Tunnel bekommt (reale
+# Tunnelsysteme sind regional konzentriert, nicht gleichmaessig verteilt).
+terrain_cave_region_frequency = 0.002
+# Perlin-Werte oberhalb dieser Schwelle (-1..1) gelten als "Hoehlen-aktive" Region.
+terrain_cave_region_threshold = 0.3
+
+terrain_dirt_layer_depth = 3
+# Fixer Offset weit weg vom Rauschursprung - die Ursprungszelle des Gradientenrauschens ist
+# degeneriert und liefert dort konstant 0.0.
+terrain_noise_origin_offset = 10000.0
+
+# Zellgroesse (Weltbloecke) des Baum-Spawn-Gitters - eine Zelle traegt hoechstens einen
+# gejitterten Kandidaten.
+terrain_tree_grid_size = 8
+# Wahrscheinlichkeit (nach Jitter, vor Biom-Check), dass eine Gitterzelle einen Baum traegt.
+terrain_tree_spawn_chance = 0.12
+terrain_tree_trunk_height_min = 4
+terrain_tree_trunk_height_max = 7
+terrain_tree_crown_radius_min = 2
+terrain_tree_crown_radius_max = 3
+
+player_half_width = 0.3
+player_height = 1.8
+player_eye_height = 1.6
+ground_probe_distance = 0.1
+fixed_timestep = 0.016666668
+max_physics_steps_per_frame = 8
+
+# Muss mind. (2*render_distance_chunks+1)^2 * (2*vertical_render_distance_chunks+1) abdecken,
+# sonst werden Chunks am Rand der Render-Distanz stillschweigend nicht geladen (Pool erschoepft).
+# Wird beim Laden automatisch auf diese Untergrenze angehoben, falls zu klein.
+chunk_pool_size = 800
+max_faces_per_direction = 3000000
+max_draws_per_direction = 4300
+
+# Obergrenze, wie viele Chunks pro Frame vom Rayon-Pool dispatcht bzw. wie viele fertige
+# Generierungs-Ergebnisse pro Frame in GPU-Uploads uebersetzt werden - verhindert Mehrsekunden-
+# Freezes bei grossem Backlog (Welt-Start, schnelles Fliegen) statt verteilter Frame-Zeit.
+max_chunk_dispatches_per_frame = 128
+max_chunk_uploads_per_frame = 128
+# Obergrenze fuer Chunk-Entladungen pro Frame - verhindert Ruckler, wenn beim Ueberqueren einer
+# Chunk-Grenze (v.a. vertikal beim Landen) eine ganze Chunk-Ebene aus dem Ladefenster wandert.
+max_chunk_unloads_per_frame = 192

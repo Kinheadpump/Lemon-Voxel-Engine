@@ -787,4 +787,32 @@ mod tests {
         assert!(config.dev.chunk_pool_size >= required);
         assert!(config.dev.max_draws_per_direction >= config.dev.chunk_pool_size);
     }
+
+    /// Regressionstest gegen genau die Art Drift, die `config.example.toml` einmal ueber mehrere
+    /// Schema-Wechsel (Player/Dev-Split, LOD-Entfernung, Terrain-Pyramide) hinweg unbemerkt
+    /// einschleichen liess: die Vorlage muss OHNE Parse-Fehler laden UND (da sie die Default-Werte
+    /// dokumentiert) exakt `EngineConfig::default()` reproduzieren.
+    #[test]
+    fn example_config_parses_and_matches_defaults() {
+        let contents = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"),
+        )
+        .expect("config.example.toml sollte lesbar sein");
+        let file: ConfigFile =
+            toml::from_str(&contents).expect("config.example.toml sollte fehlerfrei parsen");
+        let loaded = EngineConfig::from(file);
+        let expected = EngineConfig::default().normalized();
+
+        assert_eq!(loaded.player.render_distance_chunks, expected.player.render_distance_chunks);
+        assert_eq!(loaded.dev.terrain_seed, expected.dev.terrain_seed);
+        assert_eq!(
+            loaded.dev.terrain_continent_scale_blocks,
+            expected.dev.terrain_continent_scale_blocks
+        );
+        assert_eq!(
+            loaded.dev.terrain_climate_scale_blocks,
+            expected.dev.terrain_climate_scale_blocks
+        );
+        assert_eq!(loaded.dev.chunk_pool_size, expected.dev.chunk_pool_size);
+    }
 }
