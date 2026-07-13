@@ -183,6 +183,12 @@ pub struct DevSettings {
     pub player_height: f32,
     pub player_eye_height: f32,
     pub ground_probe_distance: f32,
+    /// Maximale Hoehe (Bloecke), die der Spieler ohne Sprung automatisch hochsteigt ("Auto-Step") -
+    /// s. `PlayerPhysics::try_move_axis`. Blockterrain ist auf ganze Voxel quantisiert, Nachbar-
+    /// spalten unterscheiden sich praktisch ueberall um mindestens 1 Block; ohne diesen Ausgleich
+    /// blieb der Spieler an jeder solchen Kante haengen. 1.0 (ein Voxel) ist die natuerliche Wahl -
+    /// hoehere Werte fangen an, sich wie kleine Spruenge statt wie Gehen anzufuehlen.
+    pub player_step_height: f32,
     pub fixed_timestep: f32,
     pub max_physics_steps_per_frame: u32,
 
@@ -347,6 +353,7 @@ impl Default for DevSettings {
             player_height: 1.8,
             player_eye_height: 1.6,
             ground_probe_distance: 0.1,
+            player_step_height: 1.0,
             fixed_timestep: 1.0 / 60.0,
             max_physics_steps_per_frame: 8,
 
@@ -550,6 +557,7 @@ struct DevSettingsFile {
     player_height: f32,
     player_eye_height: f32,
     ground_probe_distance: f32,
+    player_step_height: f32,
     fixed_timestep: f32,
     max_physics_steps_per_frame: u32,
 
@@ -714,6 +722,7 @@ impl From<DevSettings> for DevSettingsFile {
             player_height: d.player_height,
             player_eye_height: d.player_eye_height,
             ground_probe_distance: d.ground_probe_distance,
+            player_step_height: d.player_step_height,
             fixed_timestep: d.fixed_timestep,
             max_physics_steps_per_frame: d.max_physics_steps_per_frame,
 
@@ -808,6 +817,7 @@ impl From<DevSettingsFile> for DevSettings {
             player_height: f.player_height,
             player_eye_height: f.player_eye_height,
             ground_probe_distance: f.ground_probe_distance,
+            player_step_height: f.player_step_height.max(0.0),
             fixed_timestep: f.fixed_timestep.max(1.0 / 480.0),
             max_physics_steps_per_frame: f.max_physics_steps_per_frame.max(1),
 

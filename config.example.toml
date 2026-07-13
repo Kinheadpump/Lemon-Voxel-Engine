@@ -190,6 +190,9 @@ player_half_width = 0.3
 player_height = 1.8
 player_eye_height = 1.6
 ground_probe_distance = 0.1
+# Maximale Hoehe (Bloecke), die der Spieler ohne Sprung automatisch hochsteigt ("Auto-Step").
+# 1.0 (ein Voxel) ist die natuerliche Wahl - hoeher fuehlt sich an wie kleine Spruenge statt Gehen.
+player_step_height = 1.0
 fixed_timestep = 0.016666668
 max_physics_steps_per_frame = 8
 
