@@ -13,17 +13,65 @@ use voxel_engine::engine::render::pipeline::{
 use voxel_engine::engine::render::renderer::ChunkRenderer;
 use voxel_engine::engine::render::shadow::ShadowPass;
 use voxel_engine::engine::render::ssao::SsaoPass;
+use voxel_engine::game::world::blocks;
 use voxel_engine::game::world::chunk::{CHUNK_SIZE, Chunk};
 use voxel_engine::game::world::generator::TerrainGenerator;
 
 const SIZE: u32 = 256;
 const SAMPLES: u32 = 4;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-/// XZ-Chunk-Index eines bewaldeten Huegels weit ueber Meereshoehe (Welt-Y-Hoehe dort ~24-31) - der
-/// Weltursprung (Chunk 0,0) liegt beim aktuellen Generator direkt auf Meereshoehe und zeigt daher
-/// Strand (Sand) statt Gras.
-const CHUNK_X: i32 = -6;
-const CHUNK_Z: i32 = -20;
+
+/// Sucht deterministisch (Spirale um den Ursprung) den ersten Oberflaechen-Chunk, dessen Spalten
+/// mehrheitlich Gras exponieren - fest kodierte Koordinaten brachen bei jedem Terrain-Umbau.
+fn find_grassy_chunk(generator: &TerrainGenerator) -> (i32, i32, i32, i32) {
+    for radius in 0i32..64 {
+        for chunk_z in -radius..=radius {
+            for chunk_x in -radius..=radius {
+                if chunk_x.abs() != radius && chunk_z.abs() != radius {
+                    continue;
+                }
+                let mut heights = [0i32; (CHUNK_SIZE * CHUNK_SIZE) as usize];
+                let mut min_height = i32::MAX;
+                let mut max_height = i32::MIN;
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        let h = generator
+                            .height_at(chunk_x * CHUNK_SIZE + local_x, chunk_z * CHUNK_SIZE + local_z);
+                        heights[(local_z * CHUNK_SIZE + local_x) as usize] = h;
+                        min_height = min_height.min(h);
+                        max_height = max_height.max(h);
+                    }
+                }
+                // Flach (Kamera-Distanz zur Oberflaeche bleibt im FOV-Budget, s. `eye`), klar ueber
+                // Strand-Hoehe und alle Oberflaechen in EINEM Chunk-Y.
+                if min_height < 4 || max_height - min_height > 8 {
+                    continue;
+                }
+                let chunk_y = min_height.div_euclid(CHUNK_SIZE);
+                if max_height >= (chunk_y + 1) * CHUNK_SIZE {
+                    continue;
+                }
+
+                let mut chunk = Chunk::empty();
+                generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
+                let mut grass_surfaces = 0;
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        let local_y =
+                            heights[(local_z * CHUNK_SIZE + local_x) as usize] - chunk_y * CHUNK_SIZE;
+                        if chunk.get_block(local_x, local_y, local_z) == blocks::GRASS {
+                            grass_surfaces += 1;
+                        }
+                    }
+                }
+                if grass_surfaces * 100 >= (CHUNK_SIZE * CHUNK_SIZE) * 85 {
+                    return (chunk_x, chunk_y, chunk_z, max_height);
+                }
+            }
+        }
+    }
+    panic!("kein grasreicher Chunk in 64 Chunks Umkreis gefunden");
+}
 
 fn main() {
     let green_ratio = pollster::block_on(render_top_down_green_ratio());
@@ -64,7 +112,18 @@ async fn render_top_down_green_ratio() -> f32 {
         .await
         .expect("kein device");
 
-    let eye = glam::Vec3::new((CHUNK_X * CHUNK_SIZE + 16) as f32, 60.0, (CHUNK_Z * CHUNK_SIZE + 16) as f32);
+    let config = EngineConfig::default();
+    let generator = TerrainGenerator::new(&config);
+    let (chunk_x, chunk_y, chunk_z, surface_height) = find_grassy_chunk(&generator);
+    println!("Test-Chunk: ({chunk_x}, {chunk_y}, {chunk_z}), Oberflaeche bei y={surface_height}");
+
+    // Abstand so, dass die 32-Block-Chunk-Flaeche das 60-Grad-FOV fuellt (halbe Sichtweite bei
+    // Distanz d ist d*tan(30) - bei d=26 sind das ~15 Bloecke).
+    let eye = glam::Vec3::new(
+        (chunk_x * CHUNK_SIZE + 16) as f32,
+        (surface_height + 26) as f32,
+        (chunk_z * CHUNK_SIZE + 16) as f32,
+    );
     let projection =
         glam::camera::rh::proj::directx::perspective_infinite_reverse(60f32.to_radians(), 1.0, 0.1);
     let view = glam::camera::rh::view::look_to_mat4(
@@ -74,7 +133,6 @@ async fn render_top_down_green_ratio() -> f32 {
     );
     let view_proj = projection * view;
 
-    let config = EngineConfig::default();
     let shadow_pass = ShadowPass::new(
         &device,
         config.player.shadow_map_resolution,
@@ -84,13 +142,16 @@ async fn render_top_down_green_ratio() -> f32 {
     let chunk_pipeline = pipeline::create(&device, &queue, FORMAT, SAMPLES);
     let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, view_proj, &config, &shadow_pass);
 
-    let generator = TerrainGenerator::new(&config);
     let mut chunk = Chunk::empty();
-    generator.generate_chunk(CHUNK_X, 0, CHUNK_Z, &mut chunk);
-    let mesh = mesh_chunk(&chunk, CHUNK_X, 0, CHUNK_Z, [None; 6], |wx, wy, wz| generator.is_solid(wx, wy, wz));
+    generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
+    let mesh = mesh_chunk(&chunk, chunk_x, chunk_y, chunk_z, [None; 6], |wx, wy, wz| generator.is_solid(wx, wy, wz));
     renderer.update_camera(&queue, view_proj, eye, glam::Vec3::new(0.0, -1.0, 0.0));
     let handle = renderer.alloc_chunk(&queue, &mesh);
-    let aabb_min = glam::Vec3::new((CHUNK_X * CHUNK_SIZE) as f32, 0.0, (CHUNK_Z * CHUNK_SIZE) as f32);
+    let aabb_min = glam::Vec3::new(
+        (chunk_x * CHUNK_SIZE) as f32,
+        (chunk_y * CHUNK_SIZE) as f32,
+        (chunk_z * CHUNK_SIZE) as f32,
+    );
     let aabb_max = aabb_min + glam::Vec3::splat(CHUNK_SIZE as f32);
     renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, &handle);
 

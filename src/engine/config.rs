@@ -92,26 +92,18 @@ pub struct DevSettings {
     pub godray_temporal_blend: f32,
 
     pub terrain_seed: u32,
-    pub terrain_continental_frequency: f32,
+    /// Wellenlaenge (Weltbloecke) der Kontinental-Basisebene der Fenster-Pyramide
+    /// (`generator/pyramid.rs`, Ebene 0) - Land/Ozean-Wechsel auf dieser Skala.
+    pub terrain_continent_scale_blocks: f32,
     pub terrain_continental_amplitude: f32,
-    /// Amplitude des Berg-Boosts: `unorm(continental)^exponent * amplitude` - der Exponent (>1)
-    /// laesst Ebenen (kleine unorm-Werte) flach und nur die Kontinentalmaxima massiv hochschiessen.
+    /// Detail-Budget (Weltbloecke) der Verfeinerungs-Ebenen, verteilt nach `detail_share` und
+    /// moduliert durch die Bergmaske - der Exponent (>1) haelt Ebenen flach und laesst nur
+    /// Kontinentalmaxima zu Massiven aufsteigen.
     pub terrain_mountain_amplitude: f32,
     pub terrain_mountain_exponent: f32,
-    pub terrain_regional_frequency: f32,
-    pub terrain_regional_amplitude: f32,
-    /// fBm-Octave-Anzahl der Regional-Heightmap (4-5 fuer echtes Relief statt einer einzelnen,
-    /// glatten Perlin-Frequenz).
-    pub terrain_regional_octaves: u32,
-    /// Frequenz-Multiplikator pro fBm-Octave.
-    pub terrain_regional_lacunarity: f32,
-    /// Amplituden-Abfall pro fBm-Octave (Persistence/Gain).
-    pub terrain_regional_gain: f32,
-    pub terrain_cliff_mask_frequency: f32,
-    /// Sehr niedrigfrequente Biom-Karten (Features ueber viele hundert Bloecke) - strikte
-    /// Schwellwerte darauf ergeben grosse, zusammenhaengende Biome ohne Einzelblock-Bleeding.
-    pub terrain_temperature_frequency: f32,
-    pub terrain_humidity_frequency: f32,
+    /// Wellenlaenge (Weltbloecke) der Temperatur-/Feuchtigkeitsfelder (Pyramide Ebene 0) - grosse
+    /// zusammenhaengende Biome; die Hoehen-Lapse-Kopplung liegt in der Pyramide selbst.
+    pub terrain_climate_scale_blocks: f32,
     /// Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
     pub terrain_desert_temperature_min: f32,
     pub terrain_desert_humidity_max: f32,
@@ -245,27 +237,19 @@ impl Default for DevSettings {
             godray_temporal_blend: 0.12,
 
             terrain_seed: 1337,
-            // Kontinental-Skala ~625 Bloecke: Land/Ozean-Wechsel innerhalb einer explorierbaren
-            // Distanz (fruehere ~2650-Block-Periode war lokal unsichtbar -> alles wirkte flach).
-            terrain_continental_frequency: 0.0016,
+            // Kontinental-Skala ~2048 Bloecke: gross genug fuer echte Land/Ozean-Struktur, waehrend
+            // die Detail-Baender der Pyramide (Wellenlaengen 384/96/24) das lokale Relief tragen -
+            // anders als beim frueheren flachen fBm-Stack ist eine grosse Basis-Skala damit nicht
+            // mehr "lokal unsichtbar".
+            terrain_continent_scale_blocks: 2048.0,
             terrain_continental_amplitude: 55.0,
-            // unorm(cont)^5.5 * 130: hoher Exponent konzentriert die Berge auf die OBERSTEN
-            // Kontinental-Werte - das meiste Land bleibt sanftes Huegelland, nur die Kontinentalkerne
-            // tuermen sich zu (dann umso markanteren) Massiven auf. Kleiner Exponent liess frueher ein
-            // Viertel der Welt ueber Hoehe 80 liegen ("ueberall Berge").
+            // unorm(kontinentalhoehe)^5.5 * 130: hoher Exponent konzentriert die Berge auf die
+            // OBERSTEN Kontinental-Werte - das meiste Land bleibt sanftes Huegelland, nur die
+            // Kontinentalkerne tuermen sich zu (dann umso markanteren) Massiven auf.
             terrain_mountain_amplitude: 130.0,
             terrain_mountain_exponent: 5.5,
-            // Regional-Skala ~180 Bloecke, 4 Octaves: sanfte Huegel/Taeler statt hochfrequenter
-            // Zacken (frueher Periode 83 + 5 Octaves -> kleinteiliges Chaos auf der Sandebene).
-            terrain_regional_frequency: 0.0055,
-            terrain_regional_amplitude: 22.0,
-            terrain_regional_octaves: 4,
-            terrain_regional_lacunarity: 2.0,
-            terrain_regional_gain: 0.45,
-            terrain_cliff_mask_frequency: 0.008,
-            // Biom-Features ~650 Bloecke - grosse zusammenhaengende Wuesten/Graslaender.
-            terrain_temperature_frequency: 0.0015,
-            terrain_humidity_frequency: 0.0017,
+            // Biom-Features ~1000 Bloecke - grosse zusammenhaengende Wuesten/Graslaender.
+            terrain_climate_scale_blocks: 1024.0,
             terrain_desert_temperature_min: 0.25,
             terrain_desert_humidity_max: -0.05,
             // SANFT und SCHMAL: glaettet nur die unmittelbare Wasserlinie (±6 Bloecke, Exp 1.3),
@@ -480,18 +464,11 @@ struct DevSettingsFile {
     godray_temporal_blend: f32,
 
     terrain_seed: u32,
-    terrain_continental_frequency: f32,
+    terrain_continent_scale_blocks: f32,
     terrain_continental_amplitude: f32,
     terrain_mountain_amplitude: f32,
     terrain_mountain_exponent: f32,
-    terrain_regional_frequency: f32,
-    terrain_regional_amplitude: f32,
-    terrain_regional_octaves: u32,
-    terrain_regional_lacunarity: f32,
-    terrain_regional_gain: f32,
-    terrain_cliff_mask_frequency: f32,
-    terrain_temperature_frequency: f32,
-    terrain_humidity_frequency: f32,
+    terrain_climate_scale_blocks: f32,
     terrain_desert_temperature_min: f32,
     terrain_desert_humidity_max: f32,
     terrain_sea_compression_range: f32,
@@ -643,18 +620,11 @@ impl From<DevSettings> for DevSettingsFile {
             godray_temporal_blend: d.godray_temporal_blend,
 
             terrain_seed: d.terrain_seed,
-            terrain_continental_frequency: d.terrain_continental_frequency,
+            terrain_continent_scale_blocks: d.terrain_continent_scale_blocks,
             terrain_continental_amplitude: d.terrain_continental_amplitude,
             terrain_mountain_amplitude: d.terrain_mountain_amplitude,
             terrain_mountain_exponent: d.terrain_mountain_exponent,
-            terrain_regional_frequency: d.terrain_regional_frequency,
-            terrain_regional_amplitude: d.terrain_regional_amplitude,
-            terrain_regional_octaves: d.terrain_regional_octaves,
-            terrain_regional_lacunarity: d.terrain_regional_lacunarity,
-            terrain_regional_gain: d.terrain_regional_gain,
-            terrain_cliff_mask_frequency: d.terrain_cliff_mask_frequency,
-            terrain_temperature_frequency: d.terrain_temperature_frequency,
-            terrain_humidity_frequency: d.terrain_humidity_frequency,
+            terrain_climate_scale_blocks: d.terrain_climate_scale_blocks,
             terrain_desert_temperature_min: d.terrain_desert_temperature_min,
             terrain_desert_humidity_max: d.terrain_desert_humidity_max,
             terrain_sea_compression_range: d.terrain_sea_compression_range,
@@ -732,18 +702,11 @@ impl From<DevSettingsFile> for DevSettings {
             godray_temporal_blend: f.godray_temporal_blend.clamp(0.001, 1.0),
 
             terrain_seed: f.terrain_seed,
-            terrain_continental_frequency: f.terrain_continental_frequency,
+            terrain_continent_scale_blocks: f.terrain_continent_scale_blocks.max(64.0),
             terrain_continental_amplitude: f.terrain_continental_amplitude,
             terrain_mountain_amplitude: f.terrain_mountain_amplitude.max(0.0),
             terrain_mountain_exponent: f.terrain_mountain_exponent.max(1.0),
-            terrain_regional_frequency: f.terrain_regional_frequency,
-            terrain_regional_amplitude: f.terrain_regional_amplitude,
-            terrain_regional_octaves: f.terrain_regional_octaves.clamp(1, 8),
-            terrain_regional_lacunarity: f.terrain_regional_lacunarity.max(1.0),
-            terrain_regional_gain: f.terrain_regional_gain.clamp(0.0, 1.0),
-            terrain_cliff_mask_frequency: f.terrain_cliff_mask_frequency,
-            terrain_temperature_frequency: f.terrain_temperature_frequency,
-            terrain_humidity_frequency: f.terrain_humidity_frequency,
+            terrain_climate_scale_blocks: f.terrain_climate_scale_blocks.max(64.0),
             terrain_desert_temperature_min: f.terrain_desert_temperature_min,
             terrain_desert_humidity_max: f.terrain_desert_humidity_max,
             terrain_sea_compression_range: f.terrain_sea_compression_range.max(1.0),

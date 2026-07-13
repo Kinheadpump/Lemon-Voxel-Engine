@@ -11,11 +11,9 @@ use super::blocks::{self, ColumnSurface};
 use super::chunk::{CHUNK_SIZE, Chunk};
 
 mod flora;
+mod pyramid;
 use flora::{MAX_NEARBY_TREES, TREE_HEIGHT_SAFETY_MARGIN, TreeSpawn};
-
-/// Fraktales Perlin (fBm) fuer die Regional-Heightmap - mehrere Octaves mit konfigurierbarer
-/// Lacunarity/Gain statt einer einzelnen, glatten Frequenz (echtes Relief statt sanftem Gewoge).
-type RegionalFbm = common_noise::Fbm<common_noise::Perlin>;
+use pyramid::TerrainPyramid;
 
 /// F2-F1-Distanz (WorleyDifference): "Distanz zum 2. naechsten" minus "Distanz zum naechsten"
 /// Zellpunkt, unorm - nahe 0 heisst "genau auf der Voronoi-Zellgrenze". Zellgrenzen bilden (anders
@@ -33,14 +31,6 @@ const SEA_LEVEL: i32 = 0;
 /// geschlossen, s. `is_carved`).
 const WATER_LEVEL: i32 = SEA_LEVEL;
 
-/// Formt die "cliffy" Regional-Karte: Exponent < 1 auf `|noise|` drueckt die meisten Werte Richtung
-/// +-1 (breite Plateaus), nur nahe der Nulldurchgaenge bleibt eine schmale, steile Rampe - das ist
-/// die "Erosion Discontinuity" aus Yosemite-artigen Klippen ohne echtes 3D-Dichtefeld. Nicht zu
-/// aggressiv (0.55 statt frueher 0.35), sonst wirken die Klippen ueberall statt nur gelegentlich.
-const CLIFF_CONTRAST_EXPONENT: f32 = 0.55;
-/// Formt die Blend-Maske zwischen sanftem und "cliffy" Hoehenfeld: kleiner Exponent = weicherer,
-/// aber dennoch kontrastreicher Uebergang zwischen den Regionen (kein hartes Ein/Aus).
-const MASK_CONTRAST_EXPONENT: f32 = 0.6;
 /// Der oberste Block einer Saeule wird nie von Hoehlen durchbrochen, sonst entstehen einzelne
 /// Ein-Block-Loecher direkt im Gras.
 const MIN_CAVE_DEPTH: i32 = 1;
@@ -54,11 +44,6 @@ const ROCK_HEIGHT: f32 = 92.0;
 /// Warme Spalten brauchen mehr Hoehe fuer Fels, kalte weniger - dithert die Fels-Grenze mit dem
 /// (bereits gesampelten, glatten) Temperaturfeld statt einer harten Kontur.
 const ROCK_HEIGHT_TEMPERATURE_DITHER: f32 = 14.0;
-#[inline(always)]
-fn signed_pow(value: f32, exponent: f32) -> f32 {
-    value.signum() * value.abs().powf(exponent)
-}
-
 #[inline(always)]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
@@ -181,33 +166,14 @@ enum CarveBound {
     Maybe,
 }
 
-/// Multi-Stage-Terraingenerator: 2D-Rauschen fuer Hoehe/Klippen/Straende/Biome, 3D-Rauschen nur
-/// unterhalb der bereits bekannten Oberflaeche fuer die zwei Hoehlensysteme - siehe Kommentare an
-/// den einzelnen Feldern fuer die Rolle jeder Rauschschicht.
+/// Multi-Stage-Terraingenerator: Hoehe/Klima aus der hierarchischen Fenster-Pyramide
+/// (`generator/pyramid.rs`, InfiniteDiffusion-Schema), 3D-Rauschen nur unterhalb der bereits
+/// bekannten Oberflaeche fuer die zwei Hoehlensysteme.
 pub struct TerrainGenerator {
-    /// Sehr niedrige Frequenz, haelt Land/Ozean auf kontinentaler Ebene auseinander UND treibt den
-    /// exponentiellen Berg-Boost (s. `raw_height_at`).
-    continental: Noise<common_noise::Perlin>,
-    continental_frequency: f32,
-    continental_amplitude: f32,
-    mountain_amplitude: f32,
-    mountain_exponent: f32,
-    /// Fraktale (fBm) Huegel-Variante der Regional-Karte - 4-5 Octaves fuer echtes Relief.
-    regional_smooth: Noise<RegionalFbm>,
-    /// Kontrastierte Einzel-Frequenz derselben Skala - erzeugt die Klippen-Kandidaten.
-    regional_cliff: Noise<common_noise::Perlin>,
-    regional_frequency: f32,
-    regional_amplitude: f32,
-    /// Blend-Maske zwischen `regional_smooth` und `regional_cliff`.
-    cliff_mask: Noise<common_noise::Perlin>,
-    cliff_mask_frequency: f32,
-    sea_compression_range: f32,
-    sea_compression_exponent: f32,
+    /// Hierarchische Hoehen-/Klima-Synthese - einzige Quelle fuer Oberflaechenhoehe, Temperatur
+    /// und Feuchtigkeit (seed-konsistent, O(1)-Random-Access, s. Modul-Kommentar).
+    pyramid: TerrainPyramid,
     /// Strikte 2D-Biom-Achsen: Wueste nur bei hoher Temperatur UND geringer Feuchtigkeit.
-    temperature: Noise<common_noise::Perlin>,
-    temperature_frequency: f32,
-    humidity: Noise<common_noise::Perlin>,
-    humidity_frequency: f32,
     desert_temperature_min: f32,
     desert_humidity_max: f32,
     /// Grosse Cheese Caves: 3D-Perlin-Cutoff mit niedriger Frequenz (ausgedehnte Kavernen statt
@@ -264,31 +230,6 @@ pub struct TerrainGenerator {
 
 impl TerrainGenerator {
     pub fn new(config: &EngineConfig) -> Self {
-        let mut continental = Noise::<common_noise::Perlin>::default();
-        continental.set_seed(config.dev.terrain_seed);
-
-        let mut regional_smooth = Noise::from(LayeredNoise::new(
-            Normed::default(),
-            Persistence(config.dev.terrain_regional_gain),
-            FractalLayers {
-                layer: Octave(common_noise::Perlin::default()),
-                lacunarity: config.dev.terrain_regional_lacunarity,
-                amount: config.dev.terrain_regional_octaves,
-            },
-        ));
-        regional_smooth.set_seed(config.dev.terrain_seed.wrapping_add(0x9E37_79B9));
-
-        let mut regional_cliff = Noise::<common_noise::Perlin>::default();
-        regional_cliff.set_seed(config.dev.terrain_seed.wrapping_add(0x85EB_CA77));
-
-        let mut cliff_mask = Noise::<common_noise::Perlin>::default();
-        cliff_mask.set_seed(config.dev.terrain_seed.wrapping_add(0xC2B2_AE3D));
-
-        let mut temperature = Noise::<common_noise::Perlin>::default();
-        temperature.set_seed(config.dev.terrain_seed.wrapping_add(0x68E3_1DA4));
-        let mut humidity = Noise::<common_noise::Perlin>::default();
-        humidity.set_seed(config.dev.terrain_seed.wrapping_add(0xB529_7A4D));
-
         let mut cheese = Noise::<common_noise::Perlin>::default();
         cheese.set_seed(config.dev.terrain_seed.wrapping_add(0x27D4_EB2F));
 
@@ -302,23 +243,7 @@ impl TerrainGenerator {
         cave_region.set_seed(config.dev.terrain_seed.wrapping_add(0x1656_67B1));
 
         Self {
-            continental,
-            continental_frequency: config.dev.terrain_continental_frequency,
-            continental_amplitude: config.dev.terrain_continental_amplitude,
-            mountain_amplitude: config.dev.terrain_mountain_amplitude,
-            mountain_exponent: config.dev.terrain_mountain_exponent,
-            regional_smooth,
-            regional_cliff,
-            regional_frequency: config.dev.terrain_regional_frequency,
-            regional_amplitude: config.dev.terrain_regional_amplitude,
-            cliff_mask,
-            cliff_mask_frequency: config.dev.terrain_cliff_mask_frequency,
-            sea_compression_range: config.dev.terrain_sea_compression_range.max(1.0),
-            sea_compression_exponent: config.dev.terrain_sea_compression_exponent,
-            temperature,
-            temperature_frequency: config.dev.terrain_temperature_frequency,
-            humidity,
-            humidity_frequency: config.dev.terrain_humidity_frequency,
+            pyramid: TerrainPyramid::new(config),
             desert_temperature_min: config.dev.terrain_desert_temperature_min,
             desert_humidity_max: config.dev.terrain_desert_humidity_max,
             cheese,
@@ -405,53 +330,10 @@ impl TerrainGenerator {
             if cached_x == world_x && cached_z == world_z {
                 return cached_height;
             }
-            let height = self.raw_height_at(world_x, world_z).round() as i32;
+            let height = self.pyramid.sample(world_x, world_z).height.round() as i32;
             cache[slot] = (world_x, world_z, height);
             height
         })
-    }
-
-    fn raw_height_at(&self, world_x: i32, world_z: i32) -> f32 {
-        let continental = self.sample2d(
-            &self.continental,
-            self.continental_frequency,
-            world_x,
-            world_z,
-        );
-        let smooth = self.sample2d(
-            &self.regional_smooth,
-            self.regional_frequency,
-            world_x,
-            world_z,
-        );
-        let cliff_raw = self.sample2d(
-            &self.regional_cliff,
-            self.regional_frequency,
-            world_x,
-            world_z,
-        );
-        let cliff = signed_pow(cliff_raw, CLIFF_CONTRAST_EXPONENT);
-        let mask_raw = self.sample2d(
-            &self.cliff_mask,
-            self.cliff_mask_frequency,
-            world_x,
-            world_z,
-        );
-        let blend = signed_pow(mask_raw, MASK_CONTRAST_EXPONENT) * 0.5 + 0.5;
-
-        // Continentalness-Shaping: `unorm^exponent` haelt Ebenen/Meere flach (unorm um 0.5 traegt
-        // kaum bei) und laesst NUR die Kontinentalmaxima exponentiell zu Bergmassiven hochschiessen -
-        // reuse desselben Kontinental-Samples, keine zusaetzliche Rauschprobe.
-        let mountain =
-            ((continental + 1.0) * 0.5).powf(self.mountain_exponent) * self.mountain_amplitude;
-
-        let regional_shape = lerp(smooth, cliff, blend);
-        let raw_height = SEA_LEVEL as f32
-            + continental * self.continental_amplitude
-            + mountain
-            + regional_shape * self.regional_amplitude;
-
-        self.compress_toward_sea_level(raw_height)
     }
 
     /// Wasserfuellung: NUR ueber der Terrainoberflaeche bis zum Wasserspiegel (Ozeane/Seen in
@@ -461,18 +343,6 @@ impl TerrainGenerator {
     #[inline(always)]
     fn is_water_position(height: i32, world_y: i32) -> bool {
         world_y > height && world_y <= WATER_LEVEL
-    }
-
-    /// Drueckt Hoehen nahe `SEA_LEVEL` mit sanft steigender Staerke Richtung Meereshoehe (flache
-    /// Straende), laesst Werte jenseits von `sea_compression_range` unveraendert linear weiterlaufen
-    /// (Gebirge/Tiefsee werden nicht gedeckelt).
-    fn compress_toward_sea_level(&self, height: f32) -> f32 {
-        let range = self.sea_compression_range;
-        let delta = height - SEA_LEVEL as f32;
-        let clamped = delta.clamp(-range, range);
-        let excess = delta - clamped;
-        let shaped = signed_pow(clamped / range, self.sea_compression_exponent) * range;
-        SEA_LEVEL as f32 + shaped + excess
     }
 
     /// 0 bei/ueber `SEA_LEVEL`, waechst linear bis 1 nach `cave_widen_depth_range` Bloecken Tiefe
@@ -1683,21 +1553,15 @@ impl TerrainGenerator {
     /// Block-ID (Sand vs. Gras), nie die Festigkeit - keine Konsistenzanforderung an den Fallback,
     /// keine zusaetzlichen Rauschproben im Mesher-/Physik-Hotpath.
     fn column_surface(&self, world_x: i32, world_z: i32, height: i32) -> ColumnSurface {
-        let temperature = self.sample2d(
-            &self.temperature,
-            self.temperature_frequency,
-            world_x,
-            world_z,
-        );
-        let humidity = self.sample2d(&self.humidity, self.humidity_frequency, world_x, world_z);
-        let rock_height = ROCK_HEIGHT + temperature * ROCK_HEIGHT_TEMPERATURE_DITHER;
+        let sample = self.pyramid.sample(world_x, world_z);
+        let rock_height = ROCK_HEIGHT + sample.temperature * ROCK_HEIGHT_TEMPERATURE_DITHER;
         ColumnSurface {
             is_beach: (height - WATER_LEVEL).abs() <= BEACH_HALF_RANGE,
             is_underwater: height < WATER_LEVEL,
-            is_desert: temperature > self.desert_temperature_min
-                && humidity < self.desert_humidity_max,
+            is_desert: sample.temperature > self.desert_temperature_min
+                && sample.humidity < self.desert_humidity_max,
             is_rock: height as f32 > rock_height,
-            temperature,
+            temperature: sample.temperature,
         }
     }
 }
@@ -1998,6 +1862,36 @@ mod tests {
     /// Diagnose-Tool, KEIN Korrektheitstest - misst die tatsaechliche Verteilung von Cheese-Cave-
     /// Dichte, Tunnel-F2-F1-Distanz und Region-Gate an vielen Punkten, um die Schwellwerte empirisch
     /// zu kalibrieren statt sie zu erraten (ein naiv "klein wirkender" Schwellwert kann je nach
+    /// Durchsatz der Chunk-Generierung (Pyramide + Hoehlen + Flora) ueber ein frisches
+    /// Oberflaechen-Streaming-Fenster, inklusive Kalt-Start der Fenster-Caches. Manuell:
+    /// `cargo test --release --lib -- --ignored --nocapture profile_generate_chunk`
+    #[test]
+    #[ignore = "Diagnose-Tool, kein automatisierter Test - siehe Doc-Kommentar"]
+    fn profile_generate_chunk() {
+        use std::time::Instant;
+
+        let generator = TerrainGenerator::new(&EngineConfig::default());
+        let mut chunk = Chunk::empty();
+
+        let start = Instant::now();
+        let mut generated = 0u32;
+        for chunk_x in -8..8 {
+            for chunk_z in -8..8 {
+                for chunk_y in -2..2 {
+                    generator.generate_chunk(chunk_x, chunk_y, chunk_z, &mut chunk);
+                    generated += 1;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "{generated} Chunks in {:.1} ms -> {:.3} ms/Chunk ({:.0} Chunks/s, 1 Thread)",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / generated as f64,
+            generated as f64 / elapsed.as_secs_f64(),
+        );
+    }
+
     /// Rauschverteilung trotzdem den Grossteil des Volumens aushoehlen). Manuell ausfuehren mit:
     /// `cargo test --release --lib -- --ignored --nocapture calibrate_cave_thresholds`
     #[test]
