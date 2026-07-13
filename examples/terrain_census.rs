@@ -96,4 +96,32 @@ fn main() {
     println!("Stein:  {:.1}%", f(counts[TEXTURE_LAYER_STONE as usize]));
     println!("Sand:   {:.1}%", f(counts[TEXTURE_LAYER_SAND as usize]));
     println!("Wasser: {:.1}%", f(counts[TEXTURE_LAYER_WATER as usize]));
+
+    // 3) "Wie weit muss ich fliegen, bis ich einen Berg sehe?" - vier Strahlen vom Ursprung,
+    // Entfernung bis zur ersten Spalte ueber ROCK_HEIGHT(92)/150/200.
+    println!("\n== Entfernung bis zum ersten Berg (4 Richtungen vom Ursprung) ==");
+    let directions: [(i32, i32); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+    for threshold in [92, 150, 200] {
+        let mut distances = Vec::new();
+        for (dx, dz) in directions {
+            let mut found = None;
+            for d in (0..40_000).step_by(4) {
+                let h = generator.height_at(dx * d, dz * d);
+                if h > threshold {
+                    found = Some(d);
+                    break;
+                }
+            }
+            distances.push(found);
+        }
+        println!("  >{threshold}: {distances:?}");
+    }
+
+    // 4) Wellenlaenge-Charakterisierung: Transekt ueber 8192 Bloecke, grob gesampelt, um die
+    // tatsaechliche raeumliche Periode der grossen Landmassen sichtbar zu machen.
+    println!("\n== Langer Transekt (alle 128 Bloecke, X-Achse, Z=0) ==");
+    for wx in (-8192..8192).step_by(128) {
+        print!("{} ", generator.height_at(wx, 0));
+    }
+    println!();
 }

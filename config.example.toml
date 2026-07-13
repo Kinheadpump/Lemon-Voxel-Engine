@@ -94,20 +94,23 @@ terrain_seed = 1337
 # konfigurierbares Detail hinzu (Arrays unten, Index 0..2 = Ebene 1..3, grob nach fein).
 
 # Wellenlaenge (Weltbloecke) der Kontinental-Basisebene (Ebene 0) - Land/Ozean-Wechsel auf dieser
-# Skala.
-terrain_continent_scale_blocks = 2048.0
-# Empirisch kalibriert (s. examples/terrain_census.rs) - der nominale Wert uebersetzt sich NICHT
-# 1:1 in erreichte Hoehe, das MultiDiffusion-Fenster-Blending daempft die Varianz gegenueber der
-# rohen FBm-Amplitude erheblich. 80/400 ergeben ueber ein 2048x2048-Weltblock-Fenster: min=-36
-# p50=-5 p75=16 p95=52 max=134..185 (echte Tiefsee, verbreitete Huegel, seltene alpine Gipfel).
-terrain_continental_amplitude = 80.0
-# Amplitude/Schaerfe des Berg-Boosts: unorm(kontinentalhoehe)^exponent * amplitude - der Exponent
-# (>1) haelt Ebenen flach, nur Kontinentalmaxima werden zu markanten Massiven. Skaliert die
-# Bergmaske, die wiederum das Detail-Budget der Ebenen 1-3 unten moduliert. Dank der Maske betrifft
-# eine Erhoehung fast nur die Extremwerte (macht Gipfel dramatischer, ohne den generellen
-# Huegel-Charakter des restlichen Terrains zu veraendern).
-terrain_mountain_amplitude = 400.0
-terrain_mountain_exponent = 5.5
+# Skala. Empirisch kalibriert (s. examples/terrain_census.rs, "Entfernung bis zum ersten Berg"):
+# 2048 sah in globalen Prozentwerten gut aus, erzeugte im Spiel aber riesige eintoenige Kontinente
+# OHNE Berge in Sichtweite (echte Gipfel im Schnitt >20.000 Bloecke entfernt) - das feste
+# 8192-Block-Mittelungsfenster der groebsten Pyramiden-Ebene mittelt bei dieser Wellenlaenge fast
+# alles weg. 1024 gibt mehr unabhaengige Gipfel-Kandidaten pro Flaeche.
+terrain_continent_scale_blocks = 1024.0
+terrain_continental_amplitude = 100.0
+# Amplitude/Schaerfe des Berg-Boosts: unorm(kontinentalhoehe)^exponent * amplitude. Mit
+# 1024/100/500/2.5 liegt der naechste Berg (>92, Fels-/Schneegrenze) in jeder von 4 getesteten
+# Richtungen innerhalb von 350-1400 Bloecken vom Ursprung. Ueber ein 2048x2048-Weltblock-Fenster:
+# min=-59 p50=6 p75=34 p95=173 max=335, Ozean 37%.
+terrain_mountain_amplitude = 500.0
+# Exponent 2.5 statt hoeher: bei hohem Exponent ist die Bergmaske ausserhalb der absoluten
+# Rausch-Extremwerte praktisch Null (nur der eine hoechste Punkt pro Kontinental-Periode bekommt
+# ueberhaupt Bergbeitrag) - ein niedrigerer Exponent laesst ein deutlich groesseres Gebiet um jeden
+# Kontinentalgipfel spuerbar ansteigen, aus vereinzelten Nadelspitzen werden echte Bergketten.
+terrain_mountain_exponent = 2.5
 
 # Anteil jedes Verfeinerungs-Detailbands (Ebene 1-3) am Gesamt-Budget - faellt zur feinsten
 # Ebene hin ab, da die groebere Ebene bereits den Grossteil des sichtbaren Reliefs traegt.

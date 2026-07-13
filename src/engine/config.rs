@@ -276,27 +276,30 @@ impl Default for DevSettings {
             godray_temporal_blend: 0.12,
 
             terrain_seed: 1337,
-            // Kontinental-Skala ~2048 Bloecke: gross genug fuer echte Land/Ozean-Struktur, waehrend
-            // die Detail-Baender der Pyramide (Wellenlaengen 384/96/24) das lokale Relief tragen -
-            // anders als beim frueheren flachen fBm-Stack ist eine grosse Basis-Skala damit nicht
-            // mehr "lokal unsichtbar".
-            terrain_continent_scale_blocks: 2048.0,
-            // Empirisch kalibriert (s. examples/terrain_census.rs): der nominale Amplitudenwert
-            // uebersetzt sich NICHT 1:1 in erreichte Hoehe - das MultiDiffusion-Fenster-Blending
-            // (Mittelung ueberlappender Fenster, s. pyramid.rs) daempft die tatsaechliche Varianz
-            // gegenueber der rohen FBm-Amplitude erheblich. Bei den fruehereren 55/130 erreichte
-            // ein 2048x2048-Weltblock-Fenster nur h=-15..17 (fast nur seichtes Ozean-Geplaetscher,
-            // "flache Pfuetzen" statt Meer) - 80/400 ergeben min=-36 p50=-5 p75=16 p95=52 max=134..185
-            // (echte Tiefsee, verbreitete Huegel, seltene alpine Gipfel bis in die Fels-/Schneezone).
-            terrain_continental_amplitude: 80.0,
-            // unorm(kontinentalhoehe)^5.5 * 400: hoher Exponent konzentriert die Berge auf die
-            // OBERSTEN Kontinental-Werte - das meiste Land bleibt sanftes Huegelland, nur die
-            // Kontinentalkerne tuermen sich zu (dann umso markanteren) Massiven auf. Erhoehung
-            // gegenueber vorher (130) betrifft dank der Maske fast nur die Extremwerte (p95 wandert
-            // kaum, max schiesst deutlich hoeher) - macht Gipfel dramatischer, ohne den generellen
-            // Huegel-Charakter des restlichen Terrains zu veraendern.
-            terrain_mountain_amplitude: 400.0,
-            terrain_mountain_exponent: 5.5,
+            // Empirisch kalibriert (s. examples/terrain_census.rs, "Entfernung bis zum ersten
+            // Berg"-Diagnose). Erste Kalibrierung (2048/80/400/5.5) sah in globalen Prozentwerten
+            // gut aus (min/max ueber ein grosses Fenster), erzeugte im echten Spiel aber riesige,
+            // eintoenige Kontinente OHNE Berge in Sichtweite: bei Wellenlaenge 2048 UND dem festen
+            // 8192-Block-Fenster der groebsten Pyramiden-Ebene (32 Fenster-Pixel * 256 Bloecke/Pixel,
+            // strukturell fix) wird die Hoehe so stark weggemittelt, dass echte Gipfel (>150) im
+            // Schnitt >20.000 Bloecke vom Ursprung entfernt lagen - technisch vorhanden, praktisch
+            // unerreichbar. Kuerzere Kontinental-Skala (mehr unabhaengige Gipfel-Kandidaten pro
+            // Flaeche) UND ein sanfterer Bergmasken-Exponent (mehr Flaeche mit spuerbarem
+            // Bergmasken-Wert statt nur der absoluten Spitze) verkuerzen diese Distanz drastisch,
+            // auf Kosten einer etwas kleineren "Kontinentgroesse".
+            terrain_continent_scale_blocks: 1024.0,
+            terrain_continental_amplitude: 100.0,
+            // Mit 1024/100/500/2.5 liegt der naechste Berg (>92, Fels-/Schneegrenze) in JEDER von 4
+            // getesteten Richtungen innerhalb von 350-1400 Bloecken vom Ursprung (vorher:
+            // >20.000 in 2 von 4 Richtungen, teils gar nicht in 40.000 gefunden). Ueber ein
+            // 2048x2048-Weltblock-Fenster: min=-59 p50=6 p75=34 p95=173 max=335, Ozean 37%.
+            terrain_mountain_amplitude: 500.0,
+            // Exponent von 5.5 auf 2.5 gesenkt: bei 5.5 ist die Bergmaske ausserhalb der absoluten
+            // Rausch-Extremwerte praktisch Null (nur der eine hoechste Punkt pro Kontinental-Periode
+            // bekommt ueberhaupt Bergbeitrag) - 2.5 laesst ein deutlich groesseres Gebiet um jeden
+            // Kontinentalgipfel herum spuerbar ansteigen, aus vereinzelten Nadelspitzen werden echte
+            // Bergketten/-massive.
+            terrain_mountain_exponent: 2.5,
             // Detail-Budget faellt zur feinsten Ebene hin ab (0.5/0.32/0.18) - die groebere Ebene
             // traegt bereits den Grossteil des sichtbaren Reliefs, feinere Ebenen fuegen nur noch
             // Textur hinzu. Wellenlaengen 384/96/24 Bloecke, je 1/4 der vorherigen Ebene passend
