@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::game::math::cascades::MAX_SHADOW_CASCADES;
+use crate::game::world::generator::pyramid::DETAIL_LEVEL_COUNT;
 
 pub const CONFIG_PATH: &str = "config.toml";
 
@@ -101,8 +102,37 @@ pub struct DevSettings {
     /// Kontinentalmaxima zu Massiven aufsteigen.
     pub terrain_mountain_amplitude: f32,
     pub terrain_mountain_exponent: f32,
+    /// Anteil jedes Verfeinerungs-Detailbands am Gesamt-Budget, Index 0..2 fuer Pyramiden-Ebene
+    /// 1..3 (Ebene 0 ist reine Basis-Synthese ohne Detail). Skaliert mit `terrain_mountain_amplitude`
+    /// UND `terrain_plains_roughness` - hoeherer Anteil auf einer feineren Ebene betont deren
+    /// Wellenlaenge (`terrain_detail_wavelength_blocks`) im Gesamtrelief staerker.
+    pub terrain_detail_share: [f32; DETAIL_LEVEL_COUNT],
+    /// Wellenlaenge (Weltbloecke) des Detail-fBm jeder Verfeinerungs-Ebene, gleiche Indizierung wie
+    /// `terrain_detail_share`.
+    pub terrain_detail_wavelength_blocks: [f32; DETAIL_LEVEL_COUNT],
+    /// Anzahl thermischer-Relaxations-Durchlaeufe pro Verfeinerungs-Ebene (0 = keine Erosion),
+    /// gleiche Indizierung wie `terrain_detail_share`. Jeder Durchlauf kostet einen vollen
+    /// Fenster-Scan - hoehere Werte auf feinen Ebenen sind teurer als auf groben.
+    pub terrain_erosion_iterations: [u32; DETAIL_LEVEL_COUNT],
+    /// Ab welcher Bergmaske (0..1) das Detail vollstaendig von Smooth- auf Ridged-Charakteristik
+    /// umschaltet - kleiner Wert laesst Grate schon an sanften Huegeln auftauchen, grosser Wert
+    /// haelt sie auf die hoechsten Gipfel beschraenkt.
+    pub terrain_ridge_full_blend_mask: f32,
+    /// Steigungsschwelle (Bloecke Hoehendifferenz pro Block Pixelabstand) der thermischen
+    /// Relaxation - flachere Haenge bleiben unangetastet, steilere werden Richtung Schuttkegel
+    /// geglaettet.
+    pub terrain_erosion_talus_slope: f32,
+    /// Mischfaktor pro Relaxations-Durchlauf zwischen unveraendert und vollem Nachbarschaftsmittel
+    /// (0..1) - hoeher = aggressivere Glaettung pro Iteration.
+    pub terrain_erosion_strength: f32,
+    /// Grundrauhigkeit (Bloecke) der Ebenen ausserhalb von Bergmasken - verhindert Billardtisch-
+    /// Flaechen, ohne das Gebirgs-Budget (`terrain_mountain_amplitude`) anzutasten.
+    pub terrain_plains_roughness: f32,
+    /// Temperaturabfall pro Weltblock Hoehe ueber dem Meer (snorm-Einheiten) - koppelt Klima
+    /// kausal an das erzeugte Relief (Fels-/Nadelwald-Grenzen folgen Bergen statt eigenem Rauschen).
+    pub terrain_temperature_lapse_per_block: f32,
     /// Wellenlaenge (Weltbloecke) der Temperatur-/Feuchtigkeitsfelder (Pyramide Ebene 0) - grosse
-    /// zusammenhaengende Biome; die Hoehen-Lapse-Kopplung liegt in der Pyramide selbst.
+    /// zusammenhaengende Biome.
     pub terrain_climate_scale_blocks: f32,
     /// Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
     pub terrain_desert_temperature_min: f32,
@@ -248,6 +278,20 @@ impl Default for DevSettings {
             // Kontinentalkerne tuermen sich zu (dann umso markanteren) Massiven auf.
             terrain_mountain_amplitude: 130.0,
             terrain_mountain_exponent: 5.5,
+            // Detail-Budget faellt zur feinsten Ebene hin ab (0.5/0.32/0.18) - die groebere Ebene
+            // traegt bereits den Grossteil des sichtbaren Reliefs, feinere Ebenen fuegen nur noch
+            // Textur hinzu. Wellenlaengen 384/96/24 Bloecke, je 1/4 der vorherigen Ebene passend
+            // zum Pixelmass-Faktor 4 (`BLOCKS_PER_PIXEL`). Erosion nur auf den beiden feinsten
+            // Ebenen (0/2/2 Iterationen) - auf der groebsten waere die Talus-Schwelle bei
+            // Pixelmass 64 kaum je ueberschritten.
+            terrain_detail_share: [0.5, 0.32, 0.18],
+            terrain_detail_wavelength_blocks: [384.0, 96.0, 24.0],
+            terrain_erosion_iterations: [0, 2, 2],
+            terrain_ridge_full_blend_mask: 0.8,
+            terrain_erosion_talus_slope: 1.2,
+            terrain_erosion_strength: 0.4,
+            terrain_plains_roughness: 9.0,
+            terrain_temperature_lapse_per_block: 0.004,
             // Biom-Features ~1000 Bloecke - grosse zusammenhaengende Wuesten/Graslaender.
             terrain_climate_scale_blocks: 1024.0,
             terrain_desert_temperature_min: 0.25,
@@ -468,6 +512,14 @@ struct DevSettingsFile {
     terrain_continental_amplitude: f32,
     terrain_mountain_amplitude: f32,
     terrain_mountain_exponent: f32,
+    terrain_detail_share: [f32; DETAIL_LEVEL_COUNT],
+    terrain_detail_wavelength_blocks: [f32; DETAIL_LEVEL_COUNT],
+    terrain_erosion_iterations: [u32; DETAIL_LEVEL_COUNT],
+    terrain_ridge_full_blend_mask: f32,
+    terrain_erosion_talus_slope: f32,
+    terrain_erosion_strength: f32,
+    terrain_plains_roughness: f32,
+    terrain_temperature_lapse_per_block: f32,
     terrain_climate_scale_blocks: f32,
     terrain_desert_temperature_min: f32,
     terrain_desert_humidity_max: f32,
@@ -624,6 +676,14 @@ impl From<DevSettings> for DevSettingsFile {
             terrain_continental_amplitude: d.terrain_continental_amplitude,
             terrain_mountain_amplitude: d.terrain_mountain_amplitude,
             terrain_mountain_exponent: d.terrain_mountain_exponent,
+            terrain_detail_share: d.terrain_detail_share,
+            terrain_detail_wavelength_blocks: d.terrain_detail_wavelength_blocks,
+            terrain_erosion_iterations: d.terrain_erosion_iterations,
+            terrain_ridge_full_blend_mask: d.terrain_ridge_full_blend_mask,
+            terrain_erosion_talus_slope: d.terrain_erosion_talus_slope,
+            terrain_erosion_strength: d.terrain_erosion_strength,
+            terrain_plains_roughness: d.terrain_plains_roughness,
+            terrain_temperature_lapse_per_block: d.terrain_temperature_lapse_per_block,
             terrain_climate_scale_blocks: d.terrain_climate_scale_blocks,
             terrain_desert_temperature_min: d.terrain_desert_temperature_min,
             terrain_desert_humidity_max: d.terrain_desert_humidity_max,
@@ -706,6 +766,14 @@ impl From<DevSettingsFile> for DevSettings {
             terrain_continental_amplitude: f.terrain_continental_amplitude,
             terrain_mountain_amplitude: f.terrain_mountain_amplitude.max(0.0),
             terrain_mountain_exponent: f.terrain_mountain_exponent.max(1.0),
+            terrain_detail_share: f.terrain_detail_share.map(|v| v.max(0.0)),
+            terrain_detail_wavelength_blocks: f.terrain_detail_wavelength_blocks.map(|v| v.max(1.0)),
+            terrain_erosion_iterations: f.terrain_erosion_iterations.map(|v| v.min(8)),
+            terrain_ridge_full_blend_mask: f.terrain_ridge_full_blend_mask.max(0.01),
+            terrain_erosion_talus_slope: f.terrain_erosion_talus_slope.max(0.0),
+            terrain_erosion_strength: f.terrain_erosion_strength.clamp(0.0, 1.0),
+            terrain_plains_roughness: f.terrain_plains_roughness.max(0.0),
+            terrain_temperature_lapse_per_block: f.terrain_temperature_lapse_per_block.max(0.0),
             terrain_climate_scale_blocks: f.terrain_climate_scale_blocks.max(64.0),
             terrain_desert_temperature_min: f.terrain_desert_temperature_min,
             terrain_desert_humidity_max: f.terrain_desert_humidity_max,

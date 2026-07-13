@@ -88,21 +88,51 @@ godray_temporal_blend = 0.12
 
 terrain_seed = 1337
 # Terrain-Hoehe/-Klima stammen aus einer hierarchischen Fenster-Pyramide (InfiniteDiffusion-
-# Schema, s. src/game/world/generator/pyramid.rs): eine Kaskade progressiv feinerer Ebenen,
-# jede erzeugt ueberlappende Fenster, die per Gewichtskernel nahtlos gemittelt werden. Jede
-# Ebene verfeinert die vorherige um Faktor 4 - die zwei Skalen unten setzen NUR die groebste
-# (erste) Ebene, die feineren Detailbaender (Wellenlaengen 384/96/24 Bloecke) sind intern fix.
+# Schema, s. src/game/world/generator/pyramid.rs): eine Kaskade aus 4 progressiv feineren Ebenen
+# (Pixelmass 256/64/16/4 Bloecke, strukturell fix), jede erzeugt ueberlappende Fenster, die per
+# Gewichtskernel nahtlos gemittelt werden. Ebene 0 ist reine Basis-Synthese, Ebenen 1-3 fuegen
+# konfigurierbares Detail hinzu (Arrays unten, Index 0..2 = Ebene 1..3, grob nach fein).
 
-# Wellenlaenge (Weltbloecke) der Kontinental-Basisebene - Land/Ozean-Wechsel auf dieser Skala.
+# Wellenlaenge (Weltbloecke) der Kontinental-Basisebene (Ebene 0) - Land/Ozean-Wechsel auf dieser
+# Skala.
 terrain_continent_scale_blocks = 2048.0
 terrain_continental_amplitude = 55.0
-# Detail-Budget der Verfeinerungs-Ebenen, moduliert durch die Bergmaske: unorm(kontinentalhoehe)
-# ^exponent * amplitude - der Exponent (>1) haelt Ebenen flach, nur Kontinentalmaxima werden zu
-# markanten Massiven.
+# Amplitude/Schaerfe des Berg-Boosts: unorm(kontinentalhoehe)^exponent * amplitude - der Exponent
+# (>1) haelt Ebenen flach, nur Kontinentalmaxima werden zu markanten Massiven. Skaliert die
+# Bergmaske, die wiederum das Detail-Budget der Ebenen 1-3 unten moduliert.
 terrain_mountain_amplitude = 130.0
 terrain_mountain_exponent = 5.5
-# Wellenlaenge (Weltbloecke) der Temperatur-/Feuchtigkeitsfelder - grosse zusammenhaengende
-# Biome. Die Hoehen-Lapse-Kopplung (kaeltere Gipfel) sitzt fest in der Pyramide.
+
+# Anteil jedes Verfeinerungs-Detailbands (Ebene 1-3) am Gesamt-Budget - faellt zur feinsten
+# Ebene hin ab, da die groebere Ebene bereits den Grossteil des sichtbaren Reliefs traegt.
+terrain_detail_share = [0.5, 0.32, 0.18]
+# Wellenlaenge (Weltbloecke) des Detail-fBm jeder Ebene, gleiche Reihenfolge wie oben - je 1/4
+# der vorherigen Ebene passend zum Pixelmass-Faktor 4 zwischen den Ebenen.
+terrain_detail_wavelength_blocks = [384.0, 96.0, 24.0]
+# Thermische-Relaxations-Durchlaeufe pro Ebene (0 = keine Erosion) - jeder Durchlauf glaettet
+# Bereiche, deren lokales Relief terrain_erosion_talus_slope ueberschreitet, Richtung
+# Nachbarschaftsmittel. Kostet einen vollen Fenster-Scan pro Iteration; auf der groebsten Ebene
+# (Pixelmass 64) wird die Talus-Schwelle kaum je ueberschritten, daher dort 0.
+terrain_erosion_iterations = [0, 2, 2]
+# Ab welcher Bergmaske (0..1) das Detail vollstaendig von Smooth- auf Ridged-Charakteristik
+# umschaltet - kleiner Wert laesst Grate schon an sanften Huegeln auftauchen, grosser Wert
+# haelt sie auf die hoechsten Gipfel beschraenkt.
+terrain_ridge_full_blend_mask = 0.8
+# Steigungsschwelle (Bloecke Hoehendifferenz pro Block Pixelabstand) der thermischen Relaxation -
+# flachere Haenge bleiben unangetastet, steilere werden Richtung Schuttkegel geglaettet.
+terrain_erosion_talus_slope = 1.2
+# Mischfaktor pro Relaxations-Durchlauf zwischen unveraendert und vollem Nachbarschaftsmittel
+# (0..1) - hoeher = aggressivere Glaettung pro Iteration.
+terrain_erosion_strength = 0.4
+# Grundrauhigkeit (Bloecke) der Ebenen ausserhalb von Bergmasken - verhindert Billardtisch-
+# Flaechen, ohne das Gebirgs-Budget (terrain_mountain_amplitude) anzutasten.
+terrain_plains_roughness = 9.0
+# Temperaturabfall pro Weltblock Hoehe ueber dem Meer (snorm-Einheiten) - koppelt Klima kausal
+# an das erzeugte Relief (Fels-/Nadelwald-Grenzen folgen Bergen statt eigenem Rauschen).
+terrain_temperature_lapse_per_block = 0.004
+
+# Wellenlaenge (Weltbloecke) der Temperatur-/Feuchtigkeitsfelder (Ebene 0) - grosse
+# zusammenhaengende Biome.
 terrain_climate_scale_blocks = 1024.0
 # Wueste NUR wenn Temperatur > min UND Feuchtigkeit < max (snorm -1..1) - striktes 2D-Mapping.
 terrain_desert_temperature_min = 0.25

@@ -23,11 +23,17 @@ pub struct TerrainPyramid {
     humidity: Noise<common_noise::Perlin>,
     climate_frequency: f32,
     detail: [Noise<DetailFbm>; LEVEL_COUNT],
+    levels: [LevelSpec; LEVEL_COUNT],
     mountain_amplitude: f32,
     mountain_exponent: f32,
     sea_compression_range: f32,
     sea_compression_exponent: f32,
     noise_origin_offset: f32,
+    ridge_full_blend_mask: f32,
+    erosion_talus_slope: f32,
+    erosion_strength: f32,
+    plains_roughness: f32,
+    temperature_lapse_per_block: f32,
     window_caches: [RwLock<WindowMap>; LEVEL_COUNT],
 }
 
@@ -44,6 +50,12 @@ type BaseFbm = common_noise::Fbm<common_noise::Perlin>;
 type DetailFbm = common_noise::Fbm<common_noise::Perlin>;
 
 pub const LEVEL_COUNT: usize = 4;
+/// Level 0 ist reine Basis-Synthese (kein Elternwert, den es verfeinern koennte) - nur Level
+/// 1..LEVEL_COUNT tragen ein konfigurierbares Detailband. `pub(crate)`, damit `engine::config`
+/// die Array-Groesse der `terrain_detail_*`-Felder von hier importiert statt ein zweites,
+/// unabhaengiges Literal synchron halten zu muessen (ein Groessen-Mismatch waere sonst erst zur
+/// Laufzeit als Index-Panic sichtbar, nicht als Compile-Fehler).
+pub(crate) const DETAIL_LEVEL_COUNT: usize = LEVEL_COUNT - 1;
 
 /// Fenstergroesse in Ebenen-Pixeln - mit Stride = halbe Groesse deckt JEDER Pixel exakt 4 Fenster
 /// ab (2 pro Achse), s. `blended_pixel`.
@@ -74,36 +86,22 @@ const WINDOW_CACHE_CAP: usize = 512;
 /// beitragslos machen und die Gewichtssumme dort degenerieren lassen.
 const WEIGHT_EPSILON: f32 = 1.0 / 32.0;
 
-/// Grundrauhigkeit (Bloecke) der Ebenen ausserhalb von Bergmasken - verhindert Billardtisch-Flaechen,
-/// ohne das Gebirgs-Budget (`mountain_amplitude`) anzutasten.
-const PLAINS_ROUGHNESS: f32 = 9.0;
-/// Ab dieser Bergmaske dominiert Ridged- statt Smooth-Detail vollstaendig.
-const RIDGE_FULL_BLEND_MASK: f32 = 0.8;
-/// Temperaturabfall pro Weltblock Hoehe ueber dem Meer (snorm-Einheiten) - koppelt Klima kausal an
-/// das erzeugte Relief (Fels-/Nadelwald-Grenzen folgen Bergen statt eigenem Rauschen).
-const TEMPERATURE_LAPSE_PER_BLOCK: f32 = 0.004;
-/// Steigungsschwelle (Bloecke pro Block) der thermischen Relaxation - flachere Haenge bleiben
-/// unangetastet, steilere werden Richtung Schuttkegel geglaettet.
-const EROSION_TALUS_SLOPE: f32 = 1.2;
-const EROSION_STRENGTH: f32 = 0.4;
-
 struct LevelSpec {
     blocks_per_pixel: i32,
-    /// Anteil dieses Frequenzbands am Gesamt-Detail-Budget - Summe ueber alle Ebenen = 1.
+    /// Anteil dieses Frequenzbands am Gesamt-Detail-Budget - `EngineConfig::terrain_detail_share`.
     detail_share: f32,
-    /// Wellenlaenge (Bloecke) des Detail-fBm dieser Ebene - zwischen eigenem und Eltern-Pixelmass.
+    /// Wellenlaenge (Bloecke) des Detail-fBm dieser Ebene - `terrain_detail_wavelength_blocks`.
     detail_wavelength: f32,
+    /// `terrain_erosion_iterations`.
     erosion_iterations: u32,
 }
 
-/// Skalenfaktor 4 pro Stufe: die Kaskadenkosten amortisieren geometrisch (Paper 8: Faktor
-/// a/(a-1) = 1.33 unabhaengig von der Tiefe). Ebene 0 traegt kein Detail (Basis-Synthese).
-const LEVELS: [LevelSpec; LEVEL_COUNT] = [
-    LevelSpec { blocks_per_pixel: 256, detail_share: 0.0, detail_wavelength: 0.0, erosion_iterations: 0 },
-    LevelSpec { blocks_per_pixel: 64, detail_share: 0.5, detail_wavelength: 384.0, erosion_iterations: 0 },
-    LevelSpec { blocks_per_pixel: 16, detail_share: 0.32, detail_wavelength: 96.0, erosion_iterations: 2 },
-    LevelSpec { blocks_per_pixel: 4, detail_share: 0.18, detail_wavelength: 24.0, erosion_iterations: 2 },
-];
+/// Pixelmass pro Ebene, Faktor 4 pro Stufe - strukturell fix (bestimmt Fenster-Speicherbedarf UND
+/// die geometrisch amortisierte Kaskaden-Kostenformel aus Paper 8, Faktor a/(a-1) = 1.33
+/// unabhaengig von der Tiefe). Anders als `detail_share`/`detail_wavelength`/`erosion_iterations`
+/// NICHT ueber `EngineConfig` einstellbar - eine Aenderung hier verschiebt Fenstergroesse-in-
+/// Weltbloecken und Cache-Speicherbedarf, nicht nur die Optik.
+const BLOCKS_PER_PIXEL: [i32; LEVEL_COUNT] = [256, 64, 16, 4];
 
 const SEA_LEVEL_F: f32 = 0.0;
 
@@ -176,6 +174,22 @@ impl TerrainPyramid {
         let mut humidity = Noise::<common_noise::Perlin>::default();
         humidity.set_seed(seed.wrapping_add(0xB529_7A4D));
 
+        // Level 0 ist Basis-Synthese ohne Detailband (s. `DETAIL_LEVEL_COUNT`-Kommentar); Level
+        // 1..LEVEL_COUNT lesen ihre Detail-/Erosionsparameter aus der konfigurierbaren
+        // `terrain_detail_*`-Trilogie, Index `level - 1`.
+        let levels: [LevelSpec; LEVEL_COUNT] = std::array::from_fn(|level| {
+            let blocks_per_pixel = BLOCKS_PER_PIXEL[level];
+            let Some(detail_index) = level.checked_sub(1) else {
+                return LevelSpec { blocks_per_pixel, detail_share: 0.0, detail_wavelength: 1.0, erosion_iterations: 0 };
+            };
+            LevelSpec {
+                blocks_per_pixel,
+                detail_share: config.dev.terrain_detail_share[detail_index],
+                detail_wavelength: config.dev.terrain_detail_wavelength_blocks[detail_index].max(1.0),
+                erosion_iterations: config.dev.terrain_erosion_iterations[detail_index],
+            }
+        });
+
         Self {
             base: fbm(3, 0.5, 0x9E37_79B9),
             base_frequency: 1.0 / config.dev.terrain_continent_scale_blocks.max(64.0),
@@ -186,11 +200,17 @@ impl TerrainPyramid {
             detail: std::array::from_fn(|level| {
                 fbm(2, 0.5, 0x85EB_CA77_u32.wrapping_add(level as u32 * 0x27D4_EB2F))
             }),
+            levels,
             mountain_amplitude: config.dev.terrain_mountain_amplitude,
             mountain_exponent: config.dev.terrain_mountain_exponent,
             sea_compression_range: config.dev.terrain_sea_compression_range.max(1.0),
             sea_compression_exponent: config.dev.terrain_sea_compression_exponent,
             noise_origin_offset: config.dev.terrain_noise_origin_offset,
+            ridge_full_blend_mask: config.dev.terrain_ridge_full_blend_mask.max(0.01),
+            erosion_talus_slope: config.dev.terrain_erosion_talus_slope.max(0.0),
+            erosion_strength: config.dev.terrain_erosion_strength.clamp(0.0, 1.0),
+            plains_roughness: config.dev.terrain_plains_roughness.max(0.0),
+            temperature_lapse_per_block: config.dev.terrain_temperature_lapse_per_block,
             window_caches: std::array::from_fn(|_| RwLock::new(WindowMap::default())),
         }
     }
@@ -204,7 +224,7 @@ impl TerrainPyramid {
         ColumnSample {
             height,
             temperature: raw[CH_TEMPERATURE]
-                - TEMPERATURE_LAPSE_PER_BLOCK * (height - SEA_LEVEL_F).max(0.0),
+                - self.temperature_lapse_per_block * (height - SEA_LEVEL_F).max(0.0),
             humidity: raw[CH_HUMIDITY],
         }
     }
@@ -223,7 +243,7 @@ impl TerrainPyramid {
     /// Roh-Sample (Signed-Sqrt-Hoehe + Klima) einer Ebene an kontinuierlichen Weltkoordinaten -
     /// bilinear ueber die 4 umschliessenden Pixel-Zentren, jedes davon fenster-geblendet.
     fn sample_level(&self, level: usize, world_x: f32, world_z: f32) -> [f32; CHANNELS] {
-        let bpp = LEVELS[level].blocks_per_pixel as f32;
+        let bpp = self.levels[level].blocks_per_pixel as f32;
         let fx = world_x / bpp - 0.5;
         let fz = world_z / bpp - 0.5;
         let gx0 = fx.floor() as i32;
@@ -318,7 +338,7 @@ impl TerrainPyramid {
     /// 0, sonst Eltern-Sample + parent-konditioniertes Detailband), laesst die Fenster-Operatoren
     /// (Erosion) auf dem Puffer laufen und schneidet den Apron weg.
     fn compute_window(&self, level: usize, wi: i32, wj: i32) -> WindowData {
-        let spec = &LEVELS[level];
+        let spec = &self.levels[level];
         let bpp = spec.blocks_per_pixel as f32;
 
         let mut height = [0.0f32; PADDED_AREA];
@@ -352,7 +372,7 @@ impl TerrainPyramid {
         }
 
         for _ in 0..spec.erosion_iterations {
-            thermal_relaxation(&mut height, spec.blocks_per_pixel as f32);
+            thermal_relaxation(&mut height, spec.blocks_per_pixel as f32, self.erosion_talus_slope, self.erosion_strength);
         }
 
         let mut window = [0.0f32; (WINDOW_SIZE * WINDOW_SIZE) as usize * CHANNELS];
@@ -373,7 +393,7 @@ impl TerrainPyramid {
     /// Smooth- zu Ridged-Charakteristik - Grate entstehen nur dort, wo die groebere Ebene bereits
     /// Gebirge etabliert hat.
     fn detail_at(&self, level: usize, world_x: f32, world_z: f32, parent_height: f32) -> f32 {
-        let spec = &LEVELS[level];
+        let spec = &self.levels[level];
         let normalized = parent_height / self.continental_amplitude.max(1.0);
         let mountain_mask =
             ((normalized + 1.0) * 0.5).clamp(0.0, 1.0).powf(self.mountain_exponent);
@@ -385,8 +405,8 @@ impl TerrainPyramid {
             world_z,
         );
         let ridged = 1.0 - 2.0 * smooth.abs();
-        let shape = lerp(smooth, ridged, (mountain_mask / RIDGE_FULL_BLEND_MASK).min(1.0));
-        shape * (PLAINS_ROUGHNESS + self.mountain_amplitude * mountain_mask) * spec.detail_share
+        let shape = lerp(smooth, ridged, (mountain_mask / self.ridge_full_blend_mask).min(1.0));
+        shape * (self.plains_roughness + self.mountain_amplitude * mountain_mask) * spec.detail_share
     }
 
     #[inline]
@@ -409,8 +429,13 @@ impl TerrainPyramid {
 /// Schutthaenge glaetten sich, Ebenen und maessige Haenge bleiben unberuehrt. Genau die Art
 /// Nachbarschafts-Operator, die die fensterbasierte Architektur erlaubt und ein reiner
 /// Pro-Spalte-Generator nicht ausdruecken kann.
-fn thermal_relaxation(height: &mut [f32; PADDED_AREA], blocks_per_pixel: f32) {
-    let talus_drop = EROSION_TALUS_SLOPE * blocks_per_pixel;
+fn thermal_relaxation(
+    height: &mut [f32; PADDED_AREA],
+    blocks_per_pixel: f32,
+    talus_slope_per_block: f32,
+    strength: f32,
+) {
+    let talus_drop = talus_slope_per_block * blocks_per_pixel;
     let mut relaxed = *height;
     for v in 1..PADDED_SIZE - 1 {
         for u in 1..PADDED_SIZE - 1 {
@@ -427,7 +452,7 @@ fn thermal_relaxation(height: &mut [f32; PADDED_AREA], blocks_per_pixel: f32) {
                 .max((center - east).abs());
             if relief > talus_drop {
                 let mean = (north + south + west + east) * 0.25;
-                relaxed[index] = center + (mean - center) * EROSION_STRENGTH;
+                relaxed[index] = center + (mean - center) * strength;
             }
         }
     }
@@ -503,7 +528,7 @@ mod tests {
             }
         }
         if let (Some(peak), Some(plain)) = (peak, plain) {
-            let peak_base = peak.temperature + TEMPERATURE_LAPSE_PER_BLOCK * peak.height;
+            let peak_base = peak.temperature + p.temperature_lapse_per_block * peak.height;
             assert!(peak.temperature < peak_base);
             assert!(plain.temperature >= plain.temperature);
         }
