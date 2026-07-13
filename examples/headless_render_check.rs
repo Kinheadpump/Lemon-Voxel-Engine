@@ -75,7 +75,12 @@ async fn render_top_down_green_ratio() -> f32 {
     let view_proj = projection * view;
 
     let config = EngineConfig::default();
-    let shadow_pass = ShadowPass::new(&device, config.shadow_map_resolution, config.shadow_depth_bias, config.shadow_depth_bias_slope_scale);
+    let shadow_pass = ShadowPass::new(
+        &device,
+        config.player.shadow_map_resolution,
+        config.dev.shadow_depth_bias,
+        config.dev.shadow_depth_bias_slope_scale,
+    );
     let chunk_pipeline = pipeline::create(&device, &queue, FORMAT, SAMPLES);
     let mut renderer = ChunkRenderer::new(&device, &chunk_pipeline, view_proj, &config, &shadow_pass);
 
@@ -87,7 +92,7 @@ async fn render_top_down_green_ratio() -> f32 {
     let handle = renderer.alloc_chunk(&queue, &mesh);
     let aabb_min = glam::Vec3::new((CHUNK_X * CHUNK_SIZE) as f32, 0.0, (CHUNK_Z * CHUNK_SIZE) as f32);
     let aabb_max = aabb_min + glam::Vec3::splat(CHUNK_SIZE as f32);
-    renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, &handle);
+    renderer.update_chunk_meta(&queue, 0, aabb_min, aabb_max, 1.0, &handle);
 
     let msaa_color = create_msaa_color_view(&device, SIZE, SIZE, SAMPLES, FORMAT);
     let depth = create_depth_view(&device, SIZE, SIZE, SAMPLES);
@@ -116,7 +121,7 @@ async fn render_top_down_green_ratio() -> f32 {
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     hzb.generate(&mut encoder);
-    renderer.dispatch_cull(&mut encoder, &queue, view_proj, &hzb);
+    renderer.dispatch_cull(&mut encoder, &queue, view_proj, eye, &hzb);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("chunk"),
