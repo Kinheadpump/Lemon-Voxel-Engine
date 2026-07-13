@@ -96,11 +96,17 @@ terrain_seed = 1337
 # Wellenlaenge (Weltbloecke) der Kontinental-Basisebene (Ebene 0) - Land/Ozean-Wechsel auf dieser
 # Skala.
 terrain_continent_scale_blocks = 2048.0
-terrain_continental_amplitude = 55.0
+# Empirisch kalibriert (s. examples/terrain_census.rs) - der nominale Wert uebersetzt sich NICHT
+# 1:1 in erreichte Hoehe, das MultiDiffusion-Fenster-Blending daempft die Varianz gegenueber der
+# rohen FBm-Amplitude erheblich. 80/400 ergeben ueber ein 2048x2048-Weltblock-Fenster: min=-36
+# p50=-5 p75=16 p95=52 max=134..185 (echte Tiefsee, verbreitete Huegel, seltene alpine Gipfel).
+terrain_continental_amplitude = 80.0
 # Amplitude/Schaerfe des Berg-Boosts: unorm(kontinentalhoehe)^exponent * amplitude - der Exponent
 # (>1) haelt Ebenen flach, nur Kontinentalmaxima werden zu markanten Massiven. Skaliert die
-# Bergmaske, die wiederum das Detail-Budget der Ebenen 1-3 unten moduliert.
-terrain_mountain_amplitude = 130.0
+# Bergmaske, die wiederum das Detail-Budget der Ebenen 1-3 unten moduliert. Dank der Maske betrifft
+# eine Erhoehung fast nur die Extremwerte (macht Gipfel dramatischer, ohne den generellen
+# Huegel-Charakter des restlichen Terrains zu veraendern).
+terrain_mountain_amplitude = 400.0
 terrain_mountain_exponent = 5.5
 
 # Anteil jedes Verfeinerungs-Detailbands (Ebene 1-3) am Gesamt-Budget - faellt zur feinsten

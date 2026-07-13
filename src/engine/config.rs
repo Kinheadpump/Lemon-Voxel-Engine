@@ -281,11 +281,21 @@ impl Default for DevSettings {
             // anders als beim frueheren flachen fBm-Stack ist eine grosse Basis-Skala damit nicht
             // mehr "lokal unsichtbar".
             terrain_continent_scale_blocks: 2048.0,
-            terrain_continental_amplitude: 55.0,
-            // unorm(kontinentalhoehe)^5.5 * 130: hoher Exponent konzentriert die Berge auf die
+            // Empirisch kalibriert (s. examples/terrain_census.rs): der nominale Amplitudenwert
+            // uebersetzt sich NICHT 1:1 in erreichte Hoehe - das MultiDiffusion-Fenster-Blending
+            // (Mittelung ueberlappender Fenster, s. pyramid.rs) daempft die tatsaechliche Varianz
+            // gegenueber der rohen FBm-Amplitude erheblich. Bei den fruehereren 55/130 erreichte
+            // ein 2048x2048-Weltblock-Fenster nur h=-15..17 (fast nur seichtes Ozean-Geplaetscher,
+            // "flache Pfuetzen" statt Meer) - 80/400 ergeben min=-36 p50=-5 p75=16 p95=52 max=134..185
+            // (echte Tiefsee, verbreitete Huegel, seltene alpine Gipfel bis in die Fels-/Schneezone).
+            terrain_continental_amplitude: 80.0,
+            // unorm(kontinentalhoehe)^5.5 * 400: hoher Exponent konzentriert die Berge auf die
             // OBERSTEN Kontinental-Werte - das meiste Land bleibt sanftes Huegelland, nur die
-            // Kontinentalkerne tuermen sich zu (dann umso markanteren) Massiven auf.
-            terrain_mountain_amplitude: 130.0,
+            // Kontinentalkerne tuermen sich zu (dann umso markanteren) Massiven auf. Erhoehung
+            // gegenueber vorher (130) betrifft dank der Maske fast nur die Extremwerte (p95 wandert
+            // kaum, max schiesst deutlich hoeher) - macht Gipfel dramatischer, ohne den generellen
+            // Huegel-Charakter des restlichen Terrains zu veraendern.
+            terrain_mountain_amplitude: 400.0,
             terrain_mountain_exponent: 5.5,
             // Detail-Budget faellt zur feinsten Ebene hin ab (0.5/0.32/0.18) - die groebere Ebene
             // traegt bereits den Grossteil des sichtbaren Reliefs, feinere Ebenen fuegen nur noch

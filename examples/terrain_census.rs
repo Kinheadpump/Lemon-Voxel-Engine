@@ -8,7 +8,7 @@ use voxel_engine::engine::render::textures::{
 use voxel_engine::game::world::chunk::{CHUNK_SIZE, Chunk};
 use voxel_engine::game::world::generator::TerrainGenerator;
 
-const AREA_CHUNKS: i32 = 24; // 24*32 = 768 Bloecke Kantenlaenge
+const AREA_CHUNKS: i32 = 64; // 64*32 = 2048 Bloecke Kantenlaenge
 
 fn main() {
     let config = EngineConfig::default();
