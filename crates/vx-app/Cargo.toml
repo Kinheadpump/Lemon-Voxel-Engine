@@ -1,0 +1,30 @@
+[package]
+name = "vx-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vx"
+path = "src/main.rs"
+
+[dependencies]
+vx-core.workspace = true
+vx-world.workspace = true
+vx-mesh.workspace = true
+vx-render.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+glam.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+png.workspace = true
+
+[lints]
+workspace = true

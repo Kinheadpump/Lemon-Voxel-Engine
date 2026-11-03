@@ -1,0 +1,5 @@
+[alias]
+lint = "clippy --workspace --all-targets -- -D warnings"
+fmt-check = "fmt --all -- --check"
+bench-cpu = "bench -p vx-mesh -p vx-world"
+probe = "run --release -p vx-app -- --probe"

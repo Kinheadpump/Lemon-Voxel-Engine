@@ -1,0 +1,22 @@
+[package]
+name = "vx-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vx-core.workspace = true
+glam.workspace = true
+fastnoise-lite.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "world"
+harness = false
+
+[lints]
+workspace = true
